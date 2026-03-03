@@ -140,13 +140,13 @@ if __name__ == "__main__":
     else:
     # print(sys.argv)
         SoftmaxPipeline.exec(model, *inputs, output)
-        print(f"output: {output}")
+        # print(f"output: {output}")
         # print 64 th row of output
-        print(f"output[64]: {output[64]}")
+        # print(f"output[64]: {output[64]}")
         expected = model(*inputs)
-        print(f"expected: {expected}")
+        # print(f"expected: {expected}")
         # check results match
         if not torch.allclose(output, expected, atol=1e-5):
-            print("Output does not match expected result!")
+            print("ERROR: Output does not match expected result!")
         else:
-            print("Output matches expected result.")
+            print("SUCCESS: Output matches expected result.")
