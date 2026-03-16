@@ -224,7 +224,7 @@ class XeGPUSoftmax(XeGPUWorkload):
                 # Create collapsed tensor for sum init
                 # sum_init_2d = tensor.empty((M, 1), dtype)
                 sum_init = tensor.empty((M,), dtype)
-                # sum_init = tensor.CollapseShapeOp(sum_init_2d, [[0, 1]])
+                # tensor.CollapseShapeOp(sum_init, sum_init_2d, [[0, 1]])
 
                 
                 zero = arith.constant(dtype, 0.0)
