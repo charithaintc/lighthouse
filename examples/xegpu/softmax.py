@@ -269,20 +269,66 @@ class XeGPUSoftmax(XeGPUWorkload):
         tiling, vectorization, and XeGPU-specific lowering transformations.
         """
         # TODO: Implement proper transform schedule
-        # For now, create a minimal schedule that just applies bufferization
+        # For now, create a minimal schedule that prints the last linalg operation
         mod = ir.Module.create()
+        mod.operation.attributes["transform.with_named_sequence"] = ir.UnitAttr.get()
+        
         with ir.InsertionPoint(mod.body):
             from mlir.dialects import transform
+            from mlir.dialects.transform import structured
             
-            # Create a simple transform sequence
-            @func_cif(name="__transform_main")
-            def transform_main():
-                # Empty transform - just identity
-                # In a full implementation, this would tile, vectorize,
-                # and lower to XeGPU operations
-                pass
+            # Create a transform sequence with proper signature
+            named_sequence = transform.named_sequence(
+                "__transform_main",
+                [transform.AnyOpType.get()],  # input: module
+                [],  # no outputs
+                arg_attrs=[{"transform.readonly": ir.UnitAttr.get()}]
+            )
+            
+            with ir.InsertionPoint(named_sequence.body):
+                # Get the input module (bodyTarget)
+                payload_mod = named_sequence.bodyTarget
+                
+                # Match all linalg.generic operations
+                # We have 5 generic ops in softmax: max, sub, exp, sum, div
+                generic_ops = structured.structured_match(
+                    transform.AnyOpType.get(),
+                    payload_mod,
+                    ops=["linalg.generic"]
+                )
+                
+                # Split the handle into individual operation handles
+                # For softmax, we have 5 operations
+                anytype = transform.AnyOpType.get()
+                split_ops = transform.split_handle(
+                    (anytype, anytype, anytype, anytype, anytype),  # 5 result types
+                    generic_ops
+                )
+                
+                # The last operation (index 4) is the division
+                last_op = split_ops[-1]
+
+                # Print the last operation before tiling
+                # transform.print_(target=last_op, name="last_linalg_generic_before_tiling")
+
+                # Tile the last operation using tile_using_forall
+                # Tile sizes: [64, 64] for the two parallel dimensions (M, N)
+                tiled_op, for_op = structured.structured_tile_using_forall(
+                    anytype, anytype,
+                    last_op,
+                    num_threads=[],
+                    tile_sizes=[],
+                    static_tile_sizes=[64, 64],
+                )
+
+                # Print the tiled operation
+                # transform.print_(target=tiled_op, name="tiled_linalg_generic")
+                # transform.print_(target=for_op, name="forall_op")
+
+                # Required: yield to end the transform sequence
+                transform.yield_()
         
-        return [get_bench_wrapper_schedule(self), mod]
+        return [mod]
 
     def shared_libs(self) -> list[str]:
         return ["libmlir_levelzero_runtime.so"]
