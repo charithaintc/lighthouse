@@ -14,6 +14,8 @@ import numpy as np
 from mlir import ir
 from mlir.execution_engine import ExecutionEngine
 from mlir.dialects import linalg, gpu, bufferization, arith, tensor, func, math
+from mlir.dialects import transform
+from mlir.dialects.transform import structured, loop
 
 from lighthouse.workload import benchmark, get_bench_wrapper_schedule
 from lighthouse.utils.memref import to_ctype as memref_to_ctype
@@ -21,8 +23,24 @@ from lighthouse.utils.numpy import numpy_to_ctype
 from lighthouse.utils.mlir import func_cif
 from lighthouse.ingress.mlir_gen import get_mlir_elem_type
 from lighthouse.ingress.mlir_gen.gpu_utils import emit_gpu_util_funcs, emit_buf_to_tensor
+from lighthouse.pipeline.helper import (
+    apply_registered_pass,
+    canonicalize,
+    match,
+)
+from mlir.dialects.transform import bufferization as transform_bufferization
+from mlir.dialects.bufferization import LayoutMapOption
 
 from xegpu_workload import XeGPUWorkload
+
+def match_and_split(*args, nhandles=1, **kwargs):
+    """Helper function that splits matched handles."""
+    matched = match(*args, **kwargs)
+    anytype = transform.AnyOpType.get()
+    matched_ops = transform.split_handle((anytype,) * nhandles, matched)
+    if nhandles == 1:
+        matched_ops = [matched_ops]
+    return matched_ops
 
 
 def softmax_complexity(M: int, N: int, nbytes: int):
@@ -274,8 +292,7 @@ class XeGPUSoftmax(XeGPUWorkload):
         mod.operation.attributes["transform.with_named_sequence"] = ir.UnitAttr.get()
         
         with ir.InsertionPoint(mod.body):
-            from mlir.dialects import transform
-            from mlir.dialects.transform import structured
+
             
             # Create a transform sequence with proper signature
             named_sequence = transform.named_sequence(
@@ -305,8 +322,11 @@ class XeGPUSoftmax(XeGPUWorkload):
                     generic_ops
                 )
                 
-                # The last operation (index 4) is the division
-                last_op = split_ops[-1]
+                # Reverse split_ops to have operations in reverse order
+                split_ops = list(reversed(split_ops))
+                
+                # The first operation (after reversal) is the division - this is the consumer
+                last_op = split_ops[0]
 
                 # Print the last operation before tiling
                 # transform.print_(target=last_op, name="last_linalg_generic_before_tiling")
@@ -318,12 +338,62 @@ class XeGPUSoftmax(XeGPUWorkload):
                     last_op,
                     num_threads=[],
                     tile_sizes=[],
-                    static_tile_sizes=[64, 64],
+                    static_tile_sizes=(64,),
                 )
 
-                # Print the tiled operation
-                # transform.print_(target=tiled_op, name="tiled_linalg_generic")
-                # transform.print_(target=for_op, name="forall_op")
+                # Fuse the producer operations into the forall loop
+                # Iterate through remaining operations (already in reverse order)
+                current_forall = for_op
+                for producer_op in split_ops[1:]:
+                    fused_op, current_forall = structured.structured_fuse_into_containing_op(
+                        anytype, anytype,
+                        producer_op,
+                        current_forall
+                    )
+                    
+                func = transform.get_parent_op(
+                    anytype,
+                    current_forall,
+                    op_name="func.func",
+                    deduplicate=True,
+                )
+                transform.apply_cse(func)
+                canonicalize(func)
+                func = apply_registered_pass(func, "eliminate-empty-tensors")
+                func = structured.VectorizeChildrenAndApplyPatternsOp(
+                    func,
+                    fold_type_extensions_into_contract=True,
+                ).result
+                identity_layout = LayoutMapOption.IdentityLayoutMap
+                payload_mod = transform.get_parent_op(
+                    anytype,
+                    func,
+                    op_name="builtin.module",
+                    deduplicate=True,
+                )
+                payload_mod = transform_bufferization.OneShotBufferizeOp(
+                    payload_mod,
+                    allow_return_allocs_from_loops=True,
+                    bufferize_function_boundaries=True,
+                    function_boundary_type_conversion=identity_layout,
+                ).result
+                payload_mod = apply_registered_pass(payload_mod, "fold-memref-alias-ops")
+                transform.apply_cse(payload_mod)
+                canonicalize(payload_mod)
+                
+                # convert forall to parallel
+                wg_loops = match_and_split(payload_mod, ops={"scf.forall"})
+                for wg_loop in wg_loops:
+                    wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
+                func = transform.get_parent_op(anytype, wg_loop)
+
+                # convert to scf.parallel to gpu.launch
+                func = apply_registered_pass(func, "gpu-map-parallel-loops")
+                func = apply_registered_pass(func, "convert-parallel-loops-to-gpu")
+                func = apply_registered_pass(func, "lower-affine")
+                transform.apply_cse(func)
+                canonicalize(func)
+                
 
                 # Required: yield to end the transform sequence
                 transform.yield_()
