@@ -408,23 +408,34 @@ class XeGPUSoftmax(XeGPUWorkload):
                     op_name="builtin.module",
                     deduplicate=True,
                 )
-                payload_mod = apply_registered_pass(payload_mod, "gpu-kernel-outlining")
+                # payload = match(payload_mod, ops={"func.func"})
                 # transform.PrintOp(target=payload_mod, name="before_gpu_outlining")
-                # transform.apply_cse(payload_mod)
+                payload_mod = apply_registered_pass(payload_mod, "gpu-kernel-outlining")
+                transform.apply_cse(payload_mod)
 
                 # set xevm target
-                # payload_mod = apply_registered_pass(
-                #     payload_mod,
-                #     "xevm-attach-target",
-                #     options={"O": "3", "chip": "bmg"},
-                # )
+                payload_mod = apply_registered_pass(
+                    payload_mod,
+                    "xevm-attach-target",
+                    options={"O": "3", "chip": "bmg"},
+                )
 
-                # # convert vector to xegpu
-                # gpu_mod_ops = match_and_split(payload_mod, ops={"gpu.module"})
+                # convert vector to xegpu
+                gpu_mod = match_and_split(payload_mod, ops={"gpu.module"})
                 # for gpu_mod in gpu_mod_ops:
-                #     gpu_func = match(gpu_mod, ops={"gpu.func"})
-                #     gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
-                #     transform.apply_cse(gpu_func)
+                gpu_func = match(gpu_mod[0], ops={"gpu.func"})
+                gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
+                transform.apply_cse(gpu_func)
+                
+                # Set layout attributes for xegpu.store_nd operations
+                store_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)
+                # for store_op in store_ops:
+                xegpu.set_op_layout_attr(store_ops[0], sg_layout=[8, 1], sg_data=[8, 64])
+                
+                payload_mod = apply_registered_pass(
+                    payload_mod, "gpu-lower-to-xevm-pipeline", options={"xegpu-op-level": "workgroup"}
+                )
+                
                 
                 
 
