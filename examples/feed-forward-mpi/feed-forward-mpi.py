@@ -26,13 +26,14 @@ from mlir.runtime.np_to_memref import (
     as_ctype,
 )
 
+from lighthouse import dialects as lh_dialects
 from lighthouse.utils.memref import (
     to_ctype as memref_to_ctype,
     deallocate_memrefs_on_exit,
 )
 from lighthouse.pipeline.helper import apply_registered_pass, match
 from lighthouse.workload import Workload, benchmark, get_bench_wrapper_schedule
-from lighthouse.schedule.utils import schedule_boilerplate
+from lighthouse.schedule import schedule_boilerplate
 from lighthouse.schedule.x86 import tile_and_vector_matmul
 from ff_weight_stationary import generate_ff_payload
 
@@ -412,6 +413,8 @@ if __name__ == "__main__":
     R = MPI.COMM_WORLD.Get_rank()
 
     with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+
         wload = DistFF(args, P, R)
 
         # execute(wload, verbose=args.verbose)
