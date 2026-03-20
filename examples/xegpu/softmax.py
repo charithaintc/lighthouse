@@ -15,7 +15,7 @@ from mlir import ir
 from mlir.execution_engine import ExecutionEngine
 from mlir.dialects import linalg, gpu, bufferization, arith, tensor, func, math
 from mlir.dialects import transform
-from mlir.dialects.transform import structured, loop
+from mlir.dialects.transform import structured, loop, xegpu
 
 from lighthouse.workload import benchmark, get_bench_wrapper_schedule
 from lighthouse.utils.memref import to_ctype as memref_to_ctype
@@ -338,7 +338,7 @@ class XeGPUSoftmax(XeGPUWorkload):
                     last_op,
                     num_threads=[],
                     tile_sizes=[],
-                    static_tile_sizes=(64,),
+                    static_tile_sizes=(parameters["wg_rows"],),
                 )
 
                 # Fuse the producer operations into the forall loop
@@ -393,6 +393,39 @@ class XeGPUSoftmax(XeGPUWorkload):
                 func = apply_registered_pass(func, "lower-affine")
                 transform.apply_cse(func)
                 canonicalize(func)
+                # set the number of threads for the gpu.launch operation
+                launch_op = match_and_split(func, ops={"gpu.launch"})
+                num_threads = parameters["sg_rows"] * parameters["subgroup_size"]
+                xegpu.set_gpu_launch_threads(launch_op[0], threads=[num_threads, 1, 1])
+                
+                # outline gpu func
+                func = apply_registered_pass(func, "lower-affine")
+                canonicalize(func)
+                func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
+                payload_mod = transform.get_parent_op(
+                    anytype,
+                    func,
+                    op_name="builtin.module",
+                    deduplicate=True,
+                )
+                payload_mod = apply_registered_pass(payload_mod, "gpu-kernel-outlining")
+                # transform.PrintOp(target=payload_mod, name="before_gpu_outlining")
+                # transform.apply_cse(payload_mod)
+
+                # set xevm target
+                # payload_mod = apply_registered_pass(
+                #     payload_mod,
+                #     "xevm-attach-target",
+                #     options={"O": "3", "chip": "bmg"},
+                # )
+
+                # # convert vector to xegpu
+                # gpu_mod_ops = match_and_split(payload_mod, ops={"gpu.module"})
+                # for gpu_mod in gpu_mod_ops:
+                #     gpu_func = match(gpu_mod, ops={"gpu.func"})
+                #     gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
+                #     transform.apply_cse(gpu_func)
+                
                 
 
                 # Required: yield to end the transform sequence
@@ -413,15 +446,26 @@ def parse_cli():
         "--sizes",
         type=int,
         nargs=2,
-        default=[1024, 512],
+        default=[1024, 64],
         help="M,N matrix sizes (MxN)",
     )
     parser.add_argument(
-        "--wg-tile",
+        "--wg-rows",
         type=int,
-        nargs=2,
-        default=[64, 32],
-        help="Workgroup tile size M,N.",
+        default=64,
+        help="Number of rows per workgroup.",
+    )
+    parser.add_argument(
+        "--sg-rows",
+        type=int,
+        default=8,
+        help="Number of rows per subgroup.",
+    )
+    parser.add_argument(
+        "--subgroup-size",
+        type=int,
+        default=16,
+        help="Subgroup size.",
     )
     parser.add_argument(
         "--nruns",
@@ -468,8 +512,9 @@ if __name__ == "__main__":
     args = parse_cli()
 
     params = {
-        "wg_m": args.wg_tile[0],
-        "wg_n": args.wg_tile[1],
+        "wg_rows": args.wg_rows,
+        "sg_rows": args.sg_rows,
+        "subgroup_size": args.subgroup_size,
     }
 
     M, N = args.sizes
@@ -504,7 +549,9 @@ if __name__ == "__main__":
             parts = [
                 f"sizes={list2str(args.sizes)}",
                 f"dt={dtype}",
-                f"wg-tile={list2str(args.wg_tile)}",
+                f"wg-rows={args.wg_rows}",
+                f"sg-rows={args.sg_rows}",
+                f"subgroup-size={args.subgroup_size}",
                 f"time(us): {elapsed:.2f}",
                 f"GFLOPS: {gflops:.2f}",
             ]
