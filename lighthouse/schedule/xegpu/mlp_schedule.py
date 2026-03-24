@@ -11,6 +11,8 @@ from lighthouse.pipeline.helper import (
     apply_registered_pass,
     canonicalize,
     match,
+    match_and_split,
+    PipelineInterrupt,
 )
 
 from lighthouse.dialects import smt_ext, transform_smt_ext as td_smt_ext
@@ -31,22 +33,6 @@ PFETCH_MAX_COLS = 32
 MAX_NB_SG_THREADS = 64
 # heuristics: skip likely suboptimal configurations
 MIN_NB_THREADS = 16
-
-
-class PipelineInterrupt(Exception):
-    """Exception to signal early termination of the transform schedule."""
-
-    pass
-
-
-def match_and_split(*args, nhandles=1, **kwargs):
-    """Helper function that splits matched handles."""
-    matched = match(*args, **kwargs)
-    anytype = transform.AnyOpType.get()
-    matched_ops = transform.split_handle((anytype,) * nhandles, matched)
-    if nhandles == 1:
-        matched_ops = [matched_ops]
-    return matched_ops
 
 
 @KnobValue.ast_rewrite(in_exprs=True)

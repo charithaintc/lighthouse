@@ -12,17 +12,9 @@ from lighthouse.pipeline.helper import (
     apply_registered_pass,
     canonicalize,
     match,
+    match_and_split,
+    PipelineInterrupt,
 )
-
-
-def match_and_split(*args, nhandles=1, **kwargs):
-    """Helper function that splits matched handles."""
-    matched = match(*args, **kwargs)
-    anytype = transform.AnyOpType.get()
-    matched_ops = transform.split_handle((anytype,) * nhandles, matched)
-    if nhandles == 1:
-        matched_ops = [matched_ops]
-    return matched_ops
 
 
 def get_softmax_schedule_module(
@@ -75,121 +67,192 @@ def get_softmax_schedule_module(
                 deduplicate=True,
             )
             
-            # Match all linalg.generic and linalg.fill operations
-            # We have 7 operations in softmax: 
-            # fill(max_init), max, sub, exp, fill(sum_init), sum, div
-            generic_ops = structured.structured_match(
-                transform.AnyOpType.get(),
+            xegpu_softmax_transform_schedule(
                 payload_mod,
-                ops=["linalg.generic", "linalg.fill"]
+                parameters=parameters,
+                stop_at_stage=stop_at_stage or "",
             )
-            
-            # Split the handle into individual operation handles
-            anytype = transform.AnyOpType.get()
-            split_ops = transform.split_handle(
-                (anytype, anytype, anytype, anytype, anytype, anytype, anytype),  # 7 result types
-                generic_ops
-            )
-            
-            # Reverse split_ops to have operations in reverse order
-            split_ops = list(reversed(split_ops))
-            
-            # The first operation (after reversal) is the division - this is the consumer
-            last_op = split_ops[0]
-
-            # Tile the last operation using tile_using_forall
-            tiled_op, for_op = structured.structured_tile_using_forall(
-                anytype, anytype,
-                last_op,
-                num_threads=[],
-                tile_sizes=[],
-                static_tile_sizes=(parameters["wg_rows"],),
-            )
-
-            # Fuse the producer operations into the forall loop
-            # Iterate through remaining operations (already in reverse order)
-            current_forall = for_op
-            for producer_op in split_ops[1:]:
-                fused_op, current_forall = structured.structured_fuse_into_containing_op(
-                    anytype, anytype,
-                    producer_op,
-                    current_forall
-                )
-                
-            func = transform.get_parent_op(
-                anytype,
-                current_forall,
-                op_name="func.func",
-                deduplicate=True,
-            )
-            transform.apply_cse(func)
-            canonicalize(func)
-            
-            func = structured.VectorizeChildrenAndApplyPatternsOp(
-                func,
-                fold_type_extensions_into_contract=True,
-            ).result
-            transform.apply_cse(func)
-            canonicalize(func)
-            payload_mod = apply_registered_pass(payload_mod, "eliminate-empty-tensors")
-            identity_layout = LayoutMapOption.IdentityLayoutMap
-            payload_mod = transform_bufferization.OneShotBufferizeOp(
-                payload_mod,
-                allow_return_allocs_from_loops=True,
-                bufferize_function_boundaries=True,
-                function_boundary_type_conversion=identity_layout,
-            ).result
-            # fold memref.subviews into vector.transfer_read/write ops
-            payload_mod = apply_registered_pass(payload_mod, "fold-memref-alias-ops")
-            transform.apply_cse(payload_mod)
-            canonicalize(payload_mod)
-            
-            # convert forall to parallel
-            wg_loops = match_and_split(payload_mod, ops={"scf.forall"})
-            for wg_loop in wg_loops:
-                wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
-            func = transform.get_parent_op(anytype, wg_loop)
-            # convert scf.parallel to gpu.launch
-            func = apply_registered_pass(func, "gpu-map-parallel-loops")
-            func = apply_registered_pass(func, "convert-parallel-loops-to-gpu")
-            func = apply_registered_pass(func, "lower-affine")
-            transform.apply_cse(func)
-            canonicalize(func)
-            
-            # set the number of threads for the gpu.launch operation
-            launch_op = match_and_split(func, ops={"gpu.launch"})
-            num_threads = parameters["sg_rows"] * parameters["subgroup_size"]
-            xegpu.set_gpu_launch_threads(launch_op[0], threads=[num_threads, 1, 1])
-            
-            # outline gpu func
-            func = apply_registered_pass(func, "lower-affine")
-            canonicalize(func)
-            func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
-            payload_mod = apply_registered_pass(payload_mod, "gpu-kernel-outlining")
-            transform.apply_cse(payload_mod)
-            
-            # set xevm target
-            payload_mod = apply_registered_pass(
-                payload_mod,
-                "xevm-attach-target",
-                options={"O": "3", "chip": "bmg"},
-            )
-
-            # convert vector to xegpu
-            gpu_mod_ops = match_and_split(payload_mod, ops={"gpu.module"})
-            for gpu_mod in gpu_mod_ops:
-                gpu_func = match(gpu_mod, ops={"gpu.func"})
-                gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
-                transform.apply_cse(gpu_func)
-                
-            # Set layout attributes for xegpu.store_nd operations
-            store_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)
-            xegpu.set_op_layout_attr(store_ops[0], sg_layout=[8, 1], sg_data=[8, 64])
-            
-            payload_mod = apply_registered_pass(
-                payload_mod, "gpu-lower-to-xevm-pipeline", options={"xegpu-op-level": "workgroup"}
-            )
-            # Required: yield to end the transform sequence
-            transform.yield_()
     
+    return mod
+
+
+def xegpu_softmax_transform_schedule(
+    mod: ir.Value[transform.AnyOpType],
+    parameters: dict,
+    stop_at_stage: str = "",
+):
+    """Transform schedule for softmax payload."""
+    try:
+        mod = bundle_xegpu_softmax_schedule(
+            mod,
+            parameters=parameters,
+            stop_at_stage=stop_at_stage,
+        )
+
+        mod = bundle_xegpu_to_binary(
+            mod,
+            stop_at_stage=stop_at_stage,
+        )
+    except PipelineInterrupt:
+        pass
+    finally:
+        transform.yield_()
+
+
+def bundle_xegpu_softmax_schedule(
+    mod: ir.Value[transform.AnyOpType],
+    parameters: dict,
+    stop_at_stage: str = "",
+) -> ir.Value[transform.AnyOpType]:
+    """Schedule for lowering softmax payload to xegpu wg level."""
+    
+    if stop_at_stage == "initial":
+        raise PipelineInterrupt()
+    
+    anytype = transform.AnyOpType.get()
+    
+    # Match all linalg.generic and linalg.fill operations
+    # We have 7 operations in softmax: 
+    # fill(max_init), max, sub, exp, fill(sum_init), sum, div
+    generic_ops = structured.structured_match(
+        transform.AnyOpType.get(),
+        mod,
+        ops=["linalg.generic", "linalg.fill"]
+    )
+    
+    # Split the handle into individual operation handles
+    split_ops = transform.split_handle(
+        (anytype, anytype, anytype, anytype, anytype, anytype, anytype),  # 7 result types
+        generic_ops
+    )
+    
+    # Reverse split_ops to have operations in reverse order
+    split_ops = list(reversed(split_ops))
+    
+    # The first operation (after reversal) is the division - this is the consumer
+    last_op = split_ops[0]
+
+    # Tile the last operation using tile_using_forall
+    tiled_op, for_op = structured.structured_tile_using_forall(
+        anytype, anytype,
+        last_op,
+        num_threads=[],
+        tile_sizes=[],
+        static_tile_sizes=(parameters["wg_rows"],),
+    )
+
+    # Fuse the producer operations into the forall loop
+    # Iterate through remaining operations (already in reverse order)
+    current_forall = for_op
+    for producer_op in split_ops[1:]:
+        fused_op, current_forall = structured.structured_fuse_into_containing_op(
+            anytype, anytype,
+            producer_op,
+            current_forall
+        )
+        
+    func = transform.get_parent_op(
+        anytype,
+        current_forall,
+        op_name="func.func",
+        deduplicate=True,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
+    
+    if stop_at_stage == "tiled":
+        raise PipelineInterrupt()
+    
+    # vectorize
+    func = structured.VectorizeChildrenAndApplyPatternsOp(
+        func,
+        fold_type_extensions_into_contract=True,
+    ).result
+    transform.apply_cse(func)
+    canonicalize(func)
+    
+    if stop_at_stage == "vectorized":
+        raise PipelineInterrupt()
+    
+    # bufferize
+    mod = apply_registered_pass(mod, "eliminate-empty-tensors")
+    identity_layout = LayoutMapOption.IdentityLayoutMap
+    mod = transform_bufferization.OneShotBufferizeOp(
+        mod,
+        allow_return_allocs_from_loops=True,
+        bufferize_function_boundaries=True,
+        function_boundary_type_conversion=identity_layout,
+    ).result
+    # fold memref.subviews into vector.transfer_read/write ops
+    mod = apply_registered_pass(mod, "fold-memref-alias-ops")
+    transform.apply_cse(mod)
+    canonicalize(mod)
+    
+    if stop_at_stage == "bufferized":
+        raise PipelineInterrupt()
+    
+    # convert forall to parallel
+    wg_loops = match_and_split(mod, ops={"scf.forall"})
+    for wg_loop in wg_loops:
+        wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
+    func = transform.get_parent_op(anytype, wg_loop)
+    
+    # convert scf.parallel to gpu.launch
+    func = apply_registered_pass(func, "gpu-map-parallel-loops")
+    func = apply_registered_pass(func, "convert-parallel-loops-to-gpu")
+    func = apply_registered_pass(func, "lower-affine")
+    transform.apply_cse(func)
+    canonicalize(func)
+    
+    # set the number of threads for the gpu.launch operation
+    launch_op = match_and_split(func, ops={"gpu.launch"})
+    num_threads = parameters["sg_rows"] * parameters["subgroup_size"]
+    xegpu.set_gpu_launch_threads(launch_op[0], threads=[num_threads, 1, 1])
+    
+    # outline gpu func
+    func = apply_registered_pass(func, "lower-affine")
+    canonicalize(func)
+    func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
+    mod = apply_registered_pass(mod, "gpu-kernel-outlining")
+    transform.apply_cse(mod)
+    
+    # set xevm target
+    mod = apply_registered_pass(
+        mod,
+        "xevm-attach-target",
+        options={"O": "3", "chip": "bmg"},
+    )
+
+    # convert vector to xegpu
+    gpu_mod_ops = match_and_split(mod, ops={"gpu.module"})
+    for gpu_mod in gpu_mod_ops:
+        gpu_func = match(gpu_mod, ops={"gpu.func"})
+        gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
+        transform.apply_cse(gpu_func)
+    
+    if stop_at_stage == "xegpu-initial":
+        raise PipelineInterrupt()
+    
+    # Set layout attributes for xegpu.store_nd operations
+    store_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)
+    xegpu.set_op_layout_attr(store_ops[0], sg_layout=[8, 1], sg_data=[8, 64])
+    
+    if stop_at_stage == "xegpu-wg":
+        raise PipelineInterrupt()
+    
+    return mod
+
+
+def bundle_xegpu_to_binary(
+    mod: ir.Value, stop_at_stage: str = ""
+) -> ir.Value[transform.AnyOpType]:
+    """Schedule for lowering xegpu wg level to binary."""
+    # upstream xegpu/xevm pipeline is payload independent.
+    mod = apply_registered_pass(
+        mod, "gpu-lower-to-xevm-pipeline", options={"xegpu-op-level": "workgroup"}
+    )
+    
+    if stop_at_stage == "final":
+        raise PipelineInterrupt()
+
     return mod
