@@ -17,6 +17,7 @@ from mlir.dialects import linalg, gpu, bufferization, arith, tensor, func, math
 from mlir.dialects import transform
 from mlir.dialects.transform import structured, loop, xegpu
 
+from lighthouse import dialects as lh_dialects
 from lighthouse.workload import benchmark, get_bench_wrapper_schedule
 from lighthouse.utils.memref import to_ctype as memref_to_ctype
 from lighthouse.utils.numpy import numpy_to_ctype
@@ -54,7 +55,6 @@ def softmax_complexity(M: int, N: int, nbytes: int):
     Total: 3*N operations per row, but with transcendental (exp) operations
     """
     # Approximation: 5 FLOPs per element (max, sub, exp, sum, div)
-    # exp is expensive but we count it as ~1 FLOP for simplicity
     flop_count = M * N * 5
     memory_reads = M * N * nbytes  # read input
     memory_writes = M * N * nbytes  # write output
@@ -303,8 +303,15 @@ class XeGPUSoftmax(XeGPUWorkload):
             )
             
             with ir.InsertionPoint(named_sequence.body):
-                # Get the input module (bodyTarget)
-                payload_mod = named_sequence.bodyTarget
+                # match the payload module
+                anytype = transform.AnyOpType.get()
+                func = match(named_sequence.bodyTarget, ops={"func.func"})
+                payload_mod = transform.get_parent_op(
+                    anytype,
+                    func,
+                    op_name="builtin.module",
+                    deduplicate=True,
+                )
                 
                 # Match all linalg.generic operations
                 # We have 5 generic ops in softmax: max, sub, exp, sum, div
@@ -315,7 +322,7 @@ class XeGPUSoftmax(XeGPUWorkload):
                 )
                 
                 # Split the handle into individual operation handles
-                # For softmax, we have 5 operations
+                # For softmax, we have 7 operations
                 anytype = transform.AnyOpType.get()
                 split_ops = transform.split_handle(
                     (anytype, anytype, anytype, anytype, anytype, anytype, anytype),  # 7 result types
@@ -350,117 +357,59 @@ class XeGPUSoftmax(XeGPUWorkload):
                         producer_op,
                         current_forall
                     )
-                transform.annotate(current_forall, "gpu_loop")
+                    
+                func = transform.get_parent_op(
+                    anytype,
+                    current_forall,
+                    op_name="func.func",
+                    deduplicate=True,
+                )
+                transform.apply_cse(func)
+                canonicalize(func)
                 
-                transform.apply_cse(payload_mod)
-                # canonicalize(payload_mod)
-                
-                # Vectorize and bufferize sequence
-                func = match(payload_mod, ops={"func.func"})
                 func = structured.VectorizeChildrenAndApplyPatternsOp(
                     func,
                     fold_type_extensions_into_contract=True,
                 ).result
-                loops = match_and_split(payload_mod, ops={"scf.forall"})
-                loop.loop_hoist_loop_invariant_subsets(loops[0])
-                transform.apply_cse(payload_mod)
-                canonicalize(payload_mod)
-                # transform.PrintOp(target=payload_mod, name="vectorize")
-                
+                transform.apply_cse(func)
+                canonicalize(func)
+                payload_mod = apply_registered_pass(payload_mod, "eliminate-empty-tensors")
                 identity_layout = LayoutMapOption.IdentityLayoutMap
-                payload_mod = transform.get_parent_op(
-                    anytype,
-                    func,
-                    op_name="builtin.module",
-                    deduplicate=True,
-                )
                 payload_mod = transform_bufferization.OneShotBufferizeOp(
                     payload_mod,
                     allow_return_allocs_from_loops=True,
                     bufferize_function_boundaries=True,
                     function_boundary_type_conversion=identity_layout,
                 ).result
-                # payload_mod = transform_bufferization.OneShotBufferizeOp(
-                #     payload_mod,
-                #     allow_return_allocs_from_loops=False,
-                #     bufferize_function_boundaries=True,
-                #     function_boundary_type_conversion=identity_layout,
-                # ).result
+                # fold memref.subviews into vector.transfer_read/write ops
                 payload_mod = apply_registered_pass(payload_mod, "fold-memref-alias-ops")
-                payload_mod = apply_registered_pass(payload_mod, "drop-equivalent-buffer-results")
-                payload_mod = apply_registered_pass(
-                    payload_mod,
-                    "buffer-results-to-out-params",
-                    options={
-                        "add-result-attr": "true",
-                        "hoist-dynamic-allocs": "true",
-                        "hoist-static-allocs": "true",
-                        "modify-public-functions": "true"
-                    }
-                )
                 transform.apply_cse(payload_mod)
                 canonicalize(payload_mod)
-                # # # transform.PrintOp(target=payload_mod, name="bufferize")
                 
-                # # func = match(payload_mod, ops={"func.func"})
-                gpu_loop = match(payload_mod, op_attrs={"gpu_loop": ir.UnitAttr.get()})
-                # # gpu_loop = transform.split_handle(anytype, gpu_loop)
-                gpu_loop = loop.loop_forall_to_parallel([anytype], gpu_loop)
-                
-                # # func = apply_registered_pass(payload_mod, "eliminate-empty-tensors")
-                # # func = structured.VectorizeChildrenAndApplyPatternsOp(
-                # #     func,
-                # #     fold_type_extensions_into_contract=True,
-                # # ).result
-                # # identity_layout = LayoutMapOption.IdentityLayoutMap
-                payload_mod = transform.get_parent_op(
-                    anytype,
-                    gpu_loop,
-                    op_name="func.func",
-                    deduplicate=True,
-                )
-                # payload_mod = transform_bufferization.OneShotBufferizeOp(
-                #     payload_mod,
-                #     allow_return_allocs_from_loops=True,
-                #     bufferize_function_boundaries=True,
-                #     function_boundary_type_conversion=identity_layout,
-                # ).result
-                # payload_mod = apply_registered_pass(payload_mod, "fold-memref-alias-ops")
-                # transform.apply_cse(payload_mod)
-                # canonicalize(payload_mod)
-                
-                # # convert forall to parallel
-                # wg_loops = match_and_split(payload_mod, ops={"scf.forall"})
-                # for wg_loop in wg_loops:
-                #     wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
-                # func = transform.get_parent_op(anytype, wg_loop)
-
+                # convert forall to parallel
+                wg_loops = match_and_split(payload_mod, ops={"scf.forall"})
+                for wg_loop in wg_loops:
+                    wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
+                func = transform.get_parent_op(anytype, wg_loop)
                 # convert to scf.parallel to gpu.launch
-                func = apply_registered_pass(payload_mod, "gpu-map-parallel-loops")
+                func = apply_registered_pass(func, "gpu-map-parallel-loops")
                 func = apply_registered_pass(func, "convert-parallel-loops-to-gpu")
                 func = apply_registered_pass(func, "lower-affine")
                 transform.apply_cse(func)
                 canonicalize(func)
-                # # set the number of threads for the gpu.launch operation
+                
+                # set the number of threads for the gpu.launch operation
                 launch_op = match_and_split(func, ops={"gpu.launch"})
                 num_threads = parameters["sg_rows"] * parameters["subgroup_size"]
                 xegpu.set_gpu_launch_threads(launch_op[0], threads=[num_threads, 1, 1])
                 
-                # # outline gpu func
+                # outline gpu func
                 func = apply_registered_pass(func, "lower-affine")
                 canonicalize(func)
                 func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
-                payload_mod = transform.get_parent_op(
-                    anytype,
-                    func,
-                    op_name="builtin.module",
-                    deduplicate=True,
-                )
-                # payload = match(payload_mod, ops={"func.func"})
-                # transform.PrintOp(target=payload_mod, name="before_gpu_outlining")
                 payload_mod = apply_registered_pass(payload_mod, "gpu-kernel-outlining")
                 transform.apply_cse(payload_mod)
-
+                
                 # set xevm target
                 payload_mod = apply_registered_pass(
                     payload_mod,
@@ -469,12 +418,12 @@ class XeGPUSoftmax(XeGPUWorkload):
                 )
 
                 # convert vector to xegpu
-                gpu_mod = match_and_split(payload_mod, ops={"gpu.module"})
-                # for gpu_mod in gpu_mod_ops:
-                gpu_func = match(gpu_mod[0], ops={"gpu.func"})
-                gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
-                transform.apply_cse(gpu_func)
-                
+                gpu_mod_ops = match_and_split(payload_mod, ops={"gpu.module"})
+                for gpu_mod in gpu_mod_ops:
+                    gpu_func = match(gpu_mod, ops={"gpu.func"})
+                    gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
+                    transform.apply_cse(gpu_func)
+                    
                 # Set layout attributes for xegpu.store_nd operations
                 store_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)
                 # for store_op in store_ops:
@@ -483,14 +432,10 @@ class XeGPUSoftmax(XeGPUWorkload):
                 payload_mod = apply_registered_pass(
                     payload_mod, "gpu-lower-to-xevm-pipeline", options={"xegpu-op-level": "workgroup"}
                 )
-                
-                
-                
-
                 # Required: yield to end the transform sequence
                 transform.yield_()
         
-        return [mod]
+        return [get_bench_wrapper_schedule(self), mod]
 
     def shared_libs(self) -> list[str]:
         return ["libmlir_levelzero_runtime.so"]
@@ -580,6 +525,7 @@ if __name__ == "__main__":
     dtype = "f32"
 
     with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
         wload = XeGPUSoftmax(M=M, N=N, dtype=dtype)
 
         if args.dump_kernel or args.dump_schedule:
