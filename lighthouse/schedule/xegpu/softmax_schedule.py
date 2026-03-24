@@ -206,7 +206,8 @@ def bundle_xegpu_softmax_schedule(
     
     # set the number of threads for the gpu.launch operation
     launch_op = match_and_split(func, ops={"gpu.launch"})
-    num_threads = parameters["sg_rows"] * parameters["subgroup_size"]
+    num_subgroups = parameters["wg_rows"] // parameters["sg_rows"]
+    num_threads = num_subgroups * parameters["subgroup_size"]
     xegpu.set_gpu_launch_threads(launch_op[0], threads=[num_threads, 1, 1])
     
     # outline gpu func
@@ -233,9 +234,12 @@ def bundle_xegpu_softmax_schedule(
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
     
-    # Set layout attributes for xegpu.store_nd operations
+    # Set layout attributes for xegpu.store_nd operations.
+    # FIXME: currently ecah subgroup is handling the entire row.
     store_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)
-    xegpu.set_op_layout_attr(store_ops[0], sg_layout=[8, 1], sg_data=[8, 64])
+    sg_layout = [parameters["sg_rows"], 1]
+    sg_data = [parameters["sg_rows"], parameters["sizes"][1]]
+    xegpu.set_op_layout_attr(store_ops[0], sg_layout=sg_layout, sg_data=sg_data)
     
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()

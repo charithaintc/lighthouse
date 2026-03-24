@@ -260,6 +260,7 @@ if __name__ == "__main__":
     args = parse_cli()
 
     params = {
+        "sizes": args.sizes,
         "wg_rows": args.wg_rows,
         "sg_rows": args.sg_rows,
         "subgroup_size": args.subgroup_size,
