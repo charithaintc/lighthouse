@@ -24,7 +24,7 @@ def get_softmax_schedule_module(
 ) -> ir.Module:
     """
     Generate transform schedule for softmax operation.
-    
+
     The schedule performs the following transformations:
     1. Tile the consumer operation (division) using forall
     2. Fuse producer operations into the forall loop
@@ -32,32 +32,32 @@ def get_softmax_schedule_module(
     4. Bufferize tensors
     5. Convert to GPU dialect
     6. Lower to XeGPU operations
-    
+
     Args:
         stop_at_stage: Optional stage name to stop early (for debugging)
         parameters: Dictionary with scheduling parameters:
             - wg_rows: Number of rows per workgroup
-            - sg_rows: Number of rows per subgroup  
+            - sg_rows: Number of rows per subgroup
             - subgroup_size: Size of subgroup
             - sizes: Tuple with the sizes of the input tensors (e.g. (M, N))
-            
+
     Returns:
         MLIR module containing the transform schedule
     """
     assert parameters is not None, "Schedule parameters must be provided"
-    
+
     mod = ir.Module.create()
     mod.operation.attributes["transform.with_named_sequence"] = ir.UnitAttr.get()
-    
+
     with ir.InsertionPoint(mod.body):
         # Create a transform sequence with proper signature
         named_sequence = transform.named_sequence(
             "__transform_main",
             [transform.AnyOpType.get()],  # input: module
             [],  # no outputs
-            arg_attrs=[{"transform.readonly": ir.UnitAttr.get()}]
+            arg_attrs=[{"transform.readonly": ir.UnitAttr.get()}],
         )
-        
+
         with ir.InsertionPoint(named_sequence.body):
             # match the payload module
             anytype = transform.AnyOpType.get()
@@ -68,13 +68,13 @@ def get_softmax_schedule_module(
                 op_name="builtin.module",
                 deduplicate=True,
             )
-            
+
             xegpu_softmax_transform_schedule(
                 payload_mod,
                 parameters=parameters,
                 stop_at_stage=stop_at_stage or "",
             )
-    
+
     return mod
 
 
@@ -107,36 +107,43 @@ def bundle_xegpu_softmax_schedule(
     stop_at_stage: str = "",
 ) -> ir.Value[transform.AnyOpType]:
     """Schedule for lowering softmax payload to xegpu wg level."""
-    
+
     if stop_at_stage == "initial":
         raise PipelineInterrupt()
-    
+
     anytype = transform.AnyOpType.get()
-    
+
     # Match all linalg.generic and linalg.fill operations
-    # We have 7 operations in softmax: 
+    # We have 7 operations in softmax:
     # fill(max_init), max, sub, exp, fill(sum_init), sum, div
     generic_ops = structured.structured_match(
-        transform.AnyOpType.get(),
-        mod,
-        ops=["linalg.generic", "linalg.fill"]
+        transform.AnyOpType.get(), mod, ops=["linalg.generic", "linalg.fill"]
     )
-    
+
     # Split the handle into individual operation handles
     split_ops = transform.split_handle(
-        (anytype, anytype, anytype, anytype, anytype, anytype, anytype),  # 7 result types
-        generic_ops
+        (
+            anytype,
+            anytype,
+            anytype,
+            anytype,
+            anytype,
+            anytype,
+            anytype,
+        ),  # 7 result types
+        generic_ops,
     )
-    
+
     # Reverse split_ops to have operations in reverse order
     split_ops = list(reversed(split_ops))
-    
+
     # The first operation (after reversal) is the division - this is the consumer
     last_op = split_ops[0]
 
     # Tile the last operation using tile_using_forall
     tiled_op, for_op = structured.structured_tile_using_forall(
-        anytype, anytype,
+        anytype,
+        anytype,
         last_op,
         num_threads=[],
         tile_sizes=[],
@@ -148,11 +155,9 @@ def bundle_xegpu_softmax_schedule(
     current_forall = for_op
     for producer_op in split_ops[1:]:
         fused_op, current_forall = structured.structured_fuse_into_containing_op(
-            anytype, anytype,
-            producer_op,
-            current_forall
+            anytype, anytype, producer_op, current_forall
         )
-        
+
     func = transform.get_parent_op(
         anytype,
         current_forall,
@@ -161,10 +166,10 @@ def bundle_xegpu_softmax_schedule(
     )
     transform.apply_cse(func)
     canonicalize(func)
-    
+
     if stop_at_stage == "tiled":
         raise PipelineInterrupt()
-    
+
     # vectorize
     func = structured.VectorizeChildrenAndApplyPatternsOp(
         func,
@@ -172,10 +177,10 @@ def bundle_xegpu_softmax_schedule(
     ).result
     transform.apply_cse(func)
     canonicalize(func)
-    
+
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
-    
+
     # bufferize
     mod = apply_registered_pass(mod, "eliminate-empty-tensors")
     identity_layout = LayoutMapOption.IdentityLayoutMap
@@ -189,36 +194,36 @@ def bundle_xegpu_softmax_schedule(
     mod = apply_registered_pass(mod, "fold-memref-alias-ops")
     transform.apply_cse(mod)
     canonicalize(mod)
-    
+
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
-    
+
     # convert forall to parallel
     wg_loops = match_and_split(mod, ops={"scf.forall"})
     for wg_loop in wg_loops:
         wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
     func = transform.get_parent_op(anytype, wg_loop)
-    
+
     # convert scf.parallel to gpu.launch
     func = apply_registered_pass(func, "gpu-map-parallel-loops")
     func = apply_registered_pass(func, "convert-parallel-loops-to-gpu")
     func = apply_registered_pass(func, "lower-affine")
     transform.apply_cse(func)
     canonicalize(func)
-    
+
     # set the number of threads for the gpu.launch operation
     launch_op = match_and_split(func, ops={"gpu.launch"})
     num_subgroups = parameters["wg_rows"] // parameters["sg_rows"]
     num_threads = num_subgroups * parameters["subgroup_size"]
     xegpu.set_gpu_launch_threads(launch_op[0], threads=[num_threads, 1, 1])
-    
+
     # outline gpu func
     func = apply_registered_pass(func, "lower-affine")
     canonicalize(func)
     func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
     mod = apply_registered_pass(mod, "gpu-kernel-outlining")
     transform.apply_cse(mod)
-    
+
     # set xevm target
     mod = apply_registered_pass(
         mod,
@@ -232,18 +237,18 @@ def bundle_xegpu_softmax_schedule(
         gpu_func = match(gpu_mod, ops={"gpu.func"})
         gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
         transform.apply_cse(gpu_func)
-    
+
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
-    
+
     # Set layout attributes for xegpu.store_nd operations.
     # FIXME: currently ecah subgroup is handling the entire row.
     store_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)
     sg_layout = [parameters["sg_rows"], 1]
     sg_data = [parameters["sg_rows"], parameters["sizes"][1]]
     xegpu.set_op_layout_attr(store_ops[0], sg_layout=sg_layout, sg_data=sg_data)
-    
+
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()
-    
+
     return mod

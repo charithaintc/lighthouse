@@ -14,7 +14,7 @@ def bundle_xegpu_to_binary(
     mod = apply_registered_pass(
         mod, "gpu-lower-to-xevm-pipeline", options={"xegpu-op-level": "workgroup"}
     )
-    
+
     if stop_at_stage == "final":
         raise PipelineInterrupt()
 

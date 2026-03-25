@@ -28,7 +28,7 @@ from xegpu_workload import XeGPUWorkload
 def softmax_complexity(M: int, N: int, nbytes: int):
     """
     Complexity of softmax operation.
-    
+
     For each row:
     - O(N) to find max
     - O(N) to compute exp(x - max) and sum
@@ -127,7 +127,7 @@ class XeGPUSoftmax(XeGPUWorkload):
 
         output_ref = self._reference_solution
         output_computed = output_host.astype(np.float32)
-        
+
         if verbose > 1:
             print("Reference solution (first 5 rows):")
             print(output_ref[:5])
@@ -137,10 +137,10 @@ class XeGPUSoftmax(XeGPUWorkload):
         # Check row sums are close to 1.0
         row_sums = np.sum(output_computed, axis=1)
         sums_ok = np.allclose(row_sums, 1.0, rtol=1e-5, atol=1e-6)
-        
+
         # Check values match reference
         values_ok = np.allclose(output_computed, output_ref, rtol=1e-4, atol=1e-6)
-        
+
         success = sums_ok and values_ok
 
         if verbose:
@@ -149,7 +149,9 @@ class XeGPUSoftmax(XeGPUWorkload):
             else:
                 print("FAILED!")
                 if not sums_ok:
-                    print(f"  Row sums check failed. Min: {row_sums.min():.6f}, Max: {row_sums.max():.6f}")
+                    print(
+                        f"  Row sums check failed. Min: {row_sums.min():.6f}, Max: {row_sums.max():.6f}"
+                    )
                 if not values_ok:
                     max_diff = np.abs(output_computed - output_ref).max()
                     print(f"  Values mismatch. Max abs diff: {max_diff:.6e}")
