@@ -14,6 +14,7 @@ from lighthouse.pipeline.helper import (
     match_and_split,
     PipelineInterrupt,
 )
+from lighthouse.schedule.xegpu.helper import bundle_xegpu_to_binary
 
 from lighthouse.dialects import smt_ext, transform_smt_ext as td_smt_ext
 from lighthouse.dialects.transform_tune_ext import knob, KnobValue
@@ -600,15 +601,3 @@ def xegpu_wg_annotation_for_mlp_layer(
 
     canonicalize(gpu_func)
     transform.apply_cse(gpu_func)
-
-
-def bundle_xegpu_to_binary(
-    mod: ir.Value, stop_at_stage: str = ""
-) -> ir.Value[transform.AnyOpType]:
-    """Schedule for lowering xegpu wg level to binary."""
-    # upstream xegpu/xevm pipeline is payload independent.
-    mod = apply_registered_pass(
-        mod, "gpu-lower-to-xevm-pipeline", options={"xegpu-op-level": "workgroup"}
-    )
-
-    return mod

@@ -15,6 +15,7 @@ from lighthouse.pipeline.helper import (
     match_and_split,
     PipelineInterrupt,
 )
+from lighthouse.schedule.xegpu.helper import bundle_xegpu_to_binary
 
 
 def get_softmax_schedule_module(
@@ -38,6 +39,7 @@ def get_softmax_schedule_module(
             - wg_rows: Number of rows per workgroup
             - sg_rows: Number of rows per subgroup  
             - subgroup_size: Size of subgroup
+            - sizes: Tuple with the sizes of the input tensors (e.g. (M, N))
             
     Returns:
         MLIR module containing the transform schedule
@@ -244,19 +246,4 @@ def bundle_xegpu_softmax_schedule(
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()
     
-    return mod
-
-
-def bundle_xegpu_to_binary(
-    mod: ir.Value, stop_at_stage: str = ""
-) -> ir.Value[transform.AnyOpType]:
-    """Schedule for lowering xegpu wg level to binary."""
-    # upstream xegpu/xevm pipeline is payload independent.
-    mod = apply_registered_pass(
-        mod, "gpu-lower-to-xevm-pipeline", options={"xegpu-op-level": "workgroup"}
-    )
-    
-    if stop_at_stage == "final":
-        raise PipelineInterrupt()
-
     return mod
