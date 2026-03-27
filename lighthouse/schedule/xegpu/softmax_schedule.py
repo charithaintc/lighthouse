@@ -26,12 +26,11 @@ def get_softmax_schedule_module(
     Generate transform schedule for softmax operation.
 
     The schedule performs the following transformations:
-    1. Tile the consumer operation (division) using forall
-    2. Fuse producer operations into the forall loop
-    3. Vectorize operations
-    4. Bufferize tensors
-    5. Convert to GPU dialect
-    6. Lower to XeGPU operations
+    1. Tile the linalg.softmax operation using forall
+    2. Vectorize operations
+    3. Bufferize tensors
+    4. Convert to GPU dialect
+    5. Lower to XeGPU operations
 
     Args:
         stop_at_stage: Optional stage name to stop early (for debugging)
@@ -113,57 +112,34 @@ def bundle_xegpu_softmax_schedule(
 
     anytype = transform.AnyOpType.get()
 
-    # Match all linalg.generic and linalg.fill operations
-    # We have 7 operations in softmax:
-    # fill(max_init), max, sub, exp, fill(sum_init), sum, div
-    generic_ops = structured.structured_match(
-        transform.AnyOpType.get(), mod, ops=["linalg.generic", "linalg.fill"]
+    # Match linalg.softmax operation
+    # We have only 1 operation: linalg.softmax
+    softmax_op = structured.structured_match(
+        transform.AnyOpType.get(), mod, ops=["linalg.softmax"]
     )
 
-    # Split the handle into individual operation handles
-    split_ops = transform.split_handle(
-        (
-            anytype,
-            anytype,
-            anytype,
-            anytype,
-            anytype,
-            anytype,
-            anytype,
-        ),  # 7 result types
-        generic_ops,
-    )
-
-    # Reverse split_ops to have operations in reverse order
-    split_ops = list(reversed(split_ops))
-
-    # The first operation (after reversal) is the division - this is the consumer
-    last_op = split_ops[0]
-
-    # Tile the last operation using tile_using_forall
+    # Tile the softmax operation using tile_using_forall
     tiled_op, for_op = structured.structured_tile_using_forall(
         anytype,
         anytype,
-        last_op,
+        softmax_op,
         num_threads=[],
         tile_sizes=[],
         static_tile_sizes=(parameters["wg_rows"],),
     )
 
-    # Fuse the producer operations into the forall loop
-    # Iterate through remaining operations (already in reverse order)
-    current_forall = for_op
-    for producer_op in split_ops[1:]:
-        fused_op, current_forall = structured.structured_fuse_into_containing_op(
-            anytype, anytype, producer_op, current_forall
-        )
-
     func = transform.get_parent_op(
         anytype,
-        current_forall,
+        for_op,
         op_name="func.func",
         deduplicate=True,
     )
+    # Decompose softmax into linalg.generic operations
+    softmax_ops = structured.structured_match(
+        transform.AnyOpType.get(), func, ops=["linalg.softmax"]
+    )
+    structured.structured_decompose_interface(anytype, softmax_ops)
+
     transform.apply_cse(func)
     canonicalize(func)
 
