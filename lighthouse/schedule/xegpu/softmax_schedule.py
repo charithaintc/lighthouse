@@ -144,30 +144,28 @@ def bundle_xegpu_softmax_schedule(
     linalg_ops = match_and_split(
         func, ops={"linalg.generic", "linalg.fill"}, nhandles=6
     )
-    init_max_reduction = linalg_ops[0]
     max_reduction = linalg_ops[1]
     max_center_and_exp_op = linalg_ops[2]
-    init_sum_reduction = linalg_ops[3]
     sum_reduction = linalg_ops[4]
     div_op = linalg_ops[5]
 
     reduction_step_size = parameters["reduction_step_size"]
 
-    # Tile the max reduction using TileReductionUsingFor
-    _, _, _, for_op = structured.structured_tile_reduction_using_for(
-        [anytype],
-        anytype,
-        anytype,
-        anytype,
-        target=max_reduction,
-        tile_sizes=[0, reduction_step_size],
-    )
-
-    # Fuse the init_max_reduction into the for loop
-    # fused_init, new_for_loop = structured.structured_fuse_into_containing_op(
-    #     anytype, anytype, init_max_reduction, for_op
-    # )
-    transform.PrintOp(target=init_max_reduction)
+    # Tile all reduction ops using the same step size
+    reduction_ops = [max_reduction, sum_reduction]
+    for reduction_op in reduction_ops:
+        structured.structured_tile_reduction_using_for(
+            [anytype],
+            anytype,
+            anytype,
+            anytype,
+            target=reduction_op,
+            tile_sizes=[0, reduction_step_size],
+        )
+    # Tile elementwise ops to match the reduction tile size
+    elementwise_ops = [max_center_and_exp_op, div_op]
+    for elementwise_op in elementwise_ops:
+        structured.TileUsingForOp(elementwise_op, sizes=[0, reduction_step_size])
 
     transform.apply_cse(func)
     canonicalize(func)
