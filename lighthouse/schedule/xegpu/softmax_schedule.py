@@ -39,6 +39,7 @@ def get_softmax_schedule_module(
             - sg_rows: Number of rows per subgroup
             - subgroup_size: Size of subgroup
             - sizes: Tuple with the sizes of the input tensors (e.g. (M, N))
+            - reduction_step_size: Optional step size for tiling reduction loops
 
     Returns:
         MLIR module containing the transform schedule
@@ -139,6 +140,34 @@ def bundle_xegpu_softmax_schedule(
         transform.AnyOpType.get(), func, ops=["linalg.softmax"]
     )
     structured.structured_decompose_interface(anytype, softmax_ops)
+
+    linalg_ops = match_and_split(
+        func, ops={"linalg.generic", "linalg.fill"}, nhandles=6
+    )
+    init_max_reduction = linalg_ops[0]
+    max_reduction = linalg_ops[1]
+    max_center_and_exp_op = linalg_ops[2]
+    init_sum_reduction = linalg_ops[3]
+    sum_reduction = linalg_ops[4]
+    div_op = linalg_ops[5]
+
+    reduction_step_size = parameters["reduction_step_size"]
+
+    # Tile the max reduction using TileReductionUsingFor
+    _, _, _, for_op = structured.structured_tile_reduction_using_for(
+        [anytype],
+        anytype,
+        anytype,
+        anytype,
+        target=max_reduction,
+        tile_sizes=[0, reduction_step_size],
+    )
+
+    # Fuse the init_max_reduction into the for loop
+    # fused_init, new_for_loop = structured.structured_fuse_into_containing_op(
+    #     anytype, anytype, init_max_reduction, for_op
+    # )
+    transform.PrintOp(target=init_max_reduction)
 
     transform.apply_cse(func)
     canonicalize(func)

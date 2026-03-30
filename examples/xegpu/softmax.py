@@ -218,6 +218,12 @@ def parse_cli():
         help="Subgroup size.",
     )
     parser.add_argument(
+        "--reduction-step-size",
+        type=int,
+        default=16,
+        help="Step size for reduction loop tiling (optional).",
+    )
+    parser.add_argument(
         "--nruns",
         type=int,
         default=1000,
@@ -266,6 +272,7 @@ if __name__ == "__main__":
         "wg_rows": args.wg_rows,
         "sg_rows": args.sg_rows,
         "subgroup_size": args.subgroup_size,
+        "reduction_step_size": args.reduction_step_size,
     }
 
     M, N = args.sizes
@@ -304,7 +311,13 @@ if __name__ == "__main__":
                 f"wg-rows={args.wg_rows}",
                 f"sg-rows={args.sg_rows}",
                 f"subgroup-size={args.subgroup_size}",
-                f"time(us): {elapsed:.2f}",
-                f"GFLOPS: {gflops:.2f}",
             ]
+            if args.reduction_step_size is not None:
+                parts.append(f"reduction-step-size={args.reduction_step_size}")
+            parts.extend(
+                [
+                    f"time(us): {elapsed:.2f}",
+                    f"GFLOPS: {gflops:.2f}",
+                ]
+            )
             print(" ".join(parts))
