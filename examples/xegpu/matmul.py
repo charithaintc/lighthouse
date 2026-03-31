@@ -7,34 +7,65 @@
 # CHECK: module attributes {gpu.container_module} {
 
 """
-XeGPU matrix multiplication benchmark.
+XeGPU matrix multiplication example.
 """
 
 import argparse
 import ctypes
-from typing import Optional
+import json
+from dataclasses import dataclass
+from typing import Optional, ClassVar
 from functools import cached_property
 
 import numpy as np
 from mlir import ir
-from mlir.execution_engine import ExecutionEngine
 
 from lighthouse import dialects as lh_dialects
-from lighthouse.workload import benchmark, get_bench_wrapper_schedule
-from lighthouse.utils.memref import to_ctype as memref_to_ctype
-from lighthouse.utils.numpy import numpy_to_ctype
-from lighthouse.schedule.xegpu.mlp_schedule import get_schedule_module
-from lighthouse.ingress.mlir_gen import (
-    generate_gpu_matmul_payload,
-    get_mlir_elem_type,
+from lighthouse.pipeline.driver import TransformDriver
+from lighthouse.execution import (
+    benchmark,
+    execute,
+    get_bench_wrapper_schedule,
+    MemoryManager,
+    GPUMemoryManager,
 )
+from lighthouse.schedule.xegpu.mlp_schedule import get_schedule_module
+from lighthouse.utils.numpy import mlir_to_numpy_dtype
+from lighthouse.ingress.mlir_gen import generate_gpu_matmul_payload, get_mlir_elem_type
 
-from xegpu_workload import XeGPUWorkload, matmul_complexity
+import parameter_selector
 
 
-class XeGPUMatMul(XeGPUWorkload):
+def matmul_complexity(
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    relu: bool,
+    accumulate_c: bool,
+    nbytes_ab: int,
+    nbytes_c: int,
+):
+    """Complexity of matmul operation with optional post-ops"""
+    flop_count = 2 * M * N * K
+    memory_reads = (M * K + K * N) * nbytes_ab  # read A and B
+    memory_writes = M * N * nbytes_c  # write C
+    # Below we assume the post-ops are tiled-and-fused and do not cause
+    # reads/writes to global memory.
+    if bias:
+        flop_count += M * N
+        memory_reads += N * nbytes_c  # read bias vector
+    if relu:
+        flop_count += M * N
+    if accumulate_c:
+        memory_reads += M * N * nbytes_c  # read C for accumulation
+    return flop_count, memory_reads, memory_writes
+
+
+@dataclass
+class XeGPUMatMul:
     """
-    Matrix multiplication workload on XeGPU.
+    Matrix multiplication kernel on XeGPU.
 
     Computes C = A * B for input matrices A (M x K) and B (K x N).
 
@@ -42,38 +73,37 @@ class XeGPUMatMul(XeGPUWorkload):
     Optionally adds a bias term to C (not implemented yet).
     """
 
-    def __init__(
-        self,
-        M: int,
-        N: int,
-        K: int,
-        ab_type: str = "f16",
-        c_type: str = "f32",
-        has_bias: bool = False,
-        has_relu: bool = False,
-        accumulate_c: bool = True,
-    ):
-        super().__init__()
-        self.M = M
-        self.N = N
-        self.K = K
-        self.a_shape = (M, K)
-        self.b_shape = (K, N)
-        self.c_shape = (M, N)
-        self.bias_shape = (N,)
-        assert ab_type == "f16", "Only f16 type is supported for A and B"
-        assert c_type == "f32", "Only f32 type is supported for C"
-        self.ab_type = ab_type
-        self.c_type = c_type
-        type_str_to_numpy = {
-            "f16": np.float16,
-            "f32": np.float32,
-        }
-        self.ab_dtype = type_str_to_numpy[ab_type]
-        self.c_dtype = type_str_to_numpy[c_type]
-        self.has_bias = has_bias
-        self.has_relu = has_relu
-        self.accumulate_c = accumulate_c
+    payload_function_name: ClassVar[str] = "payload"
+    memory_manager_class: ClassVar[type[MemoryManager]] = GPUMemoryManager
+
+    M: int = 1024
+    N: int = 1024
+    K: int = 1024
+    ab_type: ir.Type | str | None = None
+    c_type: ir.Type | str | None = None
+    has_bias: bool = False
+    has_relu: bool = False
+    accumulate_c: bool = True
+
+    def __post_init__(self):
+        if isinstance(self.ab_type, str):
+            self.ab_type = get_mlir_elem_type(self.ab_type)
+        if isinstance(self.c_type, str):
+            self.c_type = get_mlir_elem_type(self.c_type)
+        if self.ab_type is None:
+            self.ab_type = ir.F16Type.get()
+        if self.c_type is None:
+            self.c_type = ir.F32Type.get()
+        assert isinstance(self.ab_type, ir.F16Type), (
+            "Only f16 type is supported for A and B"
+        )
+        assert isinstance(self.c_type, ir.F32Type), "Only f32 type is supported for C"
+        self.ab_dtype = mlir_to_numpy_dtype(self.ab_type)
+        self.c_dtype = mlir_to_numpy_dtype(self.c_type)
+        self.a_shape = (self.M, self.K)
+        self.b_shape = (self.K, self.N)
+        self.c_shape = (self.M, self.N)
+        self.bias_shape = (self.N,)
 
     @cached_property
     def _initial_host_arrays(self) -> list[np.ndarray]:
@@ -89,82 +119,10 @@ class XeGPUMatMul(XeGPUWorkload):
         A = gen_random(self.a_shape, self.ab_dtype)
         B = gen_random(self.b_shape, self.ab_dtype)
         C = gen_random(self.c_shape, self.c_dtype)
-        bias = None
         if self.has_bias:
             bias = gen_random(self.bias_shape, self.c_dtype)
-        return C, A, B, bias
-
-    @cached_property
-    def _reference_solution(self) -> np.ndarray:
-        """Compute reference solution on host with numpy."""
-        C, A, B, bias = self._initial_host_arrays
-        # use float32 data type for efficiency
-        f32 = np.float32
-        C_ref = A.astype(f32) @ B.astype(f32)
-        if self.accumulate_c:
-            C_ref += C.astype(f32)
-        if self.has_bias:
-            C_ref += bias.astype(f32)
-        if self.has_relu:
-            C_ref = np.maximum(C_ref, 0)
-        return C_ref
-
-    def _get_input_arrays(
-        self, execution_engine: ExecutionEngine
-    ) -> list[ctypes.Structure]:
-        # Allocate device memory for inputs and outputs.
-        A_gpu = self._allocate_array("A", self.a_shape, self.ab_type, execution_engine)
-        B_gpu = self._allocate_array("B", self.b_shape, self.ab_type, execution_engine)
-        C_gpu = self._allocate_array("C", self.c_shape, self.c_type, execution_engine)
-        if self.has_bias:
-            bias_gpu = self._allocate_array(
-                "bias", self.bias_shape, self.c_type, execution_engine
-            )
-
-        # Copy initial values to device.
-        C_host, A_host, B_host, bias_host = self._initial_host_arrays
-        copy_ab, copy_c = ("gpu_copy_2d_" + s for s in (self.ab_type, self.c_type))
-        execution_engine.invoke(copy_ab, numpy_to_ctype(A_host), memref_to_ctype(A_gpu))
-        execution_engine.invoke(copy_ab, numpy_to_ctype(B_host), memref_to_ctype(B_gpu))
-        execution_engine.invoke(copy_c, numpy_to_ctype(C_host), memref_to_ctype(C_gpu))
-        if self.has_bias:
-            copy_bias = "gpu_copy_1d_" + self.c_type
-            execution_engine.invoke(
-                copy_bias, numpy_to_ctype(bias_host), memref_to_ctype(bias_gpu)
-            )
-
-        # Return memrefs for the payload function.
-        if self.has_bias:
-            return [C_gpu, A_gpu, B_gpu, bias_gpu]
-        return [C_gpu, A_gpu, B_gpu]
-
-    def check_correctness(
-        self, execution_engine: ExecutionEngine, verbose: int = 0
-    ) -> bool:
-        # Copy result from device to host.
-        C_gpu = self.gpu_memrefs[("C", self.c_type)]
-        C_host_copy = np.zeros((self.M, self.N), dtype=self.c_dtype)
-        execution_engine.invoke(
-            "gpu_copy_2d_" + self.c_type,
-            memref_to_ctype(C_gpu),
-            numpy_to_ctype(C_host_copy),
-        )
-
-        C_host_ref = self._reference_solution
-        C_host = C_host_copy.astype(np.float32)
-        if verbose > 1:
-            print("Reference solution:")
-            print(C_host_ref)
-            print("Computed solution:")
-            print(C_host)
-        success = np.allclose(C_host, C_host_ref)
-
-        if verbose:
-            if success:
-                print("PASSED")
-            else:
-                print("FAILED Result mismatch!")
-        return success
+            return C, A, B, bias
+        return C, A, B
 
     def get_complexity(self) -> tuple[int, int, int]:
         nbytes_ab = np.dtype(self.ab_dtype).itemsize
@@ -186,11 +144,17 @@ class XeGPUMatMul(XeGPUWorkload):
             M=self.M,
             N=self.N,
             K=self.K,
-            ab_type=get_mlir_elem_type(self.ab_type),
-            c_type=get_mlir_elem_type(self.c_type),
+            ab_type=self.ab_type,
+            c_type=self.c_type,
             has_bias=self.has_bias,
             has_relu=self.has_relu,
             accumulate_c=self.accumulate_c,
+        )
+        ranks_and_types = [(2, self.ab_type), (2, self.c_type)]
+        if self.has_bias:
+            ranks_and_types.append((1, self.c_type))
+        self.memory_manager_class.emit_memory_management_funcs(
+            mod, ranks_and_types=ranks_and_types
         )
         return mod
 
@@ -199,7 +163,7 @@ class XeGPUMatMul(XeGPUWorkload):
     ) -> list[ir.Module]:
         assert parameters is not None, "Schedule parameters must be provided"
         return [
-            get_bench_wrapper_schedule(self),
+            get_bench_wrapper_schedule(self.payload_function_name),
             get_schedule_module(
                 has_bias=self.has_bias,
                 has_relu=self.has_relu,
@@ -213,9 +177,78 @@ class XeGPUMatMul(XeGPUWorkload):
         return ["libmlir_levelzero_runtime.so"]
 
 
-def parse_cli():
+def execute_and_check(mmul: XeGPUMatMul, payload: ir.Module, verbose: int = 0) -> bool:
+    """Execute the matmul kernel and check correctness of the result."""
+
+    # Setup callback function to copy result from device to host.
+    D_host_copy = np.zeros((mmul.M, mmul.N), dtype=mmul.c_dtype)
+
+    def argument_access_callback(
+        inputs: list[ctypes.Structure], *, memory_manager: GPUMemoryManager, **kwargs
+    ):
+        memory_manager.copy(inputs[0], D_host_copy)
+
+    # Execute kernel once.
+    execute(
+        payload,
+        host_input_buffers=mmul._initial_host_arrays,
+        mem_manager_cls=mmul.memory_manager_class,
+        shared_libs=mmul.shared_libs(),
+        payload_function_name=mmul.payload_function_name,
+        argument_access_callback=argument_access_callback,
+    )
+
+    # Compute reference solution on host.
+    host_inputs = mmul._initial_host_arrays
+    C, A, B = host_inputs[:3]
+    bias = host_inputs[3] if mmul.has_bias else None
+
+    # use float32 data type for efficiency
+    f32 = np.float32
+    D_ref = A.astype(f32) @ B.astype(f32)
+    if mmul.accumulate_c:
+        D_ref += C.astype(f32)
+    if mmul.has_bias:
+        D_ref += bias.astype(f32)
+    if mmul.has_relu:
+        D_ref = np.maximum(D_ref, 0)
+
+    D_host = D_host_copy.astype(np.float32)
+    if verbose > 1:
+        print("Reference solution:")
+        print(D_ref)
+        print("Computed solution:")
+        print(D_host)
+    success = np.allclose(D_host, D_ref)
+
+    if verbose:
+        if success:
+            print("PASSED")
+        else:
+            print("FAILED Result mismatch!")
+
+    return success
+
+
+def run_benchmark(
+    mmul: XeGPUMatMul, payload_module: ir.Module, nruns: int = 100, nwarmup: int = 10
+) -> np.ndarray:
+    """Benchmark the matmul kernel and return array of execution times in seconds."""
+    times = benchmark(
+        payload_module,
+        host_input_buffers=mmul._initial_host_arrays,
+        mem_manager_cls=mmul.memory_manager_class,
+        shared_libs=mmul.shared_libs(),
+        nruns=nruns,
+        nwarmup=nwarmup,
+    )
+    return times
+
+
+def cli_parser(description):
+    """CLI argument parser for args shared with autotuner."""
     parser = argparse.ArgumentParser(
-        description="Matrix Multiplication using MLIR",
+        description=description,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -227,72 +260,6 @@ def parse_cli():
         nargs=3,
         default=[4096, 4096, 4096],
         help="M,N,K matrix sizes (A=MxK, B=KxN, C=MxN).",
-    )
-    parser.add_argument(
-        "--wg-tile",
-        type=int,
-        nargs=2,
-        default=[256, 256],
-        help="Workgroup tile size M,N.",
-    )
-    parser.add_argument(
-        "--sg-tile",
-        type=int,
-        nargs=2,
-        default=[32, 32],
-        help="Subgroup tile size M,N.",
-    )
-    parser.add_argument(
-        "--k-tile",
-        type=int,
-        default=64,
-        help="Inner reduction dimension tile size K.",
-    )
-    parser.add_argument(
-        "--load-tile-a",
-        type=int,
-        nargs=2,
-        default=[32, 16],
-        help="Tile size for loading A matrix for DPAS op.",
-    )
-    parser.add_argument(
-        "--load-tile-b",
-        type=int,
-        nargs=2,
-        default=[32, 16],
-        help="Tile size for loading B matrix for DPAS op.",
-    )
-    parser.add_argument(
-        "--prefetch-tile-a",
-        type=int,
-        nargs=2,
-        default=[8, 32],
-        help="Tile size for cooperative prefetching of subgroup A matrix",
-    )
-    parser.add_argument(
-        "--prefetch-tile-b",
-        type=int,
-        nargs=2,
-        default=[16, 32],
-        help="Tile size for cooperative prefetching of subgroup B matrix",
-    )
-    parser.add_argument(
-        "--nb-prefetch",
-        type=int,
-        default=1,
-        help="Number of initial prefetches.",
-    )
-    parser.add_argument(
-        "--nruns",
-        type=int,
-        default=1000,
-        help="Number of runs to average the execution time.",
-    )
-    parser.add_argument(
-        "--nwarmup",
-        type=int,
-        default=20,
-        help="Number of warm-up iterations before benchmarking.",
     )
     parser.add_argument(
         "--bias",
@@ -309,10 +276,73 @@ def parse_cli():
         action="store_true",
         help="Compute plain matrix-multiply C=A*B instead of matrix-multiply-accumulate C+=A*B.",
     )
+    return parser
+
+
+def parse_cli_args(description):
+    parser = cli_parser(description=description)
+    parser.add_argument(
+        "--wg-tile",
+        type=int,
+        nargs=2,
+        help="Workgroup tile size M,N.",
+    )
+    parser.add_argument(
+        "--sg-tile",
+        type=int,
+        nargs=2,
+        help="Subgroup tile size M,N.",
+    )
+    parser.add_argument(
+        "--k-tile",
+        type=int,
+        help="Inner reduction dimension tile size K.",
+    )
+    parser.add_argument(
+        "--load-tile-a",
+        type=int,
+        nargs=2,
+        help="Tile size for loading A matrix for DPAS op.",
+    )
+    parser.add_argument(
+        "--load-tile-b",
+        type=int,
+        nargs=2,
+        help="Tile size for loading B matrix for DPAS op.",
+    )
+    parser.add_argument(
+        "--prefetch-tile-a",
+        type=int,
+        nargs=2,
+        help="Tile size for cooperative prefetching of subgroup A matrix",
+    )
+    parser.add_argument(
+        "--prefetch-tile-b",
+        type=int,
+        nargs=2,
+        help="Tile size for cooperative prefetching of subgroup B matrix",
+    )
+    parser.add_argument(
+        "--prefetch-nb",
+        type=int,
+        help="Number of initial prefetches.",
+    )
     parser.add_argument(
         "--check-result",
         action="store_true",
         help="Check the result of the matrix multiplication.",
+    )
+    parser.add_argument(
+        "--nruns",
+        type=int,
+        default=1000,
+        help="Number of runs to average the execution time.",
+    )
+    parser.add_argument(
+        "--nwarmup",
+        type=int,
+        default=20,
+        help="Number of warm-up iterations before benchmarking.",
     )
     parser.add_argument(
         "--dump-kernel",
@@ -334,67 +364,123 @@ def parse_cli():
         action="store_true",
         help="Dump transform schedule.",
     )
+    parser.add_argument(
+        "--json",
+        help="Read problem sizes and tile parameters from a JSON file.",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="count",
+        default=0,
+        help="Increase output verbosity (e.g. print reference and computed solutions).",
+    )
     args = parser.parse_args()
 
     return args
 
 
 if __name__ == "__main__":
-    args = parse_cli()
+    description = """XeGPU matrix multiplication example with tunable parameters.
 
-    M, N, K = args.sizes
+If run without arguments, executes a M=N=K=4096 matrix-multiply-accumulate
+kernel without bias or relu and default tile sizes. The problem size and tile
+sizes can be overridden by providing a JSON file or using the CLI arguments.
+CLI arguments take precedence over everything else. Bias and relu can only be
+enabled via CLI arguments.
+"""
+    args = parse_cli_args(description=description)
 
-    params = {
-        "m": M,
-        "n": N,
-        "k": K,
-        "wg_m": None if args.all_knobs else args.wg_tile[0],
-        "wg_n": None if args.all_knobs else args.wg_tile[1],
-        "sg_m": None if args.all_knobs else args.sg_tile[0],
-        "sg_n": None if args.all_knobs else args.sg_tile[1],
-        "k_tile": None if args.all_knobs else args.k_tile,
-        "load_a_m": None if args.all_knobs else args.load_tile_a[0],
-        "load_a_k": None if args.all_knobs else args.load_tile_a[1],
-        "load_b_k": None if args.all_knobs else args.load_tile_b[0],
-        "load_b_n": None if args.all_knobs else args.load_tile_b[1],
-        "prefetch_a_m": None if args.all_knobs else args.prefetch_tile_a[0],
-        "prefetch_a_k": None if args.all_knobs else args.prefetch_tile_a[1],
-        "prefetch_b_k": None if args.all_knobs else args.prefetch_tile_b[0],
-        "prefetch_b_n": None if args.all_knobs else args.prefetch_tile_b[1],
-        "prefetch_nb": args.nb_prefetch,
-    }
+    # Problem size
+    m, n, k = args.sizes if args.sizes else (4096, 4096, 4096)
+    # Get default parameters from the database
+    try:
+        params = parameter_selector.get_matmul_parameters(m, n, k)
+    except ValueError:
+        # Initialize with a stub and assume the rest will be populated
+        params = {
+            "m": m,
+            "n": n,
+            "k": k,
+            "wg_m": None,
+            "wg_n": None,
+            "sg_m": None,
+            "sg_n": None,
+            "k_tile": None,
+            "load_a_m": None,
+            "load_a_k": None,
+            "load_b_k": None,
+            "load_b_n": None,
+            "prefetch_a_m": None,
+            "prefetch_a_k": None,
+            "prefetch_b_k": None,
+            "prefetch_b_n": None,
+            "prefetch_nb": None,
+        }
+    if args.json:
+        # Override parameters with values from JSON file if provided
+        with open(args.json, "r") as f:
+            json_params = json.load(f)
+        params.update(json_params)
 
-    ab_type = "f16"
-    c_type = "f32"
+    # Override parameters with CLI args if provided
+    if args.wg_tile:
+        params["wg_m"], params["wg_n"] = args.wg_tile
+    if args.sg_tile:
+        params["sg_m"], params["sg_n"] = args.sg_tile
+    if args.k_tile:
+        params["k_tile"] = args.k_tile
+    if args.load_tile_a:
+        params["load_a_m"], params["load_a_k"] = args.load_tile_a
+    if args.load_tile_b:
+        params["load_b_k"], params["load_b_n"] = args.load_tile_b
+    if args.prefetch_tile_a:
+        params["prefetch_a_m"], params["prefetch_a_k"] = args.prefetch_tile_a
+    if args.prefetch_tile_b:
+        params["prefetch_b_k"], params["prefetch_b_n"] = args.prefetch_tile_b
+    if args.prefetch_nb is not None:
+        params["prefetch_nb"] = args.prefetch_nb
+
+    for k, v in params.items():
+        if v is None:
+            raise ValueError(
+                f"Parameter {k} is not set. Please provide it via CLI or JSON file."
+            )
 
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
 
         wload = XeGPUMatMul(
-            M=M,
-            N=N,
-            K=K,
-            ab_type=ab_type,
-            c_type=c_type,
+            M=params["m"],
+            N=params["n"],
+            K=params["k"],
             has_bias=args.bias,
             has_relu=args.relu,
             accumulate_c=not args.no_accumulate_c,
         )
 
         if args.dump_kernel or args.dump_schedule:
-            wload.lower_payload(
-                dump_payload=args.dump_kernel,
-                dump_schedule=args.dump_schedule,
-                schedule_parameters=params,
-            )
+            if args.dump_kernel:
+                pipeline = TransformDriver(
+                    wload.schedule_modules(
+                        stop_at_stage=args.dump_kernel, parameters=params
+                    )
+                )
+                payload = pipeline.apply(wload.payload_module())
+                print(payload)
+            if args.dump_schedule:
+                for schedule_module in wload.schedule_modules(parameters=params):
+                    print(schedule_module)
         else:
-            times = benchmark(
-                wload,
-                nruns=args.nruns,
-                nwarmup=args.nwarmup,
-                schedule_parameters=params,
-                check_correctness=args.check_result,
-                verbose=1,
+            pipeline = TransformDriver(wload.schedule_modules(parameters=params))
+            payload = pipeline.apply(wload.payload_module())
+            if args.check_result:
+                success = execute_and_check(wload, payload, args.verbose)
+                if not success:
+                    raise ValueError("Result mismatch!")
+
+            times = run_benchmark(
+                wload, payload, nruns=args.nruns, nwarmup=args.nwarmup
             )
             times *= 1e6  # convert to microseconds
             elapsed = np.mean(times)
@@ -404,17 +490,18 @@ if __name__ == "__main__":
             def list2str(a):
                 return ",".join(map(str, a))
 
-            parts = [
-                f"sizes={list2str(args.sizes)}",
-                f"dt={ab_type},{c_type}",
-                f"wg-tile={list2str(args.wg_tile)}",
-                f"sg-tile={list2str(args.sg_tile)}",
-                f"k-tile={args.k_tile}",
-                f"load-a-tile={list2str(args.load_tile_a)}",
-                f"load-b-tile={list2str(args.load_tile_b)}",
-                f"pf-a-tile={list2str(args.prefetch_tile_a)}",
-                f"pf-b-tile={list2str(args.prefetch_tile_b)}",
-                f"time(us): {elapsed:.2f}",
-                f"GFLOPS: {gflops:.2f}",
-            ]
-            print(" ".join(parts))
+            ab_type = str(wload.ab_type)
+            c_type = str(wload.c_type)
+            print(
+                f"sizes={list2str([params['m'], params['n'], params['k']])} "
+                f"dt={ab_type},{c_type} "
+                f"wg-tile={list2str([params['wg_m'], params['wg_n']])} "
+                f"sg-tile={list2str([params['sg_m'], params['sg_n']])} "
+                f"k-tile={params['k_tile']} "
+                f"load-a-tile={list2str([params['load_a_m'], params['load_a_k']])} "
+                f"load-b-tile={list2str([params['load_b_k'], params['load_b_n']])} "
+                f"pf-a-tile={list2str([params['prefetch_a_m'], params['prefetch_a_k']])} "
+                f"pf-b-tile={list2str([params['prefetch_b_k'], params['prefetch_b_n']])} "
+                f"time(us): {elapsed:.2f} "
+                f"GFLOPS: {gflops:.2f}"
+            )

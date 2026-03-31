@@ -11,30 +11,35 @@ following a 1d/2d weight-stationary partition strategy
 
 import argparse
 import ctypes
-from contextlib import contextmanager
-from typing import Optional
 import numpy as np
 
 from mlir import ir
-from mlir.dialects import transform
+from mlir.dialects import transform, func
 from mlir.dialects.transform.bufferization import OneShotBufferizeOp
 from mlir.dialects.bufferization import LayoutMapOption
-from mlir.execution_engine import ExecutionEngine
+from mlir.runtime.np_to_memref import ranked_memref_to_numpy
+from lighthouse.utils.memref import to_ctype as memref_to_ctype
 from mlir.runtime.np_to_memref import (
-    ranked_memref_to_numpy,
     make_nd_memref_descriptor,
     as_ctype,
 )
+from mlir.execution_engine import ExecutionEngine
 
 from lighthouse import dialects as lh_dialects
-from lighthouse.utils.memref import (
-    to_ctype as memref_to_ctype,
-    deallocate_memrefs_on_exit,
-)
 from lighthouse.pipeline.helper import apply_registered_pass, match
-from lighthouse.workload import Workload, benchmark, get_bench_wrapper_schedule
+from lighthouse.pipeline.driver import TransformDriver
+from lighthouse.execution import (
+    benchmark,
+    execute,
+    get_bench_wrapper_schedule,
+)
 from lighthouse.schedule import schedule_boilerplate
 from lighthouse.schedule.x86 import tile_and_vector_matmul
+from lighthouse.utils.numpy import numpy_to_mlir_type, mlir_to_numpy_dtype
+from lighthouse.ingress.mlir_gen.shard_utils import (
+    emit_dealloc,
+    emit_shard_gather,
+)
 from ff_weight_stationary import generate_ff_payload
 
 from mpi4py import MPI
@@ -49,6 +54,37 @@ WORLD_RANK = MPI.COMM_WORLD.Get_rank()
 def rprint(*args, **kwargs):
     if WORLD_RANK == 0:
         print(*args, **kwargs)
+
+
+def inspect_payload(payload_module: ir.Module) -> dict:
+    """
+    Inspect the payload module and extract metadata about the functions/ops it contains.
+
+    Returns a dictionary:
+    {
+        function_name: {
+            "inputs": [input types],
+            "results": [result types],
+        },
+        ...
+    }
+    """
+
+    functions = {}
+
+    def match_funcs(op: ir.Operation) -> ir.WalkResult:
+        op = op.opview
+        match op:
+            case func.FuncOp():
+                functions[op.sym_name.value] = {
+                    "inputs": op.type.inputs,
+                    "results": op.type.results,
+                }
+        return ir.WalkResult.ADVANCE
+
+    for op in payload_module.body.operations:
+        op.walk(match_funcs, ir.WalkOrder.PRE_ORDER)
+    return functions
 
 
 def parse_cla():
@@ -116,14 +152,41 @@ def parse_cla():
     return args
 
 
-class DistFF(Workload):
+def check_correctness(
+    A: np.ndarray, B: np.ndarray, C: np.ndarray, R: np.ndarray, verbose: int = 0
+) -> bool:
+    def sigmoid(z):
+        return 1 / (1 + np.exp(-z))
+
+    R_ref = sigmoid(A @ B) @ C
+
+    if verbose > 1:
+        rprint("Reference solution:")
+        rprint(R_ref)
+        rprint("Computed solution:")
+        rprint(R)
+        diff = R - R_ref
+        rprint(f"Difference: min={diff.min()}, max={diff.max()}")
+    success = np.allclose(R, R_ref, atol=1e-5)
+    success = MPI.COMM_WORLD.allreduce(success, op=MPI.LAND)
+    if success:
+        rprint("PASSED")
+    else:
+        rprint("FAILED Result mismatch!")
+    return success
+
+
+class DistFF:
     """
     A single feed-forward layer that can run on multiple MPI ranks.
 
-    A[:] = sigmoid(A@B)@C
+    D = sigmoid(A@B)@C
 
-    where A, B, C are (M,K), (K,N), (N,K) matrices respectively.
+    where A, B, C, D are (M,K), (K,N), (N,K), (M,K) matrices respectively.
     """
+
+    payload_function_name: str = "payload"
+    benchmark_function_name: str = "benchmark"
 
     def __init__(self, args, P: int, R: int):
         self.M = args.sizes[0]
@@ -136,90 +199,6 @@ class DistFF(Workload):
         self.grid = args.grid
         self.mpilibs = [args.mpilib]
         self.verbose = args.verbose
-
-    def _alloc_inout(self, execution_engine: ExecutionEngine) -> list[ctypes.Structure]:
-        rprint(" * Allocating input/output arrays...")
-        memrefs = [
-            make_nd_memref_descriptor(2, as_ctype(self.dtype))() for _ in range(4)
-        ]
-        # allocation functions use the same sharding annotations as the payload,
-        # so that each rank allocates only the part of the data it owns.
-        for i, v in enumerate(["act", "win", "wout", "act"]):
-            execution_engine.invoke(f"alloc_{v}", memref_to_ctype(memrefs[i]))
-            tmp = ranked_memref_to_numpy([memrefs[i]])
-            if not all(s % self.tile_size == 0 for s in tmp.shape):
-                raise ValueError(
-                    f"Memref {v}'s shape {tmp.shape} not divisible by tile_size {self.tile_size}"
-                )
-        return memrefs
-
-    def _init_inout(self, a: np.ndarray, b: np.ndarray, c: np.ndarray, r: np.ndarray):
-        rprint(" * Initializing input arrays...")
-        np.random.seed(self.comm_rank)  # different seed for each rank
-        for arr in [a, b, c, r]:
-            tmp = ranked_memref_to_numpy([arr])
-            tmp[:] = np.random.rand(*tmp.shape).astype(self.dtype)
-
-    @contextmanager
-    def allocate_inputs(self, execution_engine: ExecutionEngine):
-        self.input_memrefs = self._alloc_inout(execution_engine)
-        self._init_inout(*self.input_memrefs)
-        # Dealloc all memrefs on exit
-        with deallocate_memrefs_on_exit(
-            self.input_memrefs, execution_engine, "dealloc_2d"
-        ):
-            yield self.input_memrefs
-
-    def _gather(
-        self,
-        memref: ctypes.Structure,
-        execution_engine: ExecutionEngine,
-        gather_func: str,
-    ) -> ctypes.Structure:
-        gathered_memref = make_nd_memref_descriptor(2, as_ctype(self.dtype))()
-        execution_engine.invoke(
-            gather_func,
-            memref_to_ctype(gathered_memref),
-            memref_to_ctype(memref),
-        )
-        return gathered_memref
-
-    def _reference_solution(self, execution_engine: ExecutionEngine) -> np.ndarray:
-        rprint(" * Gathering input data...")
-        gathered = [
-            self._gather(self.input_memrefs[i], execution_engine, f"gather_{v}")
-            for i, v in enumerate(["act", "win", "wout"])
-        ]
-
-        rprint(" * Computing reference solution...")
-
-        def sigmoid(z):
-            return 1 / (1 + np.exp(-z))
-
-        with deallocate_memrefs_on_exit(gathered, execution_engine, "dealloc_2d"):
-            A, B, C = [ranked_memref_to_numpy([m]) for m in gathered]
-            result = sigmoid(A @ B) @ C
-        return result
-
-    def check_correctness(
-        self, execution_engine: ExecutionEngine, verbose: int = 0
-    ) -> bool:
-        gathered = self._gather(self.input_memrefs[-1], execution_engine, "gather_act")
-        with deallocate_memrefs_on_exit([gathered], execution_engine, "dealloc_2d"):
-            R = ranked_memref_to_numpy([gathered])
-            R_ref = self._reference_solution(execution_engine)
-            if verbose > 1:
-                rprint("Reference solution:")
-                rprint(R_ref)
-                rprint("Computed solution:")
-                rprint(R)
-            success = np.allclose(R, R_ref)
-        success = MPI.COMM_WORLD.allreduce(success, op=MPI.LAND)
-        if success:
-            rprint("PASSED")
-        else:
-            rprint("FAILED Result mismatch!")
-        return success
 
     def shared_libs(self) -> list[str]:
         return self.mpilibs + ["libmlir_c_runner_utils.so", "libmlir_runner_utils.so"]
@@ -263,25 +242,47 @@ class DistFF(Workload):
             grid=grid,
         )
         if len(self.grid) == 1:
+            split_act = [[], [0]]
+            split_win = [[], [0]]
+            split_wout = [[0], []]
             mod = generate_ff_payload(
                 **common,
-                split_act=[[], [0]],
-                split_win=[[], [0]],
-                split_wout=[[0], []],
+                split_act=split_act,
+                split_win=split_win,
+                split_wout=split_wout,
                 split_mm0a_mm1c=[[]],
                 split_mm0_c=[[], [0]],
                 split_sigmoid=[[], [0]],
             )
         else:
+            split_act = [[], [0, 1]]
+            split_win = [[0], [1]]
+            split_wout = [[1], [0]]
             mod = generate_ff_payload(
                 **common,
-                split_act=[[], [0, 1]],
-                split_win=[[0], [1]],
-                split_wout=[[1], [0]],
+                split_act=split_act,
+                split_win=split_win,
+                split_wout=split_wout,
                 split_mm0a_mm1c=[[], [0]],
                 split_mm0_c=[[], [1]],
                 split_sigmoid=[[], [1, 0]],
             )
+
+        # emit helper functions
+        with ir.InsertionPoint(mod.body):
+            grid_name = "grid0"
+            elem_type = numpy_to_mlir_type(self.dtype)
+            shapes = [
+                ("act", [self.M, self.K], split_act),
+                ("win", [self.K, self.N], split_win),
+                ("wout", [self.N, self.K], split_wout),
+            ]
+            ranks = set(len(shape) for _, shape, _ in shapes)
+            for name, shape, split in shapes:
+                tensor_type = ir.RankedTensorType.get(shape, elem_type)
+                emit_shard_gather(name, grid_name, tensor_type, split)
+            for rank in ranks:
+                emit_dealloc(elem_type, rank)
 
         if self.verbose > 1:
             rprint("Payload MLIR:")
@@ -346,9 +347,6 @@ class DistFF(Workload):
                 "gather_act",
                 "gather_win",
                 "gather_wout",
-                "alloc_act",
-                "alloc_win",
-                "alloc_wout",
             ]:
                 func = match(
                     mod,
@@ -387,18 +385,22 @@ class DistFF(Workload):
             transform.YieldOp()
         return schedule
 
-    def schedule_modules(
-        self, stop_at_stage: Optional[str] = None, parameters: Optional[dict] = None
-    ) -> list[ir.Module]:
+    def shard_schedule_modules(self) -> list[ir.Module]:
+        """Return schedules required to apply sharding."""
+        return [self.get_shard_schedule()]
+
+    def schedule_modules(self) -> list[ir.Module]:
         """Generate schedules:
-        - sharding propagation, partition, and MPI, tosa-to-linalg
         - adding benchmark wrapper
         - tile_and_vector
         - all the rest"""
         return [
-            self.get_shard_schedule(),
-            get_bench_wrapper_schedule(self),
-            tile_and_vector_matmul.create(self.tile_size),
+            get_bench_wrapper_schedule(
+                self.payload_function_name, self.benchmark_function_name
+            ),
+            tile_and_vector_matmul.create_schedule(
+                tile_sizes=[self.tile_size, self.tile_size]
+            ),
             self.get_bufferize_schedule(),
             self.get_lower_schedule(),
         ]
@@ -417,14 +419,80 @@ if __name__ == "__main__":
 
         wload = DistFF(args, P, R)
 
-        # execute(wload, verbose=args.verbose)
-        rprint(" Benchmark".center(60, "-"))
+        # inspect original payload function signature (for diagnostics)
+        payload = wload.payload_module()
+        payload_metadata = inspect_payload(payload)
+        payload_func_info = payload_metadata[wload.payload_function_name]
+        rprint("Payload inputs before sharding:")
+        for i, ttype in enumerate(payload_func_info["inputs"]):
+            rprint(f"  {i}: {ttype}")
+
+        # apply sharding
+        pipeline = TransformDriver(wload.shard_schedule_modules())
+        payload = pipeline.apply(payload)
+
+        # inspect sharded payload function signature
+        payload_metadata = inspect_payload(payload)
+        payload_func_info = payload_metadata[wload.payload_function_name]
+        rprint("Payload inputs after sharding:")
+        for i, ttype in enumerate(payload_func_info["inputs"]):
+            rprint(f"  {i}: {ttype}")
+
+        # allocate input buffers using local sharded shape
+        shapes_and_types = [
+            (ttype.shape, mlir_to_numpy_dtype(ttype.element_type))
+            for ttype in payload_func_info["inputs"]
+        ]
+        input_arrays = [
+            np.random.rand(*shape).astype(dtype) for shape, dtype in shapes_and_types
+        ]
+
+        rprint(" Correctness Check ".center(60, "-"))
+        # set up callback for gathering sharded arrays after execution
+        host_arrays = []
+        kinds = ["act", "win", "wout", "act"]
+        elem_type = numpy_to_mlir_type(wload.dtype)
+
+        def argument_access_callback(
+            inputs: list[ctypes.Structure],
+            *,
+            execution_engine: ExecutionEngine,
+            **kwargs,
+        ):
+            for buf, kind in zip(inputs, kinds):
+                rank = len(buf.shape)
+                np_dtype = mlir_to_numpy_dtype(elem_type)
+                # make descriptor for newly allocated gathered array
+                alloc = make_nd_memref_descriptor(rank, as_ctype(np_dtype))()
+                ptr_alloc = memref_to_ctype(alloc)
+                ptr_buf = memref_to_ctype(buf)
+                # gather
+                execution_engine.invoke("gather_" + kind, ptr_alloc, ptr_buf)
+                host_arrays.append(ranked_memref_to_numpy([alloc]).copy())
+                # deallocate the gathered buffer
+                execution_engine.invoke("dealloc_2d", ptr_alloc)
+
+        # execute once for correctness check
+        pipeline = pipeline = TransformDriver(wload.schedule_modules())
+        payload = pipeline.apply(payload)
+        execute(
+            payload,
+            shared_libs=wload.shared_libs(),
+            host_input_buffers=input_arrays,
+            payload_function_name=wload.payload_function_name,
+            argument_access_callback=argument_access_callback,
+        )
+        # check_correctness
+        check_correctness(*host_arrays, verbose=args.verbose)
+
+        rprint(" Benchmark ".center(60, "-"))
         times = benchmark(
-            wload,
+            payload,
+            shared_libs=wload.shared_libs(),
+            host_input_buffers=input_arrays,
+            benchmark_function_name=wload.benchmark_function_name,
             nruns=args.nruns,
             nwarmup=args.nwarmup,
-            check_correctness=True,
-            verbose=args.verbose,
         )
         # compute statistics
         times *= 1e6

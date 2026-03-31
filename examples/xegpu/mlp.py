@@ -15,75 +15,135 @@ lowered and executed.
 """
 
 import argparse
+from dataclasses import dataclass
 import ctypes
-from typing import Optional
+from typing import Optional, ClassVar
 from functools import cached_property
 import warnings
 
 import numpy as np
 from mlir import ir
-from mlir.execution_engine import ExecutionEngine
 
 from lighthouse import dialects as lh_dialects
-from lighthouse.workload import benchmark, get_bench_wrapper_schedule
-from lighthouse.utils.memref import to_ctype as memref_to_ctype
-from lighthouse.utils.numpy import numpy_to_ctype
+from lighthouse.pipeline.driver import TransformDriver
+from lighthouse.execution import (
+    benchmark,
+    execute,
+    get_bench_wrapper_schedule,
+    MemoryManager,
+    GPUMemoryManager,
+)
+from lighthouse.utils.numpy import mlir_to_numpy_dtype
 from lighthouse.schedule.xegpu.mlp_schedule import get_schedule_module
 from lighthouse.ingress.mlir_gen import (
     generate_gpu_mlp_payload,
     get_mlir_elem_type,
 )
 
-from xegpu_workload import XeGPUWorkload, matmul_complexity
 import parameter_selector
+from matmul import matmul_complexity
 
 
-class XeGPUMLP(XeGPUWorkload):
+def check_correctness(
+    initial_host_arrays: list[np.ndarray],
+    result: np.ndarray,
+    ab_dtype: np.dtype,
+    has_bias: bool = False,
+    has_relu: bool = False,
+    verbose: int = 0,
+) -> bool:
+    output_array, input_array, *rest = initial_host_arrays
+    if has_bias:
+        n = len(rest) // 2
+        weights = rest[:n]
+        biases = rest[n:]
+    else:
+        weights = rest
+        biases = []
+    # use float32 data type for efficiency
+    output_array = output_array.astype(np.float32)
+    input_array = input_array.astype(np.float32)
+    weights = [w.astype(np.float32) for w in weights]
+    biases = [b.astype(np.float32) for b in biases]
+
+    a_array = input_array
+    for i, W in enumerate(weights):
+        D_ref = a_array @ W
+        if has_bias:
+            D_ref += biases[i]
+        if has_relu and i < len(weights) - 1:
+            D_ref = np.maximum(D_ref, 0)
+        a_array = D_ref.astype(ab_dtype).astype(np.float32)
+
+    D_ref = a_array.astype(ab_dtype)
+    D = result
+    if verbose > 1:
+        print("Reference solution:")
+        print(D_ref)
+        print("Computed solution:")
+        print(D)
+    success = np.allclose(D, D_ref)
+
+    if verbose:
+        if success:
+            print("PASSED")
+        else:
+            print("FAILED Result mismatch!")
+            print(f"Max absolute error: {np.max(np.abs(D - D_ref))}")
+            num_diff = np.sum(np.abs(D - D_ref) > 1e-3)
+            print(f"Number of differing elements: {num_diff}")
+    return success
+
+
+@dataclass
+class XeGPUMLP:
     """
-    Multi-layer perceptron (MLP) workload on XeGPU.
+    Multi-layer perceptron (MLP) kernel on XeGPU.
 
     Optionally adds a ReLU operation after each layer.
     Optionally adds a bias term in each layer (not implemented yet).
     """
 
-    def __init__(
-        self,
-        batch_size: int,
-        input_size: int,
-        output_size: int,
-        hidden_layer_sizes: Optional[list[int]] = None,
-        ab_type: str = "f16",
-        acc_type: str = "f32",
-        has_bias: bool = False,
-        has_relu: bool = False,
-        accumulate_c: bool = False,
-        identity_weights: bool = False,
-    ):
-        super().__init__()
-        self.batch_size = batch_size
-        self.input_size = input_size
-        self.output_size = output_size
-        self.hidden_layer_sizes = hidden_layer_sizes or []
+    payload_function_name: ClassVar[str] = "payload"
+    memory_manager_class: ClassVar[type[MemoryManager]] = GPUMemoryManager
+
+    batch_size: int = 1024
+    input_size: int = 1024
+    output_size: int = 1024
+    hidden_layer_sizes: Optional[list[int]] = None
+    ab_type: ir.Type | str | None = None
+    acc_type: ir.Type | str | None = None
+    has_bias: bool = False
+    has_relu: bool = False
+    accumulate_c: bool = False
+    identity_weights: bool = False
+
+    def __post_init__(self):
+        if isinstance(self.ab_type, str):
+            self.ab_type = get_mlir_elem_type(self.ab_type)
+        if isinstance(self.acc_type, str):
+            self.acc_type = get_mlir_elem_type(self.acc_type)
+        if self.ab_type is None:
+            self.ab_type = ir.F16Type.get()
+        if self.acc_type is None:
+            self.acc_type = ir.F32Type.get()
+        assert isinstance(self.ab_type, ir.F16Type), (
+            "Only f16 type is supported for A and B"
+        )
+        assert isinstance(self.acc_type, ir.F32Type), (
+            "Only f32 type is supported for accumulator"
+        )
+        self.ab_dtype = mlir_to_numpy_dtype(self.ab_type)
+        self.acc_dtype = mlir_to_numpy_dtype(self.acc_type)
+
+        if self.hidden_layer_sizes is None:
+            self.hidden_layer_sizes = []
         self.input_shape = (self.batch_size, self.input_size)
         self.output_shape = (self.batch_size, self.output_size)
         layer_sizes = [self.input_size] + self.hidden_layer_sizes + [self.output_size]
         self.weight_shapes = list(zip(layer_sizes[:-1], layer_sizes[1:]))
         self.matmul_layers = [(self.batch_size, o, i) for i, o in self.weight_shapes]
-        self.identity_weights = identity_weights
-        self.bias_shapes = [(o,) for o in layer_sizes[1:]] if has_bias else []
-
-        assert ab_type == "f16", "Only f16 type is supported for A and B"
-        assert acc_type == "f32", "Only f32 type is supported for accumulator"
-        self.ab_type = ab_type
-        self.acc_type = acc_type
-        type_str_to_numpy = {
-            "f16": np.float16,
-            "f32": np.float32,
-        }
-        self.ab_dtype = type_str_to_numpy[ab_type]
-        self.has_bias = has_bias
-        self.has_relu = has_relu
-        self.accumulate_c = accumulate_c
+        self.bias_shapes = [(o,) for o in layer_sizes[1:]] if self.has_bias else []
 
         if len(self.matmul_layers) == 1 and self.has_relu:
             warnings.warn("Using ReLU on a single layer model has no effect.")
@@ -123,104 +183,7 @@ class XeGPUMLP(XeGPUWorkload):
                 b = gen_random(o, self.ab_dtype)
                 biases.append(b)
 
-        return output_array, input_array, weights, biases
-
-    @cached_property
-    def _reference_solution(self) -> np.ndarray:
-        """Compute reference solution on host with numpy."""
-        # NOTE for large problems the solution can overflow float16 range
-        output_array, input_array, weights, biases = self._initial_host_arrays
-        # use float32 data type for efficiency
-        output_array = output_array.astype(np.float32)
-        input_array = input_array.astype(np.float32)
-        weights = [w.astype(np.float32) for w in weights]
-        biases = [b.astype(np.float32) for b in biases]
-
-        a_array = input_array
-        for i, W in enumerate(weights):
-            C_ref = a_array @ W
-            if self.has_bias:
-                C_ref += biases[i]
-            if self.has_relu and i < len(weights) - 1:
-                C_ref = np.maximum(C_ref, 0)
-            a_array = C_ref.astype(self.ab_dtype).astype(np.float32)
-
-        C_ref += output_array
-        return C_ref.astype(self.ab_dtype)
-
-    def _get_input_arrays(
-        self, execution_engine: ExecutionEngine
-    ) -> list[ctypes.Structure]:
-        # Allocate device memory for inputs and outputs.
-        input_gpu = self._allocate_array(
-            "input", self.input_shape, self.ab_type, execution_engine
-        )
-        output_gpu = self._allocate_array(
-            "output", self.output_shape, self.ab_type, execution_engine
-        )
-        gpu_arrays_2d = [output_gpu, input_gpu]
-        for i, (in_size, out_size) in enumerate(self.weight_shapes):
-            W_gpu = self._allocate_array(
-                f"weight_{i}", (in_size, out_size), self.ab_type, execution_engine
-            )
-            gpu_arrays_2d.append(W_gpu)
-        gpu_arrays_1d = []
-        if self.has_bias:
-            for i, (out_size,) in enumerate(self.bias_shapes):
-                b_gpu = self._allocate_array(
-                    f"bias_{i}", (out_size,), self.ab_type, execution_engine
-                )
-                gpu_arrays_1d.append(b_gpu)
-
-        # Copy initial values to device.
-        input_arr, output_arr, weights, biases = self._initial_host_arrays
-        for host_arr, gpu_arr in zip([input_arr, output_arr] + weights, gpu_arrays_2d):
-            execution_engine.invoke(
-                "gpu_copy_2d_" + self.ab_type,
-                numpy_to_ctype(host_arr),
-                memref_to_ctype(gpu_arr),
-            )
-        if self.has_bias:
-            for host_arr, gpu_arr in zip(biases, gpu_arrays_1d):
-                execution_engine.invoke(
-                    "gpu_copy_1d_" + self.ab_type,
-                    numpy_to_ctype(host_arr),
-                    memref_to_ctype(gpu_arr),
-                )
-
-        # Return memrefs for the payload function.
-        return gpu_arrays_2d + gpu_arrays_1d
-
-    def check_correctness(
-        self, execution_engine: ExecutionEngine, verbose: int = 0
-    ) -> bool:
-        # copy result from device to host
-        res_gpu = self.gpu_memrefs[("output", self.ab_type)]
-        res_host_copy = np.zeros(self.output_shape, dtype=self.ab_dtype)
-        execution_engine.invoke(
-            "gpu_copy_2d_" + self.ab_type,
-            memref_to_ctype(res_gpu),
-            numpy_to_ctype(res_host_copy),
-        )
-
-        res_host_ref = self._reference_solution
-        res_host = res_host_copy
-        if verbose > 1:
-            print("Reference solution:")
-            print(res_host_ref)
-            print("Computed solution:")
-            print(res_host)
-        success = np.allclose(res_host, res_host_ref)
-
-        if verbose:
-            if success:
-                print("PASSED")
-            else:
-                print("FAILED Result mismatch!")
-                print(f"Max absolute error: {np.max(np.abs(res_host - res_host_ref))}")
-                num_diff = np.sum(np.abs(res_host - res_host_ref) > 1e-3)
-                print(f"Number of differing elements: {num_diff}")
-        return success
+        return output_array, input_array, *weights, *biases
 
     def get_complexity(self) -> tuple[int, int, int]:
         nbytes_ab = np.dtype(self.ab_dtype).itemsize
@@ -245,13 +208,19 @@ class XeGPUMLP(XeGPUWorkload):
             input_size=self.input_size,
             output_size=self.output_size,
             hidden_layer_sizes=self.hidden_layer_sizes,
-            ab_type=get_mlir_elem_type(self.ab_type),
-            acc_type=get_mlir_elem_type(self.acc_type),
-            bias_type=get_mlir_elem_type(self.ab_type),
-            result_type=get_mlir_elem_type(self.ab_type),
+            ab_type=self.ab_type,
+            acc_type=self.acc_type,
+            bias_type=self.ab_type,
+            result_type=self.ab_type,
             has_bias=self.has_bias,
             has_relu=self.has_relu,
             accumulate_c=self.accumulate_c,
+        )
+        ranks_and_types = [(2, self.ab_type), (2, self.acc_type)]
+        if self.has_bias:
+            ranks_and_types.append((1, self.ab_type))
+        self.memory_manager_class.emit_memory_management_funcs(
+            mod, ranks_and_types=ranks_and_types
         )
         return mod
 
@@ -259,7 +228,7 @@ class XeGPUMLP(XeGPUWorkload):
         self, stop_at_stage: Optional[str] = None, parameters: Optional[dict] = None
     ) -> list[ir.Module]:
         return [
-            get_bench_wrapper_schedule(self),
+            get_bench_wrapper_schedule(self.payload_function_name),
             get_schedule_module(
                 has_bias=self.has_bias,
                 has_relu=self.has_relu,
@@ -275,7 +244,7 @@ class XeGPUMLP(XeGPUWorkload):
 
 def parse_cli():
     parser = argparse.ArgumentParser(
-        description="MLP workload using MLIR",
+        description="XeGPU MLP example with tunable parameters.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -361,6 +330,13 @@ def parse_cli():
         action="store_true",
         help="Dump transform schedule.",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="count",
+        default=0,
+        help="Increase output verbosity (e.g. print reference and computed solutions).",
+    )
     args = parser.parse_args()
 
     return args
@@ -393,22 +369,65 @@ if __name__ == "__main__":
         ab_type = wload.ab_type
         acc_type = wload.acc_type
 
-        params = parameter_selector.get_matmul_parameters(wload)
+        params = parameter_selector.get_parameters_for_layers(matmuls)
 
         if args.dump_kernel or args.dump_schedule:
-            wload.lower_payload(
-                dump_payload=args.dump_kernel,
-                dump_schedule=args.dump_schedule,
-                schedule_parameters=params,
+            pipeline = TransformDriver(
+                wload.schedule_modules(
+                    stop_at_stage=args.dump_kernel, parameters=params
+                )
             )
+            payload = pipeline.apply(wload.payload_module())
+            if args.dump_kernel:
+                print(payload)
+            if args.dump_schedule:
+                for schedule_module in wload.schedule_modules(parameters=params):
+                    print(schedule_module)
         else:
+            pipeline = TransformDriver(wload.schedule_modules(parameters=params))
+            payload = pipeline.apply(wload.payload_module())
+            if args.check_result:
+                # Setup callback function to copy result from device to host.
+                result_host_copy = np.zeros(wload.output_shape, dtype=wload.ab_dtype)
+
+                def argument_access_callback(
+                    inputs: list[ctypes.Structure],
+                    *,
+                    memory_manager: GPUMemoryManager,
+                    **kwargs,
+                ):
+                    memory_manager.copy(inputs[0], result_host_copy)
+
+                # Execute kernel once.
+                execute(
+                    payload,
+                    host_input_buffers=wload._initial_host_arrays,
+                    mem_manager_cls=wload.memory_manager_class,
+                    shared_libs=wload.shared_libs(),
+                    payload_function_name=wload.payload_function_name,
+                    argument_access_callback=argument_access_callback,
+                )
+
+                # Compute reference solution on host.
+                success = check_correctness(
+                    wload._initial_host_arrays,
+                    result_host_copy,
+                    wload.ab_dtype,
+                    has_bias=wload.has_bias,
+                    has_relu=wload.has_relu,
+                    verbose=args.verbose,
+                )
+                if not success:
+                    raise ValueError("Result mismatch!")
+
             times = benchmark(
-                wload,
+                payload,
+                host_input_buffers=wload._initial_host_arrays,
+                mem_manager_cls=wload.memory_manager_class,
+                shared_libs=wload.shared_libs(),
                 nruns=args.nruns,
                 nwarmup=args.nwarmup,
-                schedule_parameters=params,
-                check_correctness=args.check_result,
-                verbose=2,
+                argument_access_callback=None,
             )
             times *= 1e6  # convert to microseconds
             elapsed = np.mean(times)

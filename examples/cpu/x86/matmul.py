@@ -1,4 +1,5 @@
 # RUN: %PYTHON %s --dump-kernel=vectorized | FileCheck %s
+# RUN: %PYTHON %s --dump-kernel=vectorized --tile-size=64 | FileCheck %s
 # RUN: %PYTHON %s --dump-kernel=vectorized --dtype=bf16 --avx512 | FileCheck %s --check-prefix=AVX512
 
 # CHECK: vector.broadcast
@@ -14,24 +15,27 @@ import ctypes
 import argparse
 import sys
 import warnings
-from contextlib import contextmanager
 
 import ml_dtypes
 import numpy as np
 from mlir import ir
 from mlir.dialects import linalg, transform
-from mlir.execution_engine import ExecutionEngine
-from mlir.dialects.transform import vector
 from mlir.dialects.transform import tensor
 
 from lighthouse import dialects as lh_dialects
-from lighthouse.workload import benchmark, get_bench_wrapper_schedule
+from lighthouse.pipeline.driver import TransformDriver
+from lighthouse.execution import (
+    benchmark,
+    execute,
+    get_bench_wrapper_schedule,
+)
 from lighthouse.utils.numpy import numpy_to_mlir_type
 from lighthouse.pipeline.helper import apply_registered_pass
 import lighthouse.utils as lh_utils
 from lighthouse import schedule as lh_schedule
 import lighthouse.schedule.x86 as lh_schedule_x86
 from lighthouse import transform as lh_transform
+import lighthouse.transform.x86 as lh_transform_x86
 import lighthouse.ingress.mlir_gen.utils as lh_mlir_utils
 from functools import cached_property
 from typing import Optional
@@ -39,13 +43,13 @@ from typing import Optional
 from mlir.runtime.np_to_memref import get_ranked_memref_descriptor
 from mlir.dialects import bufferization
 
-from lighthouse.workload import Workload
 
-
-class Matmul(Workload):
+class Matmul:
     """
     Computes GEMM: C = A * B on CPU.
     """
+
+    payload_function_name: str = "payload"
 
     def __init__(self, M: int, N: int, K: int, dtype=np.float32, tile_size: int = 32):
         if dtype not in [np.float32, ml_dtypes.bfloat16]:
@@ -66,13 +70,6 @@ class Matmul(Workload):
         self.dtype = dtype
         self.tile_size = tile_size
 
-    def check_correctness(
-        self, execution_engine: ExecutionEngine, verbose: int = 0
-    ) -> bool:
-        A, B, C = self._input_arrays
-        out_ref = np.matmul(A, B, dtype=np.float32)
-        return np.allclose(C, out_ref)
-
     @cached_property
     def _input_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         np.random.seed(123)
@@ -83,14 +80,6 @@ class Matmul(Workload):
 
     def _get_input_arrays(self) -> list[ctypes.Structure]:
         return [get_ranked_memref_descriptor(a) for a in self._input_arrays]
-
-    @contextmanager
-    def allocate_inputs(self, execution_engine: ExecutionEngine):
-        try:
-            yield self._get_input_arrays()
-        finally:
-            # cached numpy arrays are deallocated automatically
-            pass
 
     def shared_libs(self) -> list[str]:
         return []
@@ -143,7 +132,10 @@ class Matmul(Workload):
         scheds = []
 
         # Insert performance measurements.
-        scheds.append(get_bench_wrapper_schedule(self))
+        scheds.append(get_bench_wrapper_schedule(self.payload_function_name))
+
+        if stop_at_stage == "initial":
+            return scheds
 
         # GEMM block packing.
         # Create cache-friendly access pattern across matmul tiles.
@@ -175,7 +167,15 @@ class Matmul(Workload):
         # GEMM cache tiling.
         # Create memory friendly access pattern.
         gemm_op = "linalg.contract"
-        scheds.append(lh_schedule.tile(gemm_op, tile_sizes=[1, 1], fuse_producers=True))
+        with lh_schedule.schedule_boilerplate() as (sched, named_seq):
+            ops = lh_transform.match_op(named_seq.bodyTarget, gemm_op)
+            with lh_transform.foreach(ops) as op:
+                lh_transform_x86.matmul_cache_tiling(
+                    op, num_tiles=6, tile_size=self.tile_size, fuse_producers=True
+                )
+                transform.yield_()
+            transform.yield_()
+        scheds.append(sched)
 
         # Fold extra parallel outer unit dims before further tiling to help later
         # vectorization rewrites to recognize ops.
@@ -194,7 +194,7 @@ class Matmul(Workload):
         if self.tile_size % reg_tile_m != 0:
             reg_peel_loops.append(0)
         scheds.append(
-            lh_schedule.tile(
+            lh_schedule.tile_ops(
                 gemm_op,
                 tile_sizes=[reg_tile_batch, reg_tile_m, reg_tile_n, reg_tile_k],
                 tile_interchange=[1, 2, 0, 3],
@@ -214,7 +214,7 @@ class Matmul(Workload):
             reg_tile_k // reg_unroll_k,
         ]
         scheds.append(
-            lh_schedule.tile(
+            lh_schedule.tile_ops(
                 gemm_op,
                 tile_sizes=[0, reg_unroll_m, reg_unroll_n, reg_unroll_k],
                 unroll_factors=reg_unroll_factors,
@@ -222,8 +222,8 @@ class Matmul(Workload):
         )
 
         # Further tiling into hardware-friendly sizes for vectorization.
-        scheds.append(lh_schedule.tile("linalg.fill", tile_sizes=[1, 1, 1]))
-        scheds.append(lh_schedule.tile("linalg.generic", tile_sizes=[1, 8]))
+        scheds.append(lh_schedule.tile_ops("linalg.fill", tile_sizes=[1, 1, 1]))
+        scheds.append(lh_schedule.tile_ops("linalg.generic", tile_sizes=[1, 8]))
 
         if stop_at_stage == "tiled":
             return scheds
@@ -254,11 +254,7 @@ class Matmul(Workload):
 
         # Cleanup vector ops.
         with lh_schedule.schedule_boilerplate() as (sched, named_seq):
-            with ir.InsertionPoint(
-                transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
-            ):
-                vector.apply_patterns_vector_flatten_vector_transfer_ops()
-                transform.apply_patterns_canonicalization()
+            lh_transform.flatten_vector_ops(named_seq.bodyTarget)
             lh_transform.cleanup(named_seq.bodyTarget)
             transform.yield_()
         scheds.append(sched)
@@ -371,17 +367,42 @@ if __name__ == "__main__":
             sys.exit(1)
 
         wload = Matmul(*args.sizes, dtype=in_dtype, tile_size=args.tile_size)
+        pipeline = TransformDriver(
+            wload.schedule_modules(stop_at_stage=args.dump_kernel)
+        )
+        payload = pipeline.apply(wload.payload_module())
 
         if args.dump_kernel or args.dump_schedule:
-            wload.lower_payload(
-                dump_payload=args.dump_kernel,
-                dump_schedule=args.dump_schedule,
-            )
+            if args.dump_kernel:
+                print(payload)
+            if args.dump_schedule:
+                for schedule_module in wload.schedule_modules():
+                    print(schedule_module)
             sys.exit(0)
 
-        times = benchmark(
-            wload, check_correctness=True, nruns=args.nruns, nwarmup=args.nwarmup
+        # check correctness
+        execute(
+            payload,
+            host_input_buffers=wload._input_arrays,
+            shared_libs=wload.shared_libs(),
+            payload_function_name=wload.payload_function_name,
         )
+
+        A, B, C = wload._input_arrays
+        C_ref = np.matmul(A, B, dtype=np.float32)
+        success = np.allclose(C, C_ref)
+        if not success:
+            print("FAILED Result mismatch.")
+            sys.exit(1)
+
+        times = benchmark(
+            payload,
+            host_input_buffers=wload._input_arrays,
+            shared_libs=wload.shared_libs(),
+            nruns=args.nruns,
+            nwarmup=args.nwarmup,
+        )
+
         times *= 1e6  # convert to microseconds
 
         print(f"MxNxK: {args.sizes}")
