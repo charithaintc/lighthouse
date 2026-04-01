@@ -237,6 +237,17 @@ def bundle_xegpu_softmax_schedule(
     transform.apply_cse(mod)
     canonicalize(mod)
 
+    # promote memref.alloc to memref.alloca in payload function
+    func = match(mod, ops={"func.func"})
+    func = apply_registered_pass(
+        func,
+        "promote-buffers-to-stack",
+        options={
+            "max-alloc-size-in-bytes": "8192",
+            "max-rank-of-allocated-memref": "2",
+        },
+    )
+
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
 
