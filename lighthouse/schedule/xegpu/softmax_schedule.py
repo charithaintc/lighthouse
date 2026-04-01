@@ -140,6 +140,7 @@ def bundle_xegpu_softmax_schedule(
         transform.AnyOpType.get(), func, ops=["linalg.softmax"]
     )
     structured.structured_decompose_interface(anytype, softmax_ops)
+    # transform.print_(target=func, name="After structured_decompose_interface")
 
     linalg_ops = match_and_split(
         func, ops={"linalg.generic", "linalg.fill"}, nhandles=6
@@ -151,22 +152,60 @@ def bundle_xegpu_softmax_schedule(
 
     reduction_step_size = parameters["reduction_step_size"]
 
-    # Tile all reduction ops using the same step size
-    reduction_ops = [max_reduction, sum_reduction]
-    for reduction_op in reduction_ops:
-        structured.structured_tile_reduction_using_for(
-            [anytype],
-            anytype,
-            anytype,
-            anytype,
-            target=reduction_op,
-            tile_sizes=[0, reduction_step_size],
-        )
-    # Tile elementwise ops to match the reduction tile size
-    elementwise_ops = [max_center_and_exp_op, div_op]
-    for elementwise_op in elementwise_ops:
-        structured.TileUsingForOp(elementwise_op, sizes=[0, reduction_step_size])
+    # Tile the division op and fuse the sub+exp producer into it
+    _, div_loop = structured.TileUsingForOp(
+        div_op, sizes=[0, reduction_step_size]
+    ).results
 
+    # Fuse max_center_and_exp_op into the div loop
+    _, fused_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=max_center_and_exp_op,
+        containing_op=div_loop,
+    )
+
+    # Tile the sum reduction and fuse the sub+exp producer into it
+    _, _, _, sum_loop = structured.structured_tile_reduction_using_for(
+        [anytype],
+        anytype,
+        anytype,
+        anytype,
+        target=sum_reduction,
+        tile_sizes=[0, reduction_step_size],
+    )
+
+    func = transform.get_parent_op(
+        anytype,
+        fused_loop,
+        op_name="func.func",
+        deduplicate=True,
+    )
+
+    # Re-match and split linalg generic ops, there are 5 at this point
+    linalg_ops = match_and_split(func, ops={"linalg.generic"}, nhandles=5)
+    max_center_and_exp_op = linalg_ops[1]
+
+    # Fuse max_center_and_exp_op into the sum reduction loop
+    _, fused_sum_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=max_center_and_exp_op,
+        containing_op=sum_loop,
+    )
+
+    # Tile the max reduction.
+    max_reduction = linalg_ops[0]
+    structured.structured_tile_reduction_using_for(
+        [anytype],
+        anytype,
+        anytype,
+        anytype,
+        target=max_reduction,
+        tile_sizes=[0, reduction_step_size],
+    )
+
+    # Cleanup after tiling and fusion
     transform.apply_cse(func)
     canonicalize(func)
 
@@ -227,6 +266,9 @@ def bundle_xegpu_softmax_schedule(
     mod = apply_registered_pass(mod, "gpu-kernel-outlining")
     transform.apply_cse(mod)
 
+    if stop_at_stage == "gpu-outlining":
+        raise PipelineInterrupt()
+
     # set xevm target
     mod = apply_registered_pass(
         mod,
@@ -240,6 +282,10 @@ def bundle_xegpu_softmax_schedule(
         gpu_func = match(gpu_mod, ops={"gpu.func"})
         gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
         transform.apply_cse(gpu_func)
+
+    # Cleanup.
+    transform.apply_cse(mod)
+    canonicalize(mod)
 
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()

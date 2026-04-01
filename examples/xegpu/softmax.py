@@ -212,6 +212,7 @@ def parse_cli():
             "tiled",
             "vectorized",
             "bufferized",
+            "gpu-outlining",
             "xegpu-initial",
             "xegpu-wg",
             "final",
