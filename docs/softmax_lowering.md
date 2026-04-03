@@ -305,9 +305,9 @@ xegpu.store_nd %11, %12[%0, 0]
 
 # Supporting larger Softmax dimension sizes
 
-When the softmax dimension is larger than what can fit efficiently in registers, additional tiling and fusion transformations are applied to the reduction dimension. This section shows the intermediate stages between "decomposed" and "vectorized".
+Previsouly we tiled all ops in the parallel dimension only (i.e. non softmax dim). Handling a larger softmax dimension require tiling the softmax contituent ops in that dimension. 
 
-**Approach:** Tile reductions along dimension 1 (step size = 16) and fuse producers into consumers to enable streaming computation.
+**Approach:** Tile reductions along dimension 1 (using appropriate step size) and fuse producers into consumers to enable streaming computation.
 
 ---
 
@@ -320,16 +320,27 @@ When the softmax dimension is larger than what can fit efficiently in registers,
 **Key Changes:**
 ```mlir
 // Before: Single division linalg.generic over 64x64
-%11 = linalg.generic {...} ins(%8, %10 : tensor<64x64xf32>, tensor<64xf32>) 
-      outs(%extracted_slice_0 : tensor<64x64xf32>) { ... } -> tensor<64x64xf32>
+scf.forall ... {
+  // Max, Center+Exp, Sum ops ...
+  %11 = linalg.generic {...} ins(%8, %10 : tensor<64x64xf32>, tensor<64xf32>) outs(%extracted_slice_0 : tensor<64x64xf32>) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %12 = arith.divf %in, %in_2 : f32
+      linalg.yield %12 : f32
+    } -> tensor<64x64xf32>
+}
 
 // After: Division tiled into 64x16 chunks
-%11 = scf.for %arg4 = %c0_2 to %c64 step %c16 iter_args(%arg5 = %extracted_slice_0) -> (tensor<64x64xf32>) {
-  %extracted_slice_3 = tensor.extract_slice %8[0, %arg4] [64, 16] [1, 1]
-  %12 = linalg.generic {...} ins(%extracted_slice_3, %extracted_slice_4 : tensor<64x16xf32>, tensor<64xf32>) 
-        outs(%extracted_slice_5 : tensor<64x16xf32>) { ... } -> tensor<64x16xf32>
-  %inserted_slice = tensor.insert_slice %12 into %arg5[0, %arg4] [64, 16] [1, 1]
-  scf.yield %inserted_slice
+scf.forall ... {
+  %11 = scf.for %arg4 = %c0_2 to %c64 step %c16 iter_args(%arg5 = %extracted_slice_0) -> (tensor<64x64xf32>) {
+      // Max, Center+Exp, Sum ops ...
+      %12 = linalg.generic {...} ins(%extracted_slice_3, %extracted_slice_4 : tensor<64x16xf32>, tensor<64xf32>) outs(%extracted_slice_5 : tensor<64x16xf32>) {
+      ^bb0(%in: f32, %in_6: f32, %out: f32):
+        %13 = arith.divf %in, %in_6 : f32
+        linalg.yield %13 : f32
+      } -> tensor<64x16xf32>
+      %inserted_slice = tensor.insert_slice %12 into %arg5[0, %arg4] [64, 16] [1, 1] : tensor<64x16xf32> into tensor<64x64xf32>
+      scf.yield %inserted_slice : tensor<64x64xf32>
+    }
 }
 ```
 
