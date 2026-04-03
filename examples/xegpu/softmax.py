@@ -182,12 +182,6 @@ def parse_cli():
         help="Subgroup size.",
     )
     parser.add_argument(
-        "--reduction-step-size",
-        type=int,
-        default=16,
-        help="Step size for reduction loop tiling (optional).",
-    )
-    parser.add_argument(
         "--nruns",
         type=int,
         default=1000,
@@ -212,7 +206,6 @@ def parse_cli():
             "tiled",
             "vectorized",
             "bufferized",
-            "gpu-outlining",
             "xegpu-initial",
             "xegpu-wg",
             "final",
@@ -244,7 +237,6 @@ if __name__ == "__main__":
         "wg_rows": args.wg_rows,
         "sg_rows": args.sg_rows,
         "subgroup_size": args.subgroup_size,
-        "reduction_step_size": args.reduction_step_size,
     }
 
     M, N = args.sizes
