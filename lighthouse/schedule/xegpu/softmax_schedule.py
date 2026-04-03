@@ -140,7 +140,7 @@ def bundle_xegpu_softmax_schedule(
         transform.AnyOpType.get(), func, ops=["linalg.softmax"]
     )
     structured.structured_decompose_interface(anytype, softmax_ops)
-    # transform.print_(target=func, name="After structured_decompose_interface")
+    transform.print_(target=func, name="Aftemr structured_decompose_interface")
 
     linalg_ops = match_and_split(
         func, ops={"linalg.generic", "linalg.fill"}, nhandles=6
@@ -156,6 +156,8 @@ def bundle_xegpu_softmax_schedule(
     _, div_loop = structured.TileUsingForOp(
         div_op, sizes=[0, reduction_step_size]
     ).results
+    
+    transform.print_(target=func, name="After tiling div op")
 
     # Fuse max_center_and_exp_op into the div loop
     _, fused_loop = structured.structured_fuse_into_containing_op(
@@ -164,6 +166,8 @@ def bundle_xegpu_softmax_schedule(
         producer_op=max_center_and_exp_op,
         containing_op=div_loop,
     )
+    transform.print_(target=func, name="After fusing max_center_and_exp_op into div loop")
+
 
     # Tile the sum reduction and fuse the sub+exp producer into it
     _, _, _, sum_loop = structured.structured_tile_reduction_using_for(
@@ -174,6 +178,8 @@ def bundle_xegpu_softmax_schedule(
         target=sum_reduction,
         tile_sizes=[0, reduction_step_size],
     )
+    
+    transform.print_(target=func, name="After tiling sum reduction")
 
     func = transform.get_parent_op(
         anytype,
@@ -193,6 +199,7 @@ def bundle_xegpu_softmax_schedule(
         producer_op=max_center_and_exp_op,
         containing_op=sum_loop,
     )
+    transform.print_(target=func, name="After fusing max_center_and_exp_op into sum loop")
 
     # Tile the max reduction.
     max_reduction = linalg_ops[0]
@@ -204,6 +211,8 @@ def bundle_xegpu_softmax_schedule(
         target=max_reduction,
         tile_sizes=[0, reduction_step_size],
     )
+    transform.print_(target=func, name="After tiling max reduction")
+
 
     # Cleanup after tiling and fusion
     transform.apply_cse(func)
@@ -219,6 +228,8 @@ def bundle_xegpu_softmax_schedule(
     ).result
     transform.apply_cse(func)
     canonicalize(func)
+    
+    transform.print_(target=func, name="After vectorization")
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
@@ -236,6 +247,8 @@ def bundle_xegpu_softmax_schedule(
     mod = apply_registered_pass(mod, "fold-memref-alias-ops")
     transform.apply_cse(mod)
     canonicalize(mod)
+    
+    transform.print_(target=mod, name="After bufferization")
 
     # promote memref.alloc to memref.alloca in payload function
     func = match(mod, ops={"func.func"})
@@ -247,6 +260,8 @@ def bundle_xegpu_softmax_schedule(
             "max-rank-of-allocated-memref": "2",
         },
     )
+    
+    transform.print_(target=func, name="After promoting buffers to stack")
 
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
@@ -276,6 +291,8 @@ def bundle_xegpu_softmax_schedule(
     func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
     mod = apply_registered_pass(mod, "gpu-kernel-outlining")
     transform.apply_cse(mod)
+    
+    transform.print_(target=mod, name="After GPU outlining")
 
     if stop_at_stage == "gpu-outlining":
         raise PipelineInterrupt()
