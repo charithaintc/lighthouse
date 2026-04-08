@@ -302,6 +302,33 @@ xegpu.store_nd %11, %12[%0, 0]
 ```
 
 ---
+## What is reused in between matmul and softmax?
+
+The softmax implementation leverages several reusable lighthouse infrastructure components:
+
+The workload-specific code is minimal (payload generation + tiling/decomposition strategy). Most infrastructure (execution, benchmarking, XeGPU lowering) is shared across different operations like matmul, softmax, etc.
+
+### Pipeline Infrastructure (`lighthouse.pipeline`)
+- **`TransformDriver`**: Orchestrates application of transform schedules to payload modules
+- **`apply_registered_pass`**: Applies named MLIR passes (e.g., `eliminate-empty-tensors`, `gpu-kernel-outlining`)
+- **`canonicalize`, `match`, `match_and_split`, `PipelineInterrupt`**: Helper utilities for constructing transform sequences
+
+### Execution Infrastructure (`lighthouse.execution`)
+- **`execute`**: Runs compiled MLIR modules on GPU with memory management
+- **`benchmark`**: Benchmarks kernel execution with warmup and timing utilities
+- **`GPUMemoryManager`**: Manages host-device memory transfers for GPU execution
+- **`get_bench_wrapper_schedule`**: Wraps payload functions with benchmarking infrastructure
+
+### XeGPU Lowering (`lighthouse.schedule.xegpu.helper`)
+- **`bundle_xegpu_to_binary`**: Common lowering path from XeGPU to executable binary (shared with matmul and other XeGPU workloads)
+  - Handles XeGPU peephole optimizations, layout propagation, and GPU-to-SPIRV/binary compilation
+
+### Payload Generation (`lighthouse.ingress.mlir_gen`)
+- **`get_mlir_elem_type`**: Type conversion utilities for constructing MLIR types
+
+**Key Insight**: 
+
+---
 
 # Supporting larger Softmax dimension sizes
 
