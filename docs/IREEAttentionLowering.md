@@ -6,9 +6,6 @@
 
 The `ConvertAttentionToOnlineAttentionPass` transforms a standard (offline) attention operation (`iree_linalg_ext.attention`) into an **online attention** operation (`iree_linalg_ext.online_attention`). Online attention computes attention in a **tiled/streaming** fashion, maintaining running max and running sum accumulators to perform numerically stable softmax incrementally — this is the core idea behind **FlashAttention**.
 
-### Why?
-
-Standard attention computes `softmax(Q @ K^T / scale) @ V` in a single monolithic step, requiring the entire attention matrix to be materialized in memory. Online attention tiles the computation over the key/value sequence dimension, updating partial results with running statistics, enabling **O(1) memory** in the sequence length.
 
 ### Before the Pass
 
@@ -23,8 +20,8 @@ A standard `iree_linalg_ext.attention` op with Q, K, V, scale, and output:
         affine_map<(d0, d1, d2, d3) -> ()>,         // scale
         affine_map<(d0, d1, d2, d3) -> (d0, d3)>    // output: (m, n)
     ]}
-    ins(%Q, %K, %V, %scale : tensor<16x64xf32>, tensor<4048x64xf32>,
-                              tensor<4048x64xf32>, f32)
+    ins(%Q, %K, %V, %scale : tensor<16x64xf32>, tensor<4096x64xf32>,
+                              tensor<4096x64xf32>, f32)
     outs(%output : tensor<16x64xf32>)
     -> tensor<16x64xf32>
 ```
@@ -56,8 +53,8 @@ The op is converted to `iree_linalg_ext.online_attention` with two additional ac
         affine_map<(d0, d1, d2, d3) -> (d0)>,       // running max: (m)
         affine_map<(d0, d1, d2, d3) -> (d0)>        // running sum: (m)
     ]}
-    ins(%Q, %K, %V, %scale : tensor<16x64xf32>, tensor<4048x64xf32>,
-                              tensor<4048x64xf32>, f32)
+    ins(%Q, %K, %V, %scale : tensor<16x64xf32>, tensor<4096x64xf32>,
+                              tensor<4096x64xf32>, f32)
     outs(%output_acc, %max_init, %sum_init : tensor<16x64xf32>,
                                               tensor<16xf32>,
                                               tensor<16xf32>) {
@@ -83,14 +80,16 @@ The op is converted to `iree_linalg_ext.online_attention` with two additional ac
 } -> tensor<16x64xf32>
 ```
 
+**Question**: not sure why they do it this way. why not embed the normalization also inside the op?
+
 ### Key Transformations
 
 | Aspect | Before | After |
 |--------|--------|-------|
 | **Op** | `iree_linalg_ext.attention` | `iree_linalg_ext.online_attention` |
 | **Q shape** | `tensor<16x64xf32>` | `tensor<16x64xf32>` (unchanged) |
-| **K shape** | `tensor<4048x64xf32>` | `tensor<4048x64xf32>` (unchanged) |
-| **V shape** | `tensor<4048x64xf32>` | `tensor<4048x64xf32>` (unchanged) |
+| **K shape** | `tensor<4096x64xf32>` | `tensor<4096x64xf32>` (unchanged) |
+| **V shape** | `tensor<4096x64xf32>` | `tensor<4096x64xf32>` (unchanged) |
 | **Outputs** | 1 (result: `16x64xf32`) | 3 (result: `16x64xf32`, max: `16xf32`, sum: `16xf32`) |
 | **Max accumulator** | N/A | Initialized to `-inf` (`-3.40282347E+38`) |
 | **Sum accumulator** | N/A | Initialized to `0.0` |
@@ -127,6 +126,7 @@ After tiling, the online attention operates on a K2-tile (e.g., 16 keys at a tim
 
 ```mlir
 // Inside an scf.for loop over K2 tiles:
+// Step size is 16.
 %results:3 = iree_linalg_ext.online_attention {
     indexing_maps = [
         affine_map<(d0, d1, d2, d3) -> (d0, d1)>,   // Q tile: (m, k1)
