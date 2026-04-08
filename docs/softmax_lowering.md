@@ -3,7 +3,7 @@
 ## Overview
 
 **Assumptions:**
-Softmax dimension size is small (64 in this example). 
+Softmax dimension size is small (64 in this example). No tiling in reduction dim.
 
 The lowering process consists of seven stages:
 1. **initial** - High-level tensor operations
@@ -302,7 +302,7 @@ xegpu.store_nd %11, %12[%0, 0]
 ```
 
 ---
-## What is reused in between matmul and softmax?
+## What is reused form the lighthouse project?
 
 The softmax implementation leverages several reusable lighthouse infrastructure components:
 
@@ -326,7 +326,6 @@ The workload-specific code is minimal (payload generation + tiling/decomposition
 ### Payload Generation (`lighthouse.ingress.mlir_gen`)
 - **`get_mlir_elem_type`**: Type conversion utilities for constructing MLIR types
 
-**Key Insight**: 
 
 ---
 
