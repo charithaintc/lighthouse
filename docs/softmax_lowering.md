@@ -8,7 +8,7 @@ Softmax dimension size is small (64 in this example). No tiling in reduction dim
 The lowering process consists of seven stages:
 1. **initial** - High-level tensor operations
 2. **tiled-softmax** - Tiled softmax operations
-3. **decomposed** - Decomposition into constituent operations
+3. **decomposed** - Decomposition into generic operations
 4. **vectorized** - Vector operations
 5. **bufferized** - Memory-based representation
 6. **xegpu-initial** - GPU kernel with XeGPU operations
@@ -65,7 +65,7 @@ func.func @payload(%arg0: memref<1024x64xf32>, %arg1: memref<1024x64xf32>) {
 ## Stage 3: Decomposed
 
 **Notes**
-- Softmax decomposed into 4 constituent `linalg.generic` ops : max, sub+exp, sum, divide
+- Softmax decomposed into 4 `linalg.generic` ops : max, sub+exp, sum, divide
 - Uses `structured.structured_decompose_interface` implemented by `linalg.softmax`
 
 **Code:**
@@ -331,9 +331,9 @@ The workload-specific code is minimal (payload generation + tiling/decomposition
 
 # Supporting larger Softmax dimension sizes
 
-Previsouly we tiled all ops in the parallel dimension only (i.e. non softmax dim). Handling a larger softmax dimension require tiling the softmax contituent ops in that dimension. 
+Previsouly we tiled all ops in the parallel dimension only (i.e. non softmax dim). Handling a larger softmax reduction dimension require tiling the softmax contituent ops in the reduction dimension. 
 
-**Approach:** Tile reductions along dimension 1 (using appropriate step size) and fuse producers into consumers to enable streaming computation.
+**Approach:** Tile reductions along dimension 1 (using appropriate step size) and fuse producers into consumers to avoid extra memory buffers.
 
 ---
 
@@ -357,8 +357,8 @@ scf.forall ... {
 
 // After: Division tiled into 64x16 chunks
 scf.forall ... {
+  // Tiled Max, Center+Exp, Sum ops ...
   %11 = scf.for %arg4 = %c0_2 to %c64 step %c16 iter_args(%arg5 = %extracted_slice_0) -> (tensor<64x64xf32>) {
-      // Max, Center+Exp, Sum ops ...
       %12 = linalg.generic {...} ins(%extracted_slice_3, %extracted_slice_4 : tensor<64x16xf32>, tensor<64xf32>) outs(%extracted_slice_5 : tensor<64x16xf32>) {
       ^bb0(%in: f32, %in_6: f32, %out: f32):
         %13 = arith.divf %in, %in_6 : f32
@@ -380,10 +380,11 @@ scf.forall ... {
 
 **Key Changes:**
 ```mlir
+// Original tiled div loop.
 %11 = scf.for %arg4 = %c0_2 to %c64 step %c16 iter_args(%arg5 = %extracted_slice_0) -> (tensor<64x64xf32>) {
   %extracted_slice_3 = tensor.extract_slice %extracted_slice[0, %arg4] [64, 16] [1, 1]
   
-  // Fused: sub+exp computed per 16-element chunk
+  // Fused recomputation: sub+exp computed per 16-element chunk
   %12 = linalg.generic {...} ins(%extracted_slice_3, %extracted_slice_4 : tensor<64x16xf32>, tensor<64xf32>) 
         outs(%extracted_slice_5 : tensor<64x16xf32>) {
     ^bb0(%in: f32, %in_8: f32, %out: f32):
@@ -443,10 +444,11 @@ scf.forall ... {
 
 **Key Changes:**
 ```mlir
+// Original tiled mun loop.
 %12 = scf.for %arg4 = %c0_3 to %c64 step %c16 iter_args(%arg5 = %11) -> (tensor<64x16xf32>) {
   %extracted_slice_7 = tensor.extract_slice %extracted_slice[0, %arg4] [64, 16] [1, 1]
   
-  // Fused: sub+exp
+  // Fused recomputation: sub+exp
   %14 = linalg.generic {...} ins(%extracted_slice_7, %extracted_slice_8 : tensor<64x16xf32>, tensor<64xf32>) 
         outs(%extracted_slice_9 : tensor<64x16xf32>) {
     ^bb0(%in: f32, %in_11: f32, %out: f32):
@@ -608,7 +610,7 @@ func.func @payload(%arg0: memref<1024x64xf32>, %arg1: memref<1024x64xf32>) {
 
 **Notes:**
 - Convert `memref.alloc()` to `memref.alloca()` for stack allocation
-- Reduces memory allocation overhead
+- **Why?** We can only allocate SLM inside GPU kernel.
 
 **Code:**
 ```mlir
