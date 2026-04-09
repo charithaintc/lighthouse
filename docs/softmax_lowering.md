@@ -676,3 +676,8 @@ gpu.module @payload_kernel {
 ```
 
 **Summary:** At this stage, the kernel processes 64x16 chunks in streaming fashion through three sequential loops, minimizing memory footprint.
+
+## XeGPU improvements needed for e2e support (WIP)
+
+* Change `memeref.alloca()` address space to SLM.
+* Support for lowering load/store using SLM to `xegpu.load/store_matrix` instead of `xegpu.load/store_nd`
