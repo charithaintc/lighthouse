@@ -47,11 +47,10 @@ if __name__ == "__main__":
     )
     Parser.add_argument(
         "--input-shape",
-        action="append",
         required=True,
         help="Shape of the input tensors in format: \
               DIMS(MxNx...)xTYPE(f16/f32/f64/bf16/i8)xINIT(0/1/rnd/id). \
-              For multiple inputs, use multiple --input-shape arguments.",
+              For multiple inputs, separate by comma.",
     )
     Parser.add_argument(
         "--seed",
@@ -128,10 +127,7 @@ if __name__ == "__main__":
 
     # Initialize the device data
     # TODO: Allow automatic inspection of the payload module if the user doesn't provide input shapes.
-    buffers = []
-    for shape in args.input_shape:
-        for sub_shape in shape.split(","):
-            buffers.append(KernelArgumentParser.parse(sub_shape).arg)
+    buffers = [arg.arg for arg in KernelArgumentParser.parse_all(args.input_shape)]
 
     # Create the runner and execute/benchmark the module.
     runner = Runner(optimized_module, opt_level=args.O)
