@@ -512,15 +512,19 @@ scf.forall ... {
 - Convert tiled linalg operations to vector operations
 - `scf.for` loops remain but operate on vectors
 - Vector size: 64x16 for tiled operations
+- Same buffer is used for max and sum streaming reductions.
 
 **Code:**
 ```mlir
 func.func @payload(%arg0: memref<1024x64xf32>, %arg1: memref<1024x64xf32>) {
-  // ...
+  // ... 
+  %cst = arith.constant dense<0.000000e+00> : vector<64x16xf32> // 0.0
+  %cst_1 = arith.constant dense<0xFFC00000> : vector<64x16xf32> // -inf
   %3 = scf.forall (%arg2) in (16) shared_outs(%arg3 = %2) -> (tensor<1024x64xf32>) {
     // ...
     
     // Vectorized max reduction loop
+    %5 = tensor.empty() : tensor<64x16xf32>
     %6 = vector.transfer_write %cst_1, %5[%c0, %c0] : vector<64x16xf32>, tensor<64x16xf32>
     %7 = scf.for %arg4 = %c0 to %c64 step %c16 iter_args(%arg5 = %6) -> (tensor<64x16xf32>) {
       %15 = vector.transfer_read %1[%4, %arg4], %0 : tensor<1024x64xf32>, vector<64x16xf32>
@@ -531,7 +535,7 @@ func.func @payload(%arg0: memref<1024x64xf32>, %arg1: memref<1024x64xf32>) {
     }
     %8 = vector.transfer_read %7[%c0, %c0], %0 : tensor<64x16xf32>, vector<64x16xf32>
     %9 = vector.multi_reduction <maxnumf>, %8, %cst_2 [1] : vector<64x16xf32> to vector<64xf32>
-    
+    %10 = vector.transfer_write %cst, %5[%c0, %c0] {in_bounds = [true, true]} : vector<64x16xf32>, tensor<64x16xf32>
     // Vectorized sum reduction loop with fused sub+exp
     %11 = scf.for %arg4 = %c0 to %c64 step %c16 iter_args(%arg5 = %10) -> (tensor<64x16xf32>) {
       %15 = vector.transfer_read %1[%4, %arg4], %0 : tensor<1024x64xf32>, vector<64x16xf32>
