@@ -337,7 +337,7 @@ Previsouly we tiled all ops in the parallel dimension only (i.e. non softmax dim
 
 ---
 
-## Decomposed → Tiled: Stage A - Tile div op
+## Stage A - Tile div op
 
 **Notes:**
 - Tile the division operation with step size 16 along dimension 1
@@ -357,7 +357,7 @@ scf.forall ... {
 
 // After: Division tiled into 64x16 chunks
 scf.forall ... {
-  // Tiled Max, Center+Exp, Sum ops ...
+  // Max, Center+Exp, Sum ops ...
   %11 = scf.for %arg4 = %c0_2 to %c64 step %c16 iter_args(%arg5 = %extracted_slice_0) -> (tensor<64x64xf32>) {
       %12 = linalg.generic {...} ins(%extracted_slice_3, %extracted_slice_4 : tensor<64x16xf32>, tensor<64xf32>) outs(%extracted_slice_5 : tensor<64x16xf32>) {
       ^bb0(%in: f32, %in_6: f32, %out: f32):
