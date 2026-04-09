@@ -290,7 +290,7 @@ gpu.module @payload_kernel [#xevm.target<O = 3>] {
 **Notes**
 - Sets the layout for anchor xegpu ops. Each Wg consistes of [8, 1] subgroups
   doing 8x64 softmax slice. 
-- Only sets the layotu for `store_nd`. Layout propagation does the rest.  
+- Only sets the layout for `store_nd`. Layout propagation does the rest.  
 
 **Code (differences from xegpu-initial):**
 ```mlir
