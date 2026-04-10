@@ -8,7 +8,7 @@ from mlir.dialects.bufferization import LayoutMapOption
 from mlir.dialects import transform
 from mlir.dialects.transform import structured
 import lighthouse.transform as lh_transform
-from lighthouse.dialects import transform_ext
+from lighthouse.dialects.transform import transform_ext
 from lighthouse.pipeline.helper import (
     apply_registered_pass,
     canonicalize,
@@ -18,8 +18,9 @@ from lighthouse.pipeline.helper import (
 )
 from lighthouse.schedule.xegpu.helper import bundle_xegpu_to_binary
 
-from lighthouse.dialects import smt_ext, transform_smt_ext as td_smt_ext
-from lighthouse.dialects.transform_tune_ext import knob, KnobValue
+from lighthouse.dialects import smt_ext
+from lighthouse.dialects.transform import smt_ext as td_smt_ext
+from lighthouse.dialects.transform.tune_ext import knob, KnobValue
 
 # hardware constraints
 DPAS = namedtuple("DPAS", ["M", "N", "K", "A_TILE", "B_TILE", "C_TILE"])(
