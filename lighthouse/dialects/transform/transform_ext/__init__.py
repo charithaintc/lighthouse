@@ -9,6 +9,7 @@ from .ops.convert_func_results_to_args import convert_func_results_to_args
 from .ops.extract_handle import extract_handle
 from .ops.get_tileable_consumers import get_tileable_consumers
 from .ops.get_tiling_sizes import get_tiling_sizes
+from .ops.update_address_space import update_address_space
 
 __all__ = [
     "TransformExtensionDialect",
@@ -22,4 +23,5 @@ __all__ = [
     "register_and_load",
     "replace",
     "wrap_in_benching_func",
+    "update_address_space",
 ]
