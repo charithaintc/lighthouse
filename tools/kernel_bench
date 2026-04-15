@@ -1,0 +1,227 @@
+#!/usr/bin/env python
+
+import argparse
+from datetime import datetime
+import sys
+import tempfile
+import ml_dtypes
+import numpy as np
+from pathlib import Path
+import torch
+
+from lighthouse.execution.runner import Runner
+from lighthouse.execution.init import KernelArgumentParser
+from lighthouse.pipeline.driver import CompilerDriver
+from lighthouse.schedule import convert_function_results
+from lighthouse import dialects as lh_dialects
+from lighthouse import ingress as lh_ingress
+
+
+def import_kb_module(
+    filepath: str | Path,
+    model_class_name: str = "Model",
+    dialect: str = "linalg-on-tensors",
+    sample_args=None,
+    model_init_args=None,
+) -> Path:
+    """
+    Imports a PyTorch model from a KernelBench file and converts it to an MLIR module in the specified dialect.
+    The MLIR module is saved into a file to be passed to the CompilerDrviver for optimization and execution.
+    The Python file must define a Kernel Bench module file.
+    Return: The path to the generated MLIR module file.
+    """
+    try:
+        mlir_module = lh_ingress.torch.import_from_file(
+            filepath=filepath,
+            model_class_name=model_class_name,
+            dialect=dialect,
+            sample_args=sample_args,
+            model_init_args=model_init_args,
+        )
+        assert isinstance(mlir_module, str)
+        temp_dir = tempfile.TemporaryDirectory(delete=False)
+        mlir_file = Path(temp_dir.name) / (Path(filepath).stem + ".mlir")
+        mlir_file.write_text(mlir_module)
+        print(f"Successfully imported {filepath} to MLIR module at {mlir_file}")
+        return mlir_file
+    except Exception as e:
+        print(
+            f"ERROR: got an error converting {filepath} to MLIR:",
+            file=sys.stderr,
+        )
+        raise e
+
+
+def define_compiler_pipeline(
+    mlir_file: Path,
+    pipeline_yaml: str | None,
+    benchmark: bool = False,
+) -> None:
+    """
+    Defines the compiler pipeline by adding stages to the driver.
+    The stages can be defined in a YAML file, or added manually in this function.
+    """
+    driver = CompilerDriver(mlir_file)
+
+    with driver.context:
+        lh_dialects.register_and_load()
+        driver.add_module_stage(convert_function_results(args.entry_point))
+
+    if benchmark:
+        # Calling the benchmark wrapper, not the entry point.
+        # FIXME: Eliminate this cross-dependency between the Runner and the Driver.
+        with driver.context:
+            lh_dialects.register_and_load()
+            bench_wrapper = Runner.get_bench_wrapper_schedule(args.entry_point)
+            driver.add_module_stage(bench_wrapper)
+    else:
+        # Calling the entry point directly, so set the attribute on the entry point function.
+        driver.make_function_callable(args.entry_point)
+
+    if pipeline_yaml:
+        # Add stages defined by the user.
+        driver.add_stages(pipeline_yaml)
+    else:
+        # Search for the yaml file in the script directory.
+        path = Path(__file__).parent / "kernel_bench.yaml"
+        driver.add_stage(str(path))
+
+    return driver
+
+
+def parse_inputs_and_outputs(
+    input_shapes_str: str, output_shape_str: str
+) -> tuple[list, list]:
+    """
+    Parses the input and output shape strings to create sample tensors for the inputs and outputs.
+    """
+    # Parse input shapes first, to create sample tensors for the inputs only
+    buffers = [arg.arg for arg in KernelArgumentParser.parse_all(input_shapes_str)]
+    # Build sample torch tensors from input shapes to override hard-coded sizes in get_inputs().
+    # torch.from_numpy() does not support ml_dtypes.bfloat16, so reinterpret as uint16 first.
+    if any(buf.dtype == ml_dtypes.bfloat16 for buf in buffers):
+        print(
+            "Warning: bfloat16 is not natively supported by torch.from_numpy(), \
+            so we are reinterpreting the buffers as uint16. This may cause issues if the buffers are modified after creation."
+        )
+    sample_tensors = [
+        torch.from_numpy(buf.view(np.uint16)).view(torch.bfloat16)
+        if buf.dtype == ml_dtypes.bfloat16
+        else torch.from_numpy(buf)
+        for buf in buffers
+    ]
+    # Now include the output shape in the buffers
+    buffers = [KernelArgumentParser.parse(output_shape_str).arg, *buffers]
+    return buffers, sample_tensors
+
+
+if __name__ == "__main__":
+    Parser = argparse.ArgumentParser(
+        description="""Kernel Bench importer, optimization and runner."""
+    )
+    Parser.add_argument(
+        "kernel_bench_model",
+        type=str,
+        help="Path to the KernelBench module to optimize.",
+    )
+    Parser.add_argument(
+        "--input-shapes",
+        required=True,
+        help="Shape of the input tensors in format: \
+              DIMS(MxNx...)xTYPE(f16/f32/f64/bf16/i8)xINIT(0/1/rnd/id). \
+              For multiple inputs, separate by comma.",
+    )
+    Parser.add_argument(
+        "--output-shape",
+        required=True,
+        help="Shape of the output tensor in format: \
+              DIMS(MxNx...)xTYPE(f16/f32/f64/bf16/i8)xINIT(0/1/rnd/id). \
+              Single output shape supported.",
+    )
+    Parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for initializing input tensors.",
+    )
+    Parser.add_argument(
+        "--pipeline",
+        type=str,
+        action="append",
+        help="A descriptor file (YAML) with the pipeline stages to apply. Minimal passes always apply.",
+    )
+    Parser.add_argument(
+        "-O",
+        type=int,
+        default=3,
+        help="Optimization level for the LLVM back-end. Default is 3.",
+    )
+    Parser.add_argument(
+        "--benchmark",
+        action=argparse.BooleanOptionalAction,
+        help="Whether to run the benchmark. Default is False.",
+    )
+    Parser.add_argument(
+        "--print-optimized-module",
+        action=argparse.BooleanOptionalAction,
+        help="Whether to print the optimized module. Default is False.",
+    )
+    Parser.add_argument(
+        "--entry-point",
+        type=str,
+        default="main",
+        help="Name of the function to execute or benchmark. Default is 'main'.",
+    )
+    Parser.add_argument(
+        "--print-tensor",
+        type=int,
+        default=0,
+        help="Print the Nth tensor. Default is 0 (no print).",
+    )
+    Parser.add_argument(
+        "--print-mlir-after-all",
+        action=argparse.BooleanOptionalAction,
+        help="Whether to print the MLIR module after all stages. Default is False.",
+    )
+    args = Parser.parse_args()
+
+    # Initialize the random seed, for stable tests
+    if args.seed:
+        np.random.seed(args.seed)
+    else:
+        np.random.seed(int(datetime.now().timestamp()))
+
+    # Initialize the device data
+    buffers, sample_tensors = parse_inputs_and_outputs(
+        args.input_shapes, args.output_shape
+    )
+
+    # Import the model with the custom sample inputs from the command line.
+    mlir_file = import_kb_module(args.kernel_bench_model, sample_args=sample_tensors)
+
+    # Create the driver and run the pipeline.
+    driver = define_compiler_pipeline(mlir_file, args.pipeline, args.benchmark)
+
+    # Run the pipeline to get the optimized module.
+    optimized_module = driver.run(print_after_all=args.print_mlir_after_all)
+    if args.print_optimized_module:
+        print(optimized_module)
+
+    # Create the runner and execute/benchmark the module.
+    runner = Runner(optimized_module, opt_level=args.O)
+
+    if args.benchmark:
+        print("Running the benchmark...")
+        time_array = runner.benchmark(host_input_buffers=buffers)
+        print(f"{len(time_array)} runs: {np.mean(time_array)} seconds")
+    else:
+        print("Executing the module...")
+        runner.execute(
+            payload_function_name=args.entry_point,
+            host_input_buffers=buffers,
+        )
+
+    # Optionally print the output tensor after execution.
+    if args.print_tensor > 0:
+        idx = args.print_tensor - 1
+        print(f"Output: {buffers[idx]}")

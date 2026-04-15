@@ -1,4 +1,4 @@
-name: Lighthouse Examples
+name: Lighthouse Pre-Commit
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
   pull_request:
 
 jobs:
-  Examples:
+  Pre-Commit:
     strategy:
       matrix:
         arch: [x86_64, AArch64]
@@ -27,15 +27,9 @@ jobs:
       - name: Install the project and its dependencies
         run: |
           sudo apt-get install -y llvm-dev # Obtain FileCheck, used in testing.
-          uv sync --extra ingress-torch-cpu
+          uv sync --extra ingress-torch-cpu --extra runtime_mpich
 
-      - name: Run lit-enabled examples as tests
+      - name: Run lit-enabled tests
         run: |
           export FILECHECK=FileCheck-18 # Ubuntu's llvm-dev appends a version number.
-          uv run lit examples --verbose  # Makes sure to substitute FileCheck for $FILECHECK
-
-      - name: Run lit-enabled examples which use mpi as tests
-        run: |
-          export FILECHECK=FileCheck-18 # Ubuntu's llvm-dev appends a version number.
-          uv sync --extra runtime_mpich
-          uv run lit examples/feed-forward-mpi --verbose  # Makes sure to substitute FileCheck for $FILECHECK
+          uv run lit -v .
