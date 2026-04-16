@@ -22,6 +22,6 @@ __all__ = [
     "param_cmp_eq",
     "register_and_load",
     "replace",
-    "wrap_in_benching_func",
     "update_address_space",
+    "wrap_in_benching_func",
 ]
