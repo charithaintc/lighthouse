@@ -16,6 +16,7 @@ from lighthouse.pipeline.helper import (
     PipelineInterrupt,
 )
 from lighthouse.schedule.xegpu.helper import bundle_xegpu_to_binary
+from lighthouse.dialects.transform import transform_ext
 
 
 def get_softmax_schedule_module(
@@ -140,7 +141,6 @@ def bundle_xegpu_softmax_schedule(
         transform.AnyOpType.get(), func, ops=["linalg.softmax"]
     )
     structured.structured_decompose_interface(anytype, softmax_ops)
-    transform.print_(target=func, name="Aftemr structured_decompose_interface")
 
     linalg_ops = match_and_split(
         func, ops={"linalg.generic", "linalg.fill"}, nhandles=6
@@ -157,17 +157,12 @@ def bundle_xegpu_softmax_schedule(
         div_op, sizes=[0, reduction_step_size]
     ).results
 
-    transform.print_(target=func, name="After tiling div op")
-
     # Fuse max_center_and_exp_op into the div loop
     _, fused_loop = structured.structured_fuse_into_containing_op(
         anytype,
         anytype,
         producer_op=max_center_and_exp_op,
         containing_op=div_loop,
-    )
-    transform.print_(
-        target=func, name="After fusing max_center_and_exp_op into div loop"
     )
 
     # Tile the sum reduction and fuse the sub+exp producer into it
@@ -179,8 +174,6 @@ def bundle_xegpu_softmax_schedule(
         target=sum_reduction,
         tile_sizes=[0, reduction_step_size],
     )
-
-    transform.print_(target=func, name="After tiling sum reduction")
 
     func = transform.get_parent_op(
         anytype,
@@ -200,9 +193,6 @@ def bundle_xegpu_softmax_schedule(
         producer_op=max_center_and_exp_op,
         containing_op=sum_loop,
     )
-    transform.print_(
-        target=func, name="After fusing max_center_and_exp_op into sum loop"
-    )
 
     # Tile the max reduction.
     max_reduction = linalg_ops[0]
@@ -214,7 +204,6 @@ def bundle_xegpu_softmax_schedule(
         target=max_reduction,
         tile_sizes=[0, reduction_step_size],
     )
-    transform.print_(target=func, name="After tiling max reduction")
 
     # Cleanup after tiling and fusion
     transform.apply_cse(func)
@@ -230,8 +219,6 @@ def bundle_xegpu_softmax_schedule(
     ).result
     transform.apply_cse(func)
     canonicalize(func)
-
-    transform.print_(target=func, name="After vectorization")
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
@@ -250,8 +237,6 @@ def bundle_xegpu_softmax_schedule(
     transform.apply_cse(mod)
     canonicalize(mod)
 
-    transform.print_(target=mod, name="After bufferization")
-
     # promote memref.alloc to memref.alloca in payload function
     func = match(mod, ops={"func.func"})
     func = apply_registered_pass(
@@ -262,8 +247,6 @@ def bundle_xegpu_softmax_schedule(
             "max-rank-of-allocated-memref": "2",
         },
     )
-
-    transform.print_(target=func, name="After promoting buffers to stack")
 
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
@@ -294,8 +277,6 @@ def bundle_xegpu_softmax_schedule(
     mod = apply_registered_pass(mod, "gpu-kernel-outlining")
     transform.apply_cse(mod)
 
-    transform.print_(target=mod, name="After GPU outlining")
-
     if stop_at_stage == "gpu-outlining":
         raise PipelineInterrupt()
 
@@ -306,12 +287,16 @@ def bundle_xegpu_softmax_schedule(
         options={"O": "3", "chip": "bmg"},
     )
 
-    # convert vector to xegpu
+    # for each gpu function in the gpu module, change memref.alloca address
+    # space to 3 (SLM) and convert vector to xegpu.
     gpu_mod_ops = match_and_split(mod, ops={"gpu.module"})
     for gpu_mod in gpu_mod_ops:
         gpu_func = match(gpu_mod, ops={"gpu.func"})
-        gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
-        transform.apply_cse(gpu_func)
+        allocas = match_and_split(gpu_func, ops={"memref.alloca"})
+        for alloca in allocas:
+            transform_ext.update_address_space(alloca, address_space=3)
+        # gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
+        # transform.apply_cse(gpu_func)
 
     # Cleanup.
     transform.apply_cse(mod)

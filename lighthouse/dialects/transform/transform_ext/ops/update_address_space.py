@@ -32,51 +32,46 @@ class UpdateAddressSpace(
             state: transform.TransformState,
         ) -> DiagnosedSilenceableFailure:
             # Get the target operations to transform
-            target_ops = state.get_payload_ops(op.target)
+            target_op = state.get_payload_ops(op.target)[0]
             # Get the address space value from the attribute
             address_space_value = ir.IntegerAttr(op.address_space).value
             new_ops = []
 
-            for target_op in target_ops:
-                # Verify this is a memref.alloca operation
-                if target_op.OPERATION_NAME != "memref.alloca":
-                    return DiagnosedSilenceableFailure.emit_silenceable_error(
-                        f"Expected memref.alloca operation, got {target_op.OPERATION_NAME}"
-                    )
-
-                # Get the current result type (should be a MemRefType)
-                old_result_type = target_op.results[0].type
-                memref_type = ir.MemRefType(old_result_type)
-                # Create a new memref type with the specified address space
-                new_memref_type = ir.MemRefType.get(
-                    memref_type.shape,
-                    memref_type.element_type,
-                    layout=memref_type.layout,
-                    memory_space=ir.Attribute.parse(f"{address_space_value}"),
+            # Verify this is a memref.alloca operation
+            if target_op.OPERATION_NAME != "memref.alloca":
+                return DiagnosedSilenceableFailure.emit_silenceable_error(
+                    f"Expected memref.alloca operation, got {target_op.OPERATION_NAME}"
                 )
 
-                # Replace the operation with a new one that has the updated type
-                with ir.InsertionPoint(target_op):
-                    # Get the operands from the original alloca (dynamic sizes and symbols)
-                    dynamic_sizes = list(
-                        target_op.operands[
-                            : target_op.attributes["operandSegmentSizes"][0]
-                        ]
-                    )
-                    symbol_operands = list(
-                        target_op.operands[
-                            target_op.attributes["operandSegmentSizes"][0] :
-                        ]
-                    )
-                    # Create a new alloca with the updated type
-                    new_alloca = memref.alloca(
-                        new_memref_type, dynamic_sizes, symbol_operands
-                    )
-                    # Replace all uses of the old operation with the new one
-                    # FIXME: This won't handle operations that consume the memref type and
-                    # return a new memref (such as subview).
-                    rewriter.replace_op(target_op, [new_alloca])
-                    new_ops.append(new_alloca.owner)
+            # Get the current result type (should be a MemRefType)
+            old_result_type = target_op.results[0].type
+            memref_type = ir.MemRefType(old_result_type)
+            # Create a new memref type with the specified address space
+            new_memref_type = ir.MemRefType.get(
+                memref_type.shape,
+                memref_type.element_type,
+                layout=memref_type.layout,
+                memory_space=ir.Attribute.parse(f"{address_space_value}"),
+            )
+
+            # Replace the operation with a new one that has the updated type
+            with ir.InsertionPoint(target_op):
+                # Get the operands from the original alloca (dynamic sizes and symbols)
+                dynamic_sizes = list(
+                    target_op.operands[: target_op.attributes["operandSegmentSizes"][0]]
+                )
+                symbol_operands = list(
+                    target_op.operands[target_op.attributes["operandSegmentSizes"][0] :]
+                )
+                # Create a new alloca with the updated type
+                new_alloca = memref.alloca(
+                    new_memref_type, dynamic_sizes, symbol_operands
+                )
+                # Replace all uses of the old operation with the new one
+                # FIXME: This won't handle operations that consume the memref type and
+                # return a new memref (such as subview).
+                rewriter.replace_op(target_op, [new_alloca])
+                new_ops.append(new_alloca.owner)
 
             # Set the results to the new operations
             results.set_ops(op.updated_op, new_ops)
