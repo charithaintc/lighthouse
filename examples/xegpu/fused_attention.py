@@ -18,8 +18,12 @@ from lighthouse.pipeline.driver import TransformDriver
 from lighthouse.execution import GPUMemoryManager
 from lighthouse.utils.numpy import mlir_to_numpy_dtype
 from lighthouse.ingress.mlir_gen import get_mlir_elem_type
-from lighthouse.ingress.mlir_gen.gpu_fused_attention_payload import generate_gpu_fused_attention_payload
-from lighthouse.schedule.xegpu.fused_attention_schedule import get_fused_attention_schedule_module
+from lighthouse.ingress.mlir_gen.gpu_fused_attention_payload import (
+    generate_gpu_fused_attention_payload,
+)
+from lighthouse.schedule.xegpu.fused_attention_schedule import (
+    get_fused_attention_schedule_module,
+)
 
 
 def fused_attention_complexity(Z: int, H: int, n_ctx: int, n_head: int, nbytes: int):
@@ -41,7 +45,11 @@ def fused_attention_complexity(Z: int, H: int, n_ctx: int, n_head: int, nbytes: 
 
 
 def check_correctness(
-    Q: np.ndarray, K: np.ndarray, V: np.ndarray, output_arr: np.ndarray, verbose: int = 0
+    Q: np.ndarray,
+    K: np.ndarray,
+    V: np.ndarray,
+    output_arr: np.ndarray,
+    verbose: int = 0,
 ) -> bool:
     """
     Check correctness of fused attention output.
@@ -146,7 +154,9 @@ class XeGPUFusedAttention:
 
     def get_complexity(self) -> tuple[int, int, int]:
         nbytes = np.dtype(self.dtype).itemsize
-        return fused_attention_complexity(self.Z, self.H, self.n_ctx, self.n_head, nbytes)
+        return fused_attention_complexity(
+            self.Z, self.H, self.n_ctx, self.n_head, nbytes
+        )
 
     def payload_module(self) -> ir.Module:
         """Generate MLIR module for fused attention payload."""
@@ -309,7 +319,9 @@ if __name__ == "__main__":
                 # Compute reference solution on host.
                 Q, K, V = wload._initial_host_arrays[1:4]
                 success = check_correctness(
-                    Q, K, V,
+                    Q,
+                    K,
+                    V,
                     result_host_copy,
                     verbose=args.verbose,
                 )

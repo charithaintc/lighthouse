@@ -1,7 +1,7 @@
 """Generate MLIR payload for GPU fused attention operation."""
 
 from mlir import ir
-from mlir.dialects import linalg, bufferization, tensor, arith
+from mlir.dialects import bufferization, tensor
 
 from lighthouse.utils.mlir import func_cif
 from lighthouse.ingress.mlir_gen.gpu_utils import emit_gpu_util_funcs

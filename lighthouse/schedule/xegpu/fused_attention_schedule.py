@@ -4,19 +4,13 @@ from typing import Optional
 
 from mlir import ir
 from mlir.dialects import transform
-from mlir.dialects.transform import structured, loop, xegpu
-from mlir.dialects.transform import bufferization as transform_bufferization
-from mlir.dialects.bufferization import LayoutMapOption
 
 from lighthouse.pipeline.helper import (
-    apply_registered_pass,
     canonicalize,
     match,
-    match_and_split,
     PipelineInterrupt,
 )
 from lighthouse.schedule.xegpu.helper import bundle_xegpu_to_binary
-from lighthouse.dialects.transform import transform_ext
 
 
 def get_fused_attention_schedule_module(
