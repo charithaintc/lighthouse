@@ -295,8 +295,8 @@ def bundle_xegpu_softmax_schedule(
         allocas = match_and_split(gpu_func, ops={"memref.alloca"})
         for alloca in allocas:
             transform_ext.update_address_space(alloca, address_space=3)
-        # gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
-        # transform.apply_cse(gpu_func)
+        gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
+        transform.apply_cse(gpu_func)
 
     # Cleanup.
     transform.apply_cse(mod)
@@ -305,12 +305,15 @@ def bundle_xegpu_softmax_schedule(
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
 
-    # Set layout attributes for xegpu.store_nd operations.
-    # FIXME: currently ecah subgroup is handling the entire row.
-    store_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=5)
+    # Set layout attributes for xegpu.store_nd and xegpu.store_matrix ops.
+    store_nd_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)
+    store_matrix_ops = match_and_split(gpu_func, ops={"xegpu.store_matrix"}, nhandles=4)
     sg_layout = [parameters["sg_rows"], 1]
     sg_data = [parameters["sg_rows"], parameters["reduction_step_size"]]
-    xegpu.set_anchor_layout(store_ops[-1], sg_layout=sg_layout, sg_data=sg_data)
+    for store_op in store_nd_ops:
+        xegpu.set_anchor_layout(store_op, sg_layout=sg_layout, sg_data=sg_data)
+    for store_op in store_matrix_ops:
+        xegpu.set_anchor_layout(store_op, sg_layout=sg_layout, sg_data=sg_data)
 
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()

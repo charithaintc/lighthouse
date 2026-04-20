@@ -16,7 +16,7 @@ class UpdateAddressSpace(
 
     target: ext.Operand[transform.AnyOpType]
     address_space: ir.IntegerAttr
-    updated_op: ext.Result[transform.AnyOpType[()]] = ext.result(infer_type=True)
+    updated_op: ext.Result[transform.AnyOpType[()]] = ext.infer_result()
 
     @classmethod
     def attach_interface_impls(cls, ctx=None):

@@ -155,7 +155,7 @@ def parse_cli():
         "--sizes",
         type=int,
         nargs=2,
-        default=[1024, 64],
+        default=[1024, 512],
         help="M,N matrix sizes (MxN)",
     )
     parser.add_argument(
@@ -290,6 +290,8 @@ if __name__ == "__main__":
                 )
                 if not success:
                     raise ValueError("Result mismatch!")
+                else:
+                    print("Result is correct. Proceeding to benchmark...")
 
             times = runner.benchmark(
                 host_input_buffers=wload._initial_host_arrays,
