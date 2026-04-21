@@ -1,7 +1,9 @@
 """Generate MLIR payload for GPU fused attention operation."""
 
+import math
+
 from mlir import ir
-from mlir.dialects import bufferization, tensor
+from mlir.dialects import arith, bufferization, linalg, tensor
 
 from lighthouse.utils.mlir import func_cif
 from lighthouse.ingress.mlir_gen.gpu_utils import emit_gpu_util_funcs
@@ -47,16 +49,84 @@ def generate_gpu_fused_attention_payload(
             K_tensor = emit_buf_to_tensor(K_arg, restrict=True)
             V_tensor = emit_buf_to_tensor(V_arg, restrict=True)
 
-            # TODO: Implement fused attention computation
-            # This will involve:
-            # 1. Q @ K^T (batch matmul with transpose)
-            # 2. Scale by 1/sqrt(n_head)
-            # 3. Softmax along last dimension
-            # 4. Result @ V (batch matmul)
+            # Collapse first 3 dimensions (Z, H, n_ctx) into a single dimension
+            # From (Z, H, n_ctx, n_head) to (Z*H*n_ctx, n_head)
+            collapsed_dim = Z * H * n_ctx
+            collapsed_shape_2d = (collapsed_dim, n_head)
 
-            # Placeholder: create empty output tensor
-            output_init = tensor.empty(shape, dtype)
-            result = output_init
+            Q_2d = tensor.collapse_shape(
+                ir.RankedTensorType.get(collapsed_shape_2d, dtype),
+                Q_tensor,
+                reassociation=[[0, 1, 2], [3]],
+            )
+            K_2d = tensor.collapse_shape(
+                ir.RankedTensorType.get(collapsed_shape_2d, dtype),
+                K_tensor,
+                reassociation=[[0, 1, 2], [3]],
+            )
+            V_2d = tensor.collapse_shape(
+                ir.RankedTensorType.get(collapsed_shape_2d, dtype),
+                V_tensor,
+                reassociation=[[0, 1, 2], [3]],
+            )
+
+            # Step 1: Transpose K to get K^T
+            # Permute from (collapsed_dim, n_head) to (n_head, collapsed_dim)
+            kt_shape_2d = (n_head, collapsed_dim)
+            kt_init = tensor.empty(kt_shape_2d, dtype)
+            K_transposed = linalg.transpose(K_2d, outs=[kt_init], permutation=[1, 0])
+
+            # Step 2: Compute Q @ K^T
+            # Q: (collapsed_dim, n_head) @ K^T: (n_head, collapsed_dim)
+            # Result: (collapsed_dim, collapsed_dim)
+            qkt_shape_2d = (collapsed_dim, collapsed_dim)
+            qkt_init = tensor.empty(qkt_shape_2d, dtype)
+            # Initialize with zeros for matmul accumulation
+            zero = arith.constant(dtype, 0.0)
+            qkt_init_filled = linalg.fill(zero, outs=[qkt_init])
+
+            # Matmul: Q @ K^T
+            qkt = linalg.matmul(Q_2d, K_transposed, outs=[qkt_init_filled])
+
+            # Step 3: Scale by 1/sqrt(n_head)
+            scale_factor = 1.0 / math.sqrt(n_head)
+            scale_const = arith.constant(dtype, scale_factor)
+
+            # Create a tensor filled with the scale factor
+            scale_tensor_init = tensor.empty(qkt_shape_2d, dtype)
+            scale_tensor = linalg.fill(scale_const, outs=[scale_tensor_init])
+
+            # Elementwise multiply qkt with scale tensor
+            scaled_qkt_init = tensor.empty(qkt_shape_2d, dtype)
+            scaled_qkt = linalg.mul(qkt, scale_tensor, outs=[scaled_qkt_init])
+
+            # Step 4: Apply softmax along the last dimension (dim=1 in 2D)
+            softmax_init = tensor.empty(qkt_shape_2d, dtype)
+            attention_weights = linalg.softmax(
+                result=[ir.RankedTensorType.get(qkt_shape_2d, dtype)],
+                input=scaled_qkt,
+                output=softmax_init,
+                dimension=1,
+            )
+
+            # Step 5: Multiply attention weights by V
+            # attention_weights: (collapsed_dim, collapsed_dim) @ V: (collapsed_dim, n_head)
+            # Result: (collapsed_dim, n_head)
+            output_2d_init = tensor.empty(collapsed_shape_2d, dtype)
+            output_2d_init_filled = linalg.fill(zero, outs=[output_2d_init])
+
+            result_2d = linalg.matmul(
+                attention_weights, V_2d, outs=[output_2d_init_filled]
+            )
+
+            # Expand back to 4D: (Z*H*n_ctx, n_head) -> (Z, H, n_ctx, n_head)
+            result = tensor.expand_shape(
+                ir.RankedTensorType.get(shape, dtype),
+                result_2d,
+                reassociation=[[0, 1, 2], [3]],
+                output_shape=[],
+                static_output_shape=shape,
+            )
 
             # Materialize result back to output memref
             bufferization.materialize_in_destination(
