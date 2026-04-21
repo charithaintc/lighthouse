@@ -215,6 +215,12 @@ def parse_cli():
         help="Head dimension",
     )
     parser.add_argument(
+        "--wg-tile-size",
+        type=int,
+        default=64,
+        help="Workgroup tile size for the collapsed batch dimension (Z*H*n_ctx)",
+    )
+    parser.add_argument(
         "--nruns",
         type=int,
         default=1000,
@@ -271,6 +277,7 @@ if __name__ == "__main__":
         "num_heads": args.num_heads,
         "n_ctx": args.n_ctx,
         "n_head": args.n_head,
+        "wg_tile_size": args.wg_tile_size,
     }
 
     Z = args.batch_size

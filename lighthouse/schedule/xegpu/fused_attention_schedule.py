@@ -4,10 +4,12 @@ from typing import Optional
 
 from mlir import ir
 from mlir.dialects import transform
+from mlir.dialects.transform import structured
 
 from lighthouse.pipeline.helper import (
     canonicalize,
     match,
+    match_and_split,
     PipelineInterrupt,
 )
 from lighthouse.schedule.xegpu.helper import bundle_xegpu_to_binary
@@ -34,6 +36,7 @@ def get_fused_attention_schedule_module(
             - num_heads: Number of attention heads (H)
             - n_ctx: Context length
             - n_head: Head dimension
+            - wg_tile_size: Workgroup tile size for the collapsed batch dimension (Z*H*n_ctx)
 
     Returns:
         MLIR module containing the transform schedule
@@ -106,18 +109,33 @@ def bundle_xegpu_fused_attention_schedule(
         raise PipelineInterrupt()
 
     anytype = transform.AnyOpType.get()
+    # Match all matmul operations - there should be 2:
+    # 1. Q @ K^T
+    # 2. attention_weights @ V
+    matmul_ops = match_and_split(mod, ops={"linalg.matmul"}, nhandles=2)
 
-    # TODO: Implement tiling, fusion, and lowering for fused attention
-    # This will involve:
-    # 1. Matching and tiling matmul operations (Q @ K^T)
-    # 2. Fusing softmax operation
-    # 3. Tiling second matmul (attention @ V)
-    # 4. Vectorization
-    # 5. Bufferization
-    # 6. GPU outlining
-    # 7. XeGPU lowering
+    # Get the last matmul (attention_weights @ V)
+    last_matmul = matmul_ops[1]
+    func = transform.get_parent_op(
+        anytype,
+        last_matmul,
+        op_name="func.func",
+        deduplicate=True,
+    )
 
-    func = match(mod, ops={"func.func"})
+    # Tile the last matmul in the batch dimension using tile_using_forall
+    # Batch dimension is the first dimension (collapsed_dim = Z * H * n_ctx)
+    # Extract workgroup tile size from parameters
+    wg_tile_size = parameters["wg_tile_size"]
+
+    tiled_matmul, forall_loop = structured.structured_tile_using_forall(
+        anytype,
+        anytype,
+        last_matmul,
+        num_threads=[],
+        tile_sizes=[],
+        static_tile_sizes=(wg_tile_size, 0),
+    )
 
     if stop_at_stage == "tiled":
         raise PipelineInterrupt()
