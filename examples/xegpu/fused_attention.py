@@ -242,7 +242,8 @@ def parse_cli():
         type=str,
         choices=[
             "initial",
-            "tiled",
+            "outer-tiled",
+            "inner-tiled",
             "vectorized",
             "bufferized",
             "gpu-outlining",

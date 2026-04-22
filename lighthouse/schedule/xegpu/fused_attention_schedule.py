@@ -109,6 +109,7 @@ def bundle_xegpu_fused_attention_schedule(
         raise PipelineInterrupt()
 
     anytype = transform.AnyOpType.get()
+    anyvalue = transform.AnyValueType.get()
     # Match all matmul operations - there should be 2:
     # 1. Q @ K^T
     # 2. attention_weights @ V
@@ -137,16 +138,110 @@ def bundle_xegpu_fused_attention_schedule(
         static_tile_sizes=(wg_tile_size, 0),
     )
 
-    if stop_at_stage == "tiled":
-        raise PipelineInterrupt()
-
-    # vectorize (placeholder)
-    # func = structured.VectorizeChildrenAndApplyPatternsOp(
-    #     func,
-    #     fold_type_extensions_into_contract=True,
-    # ).result
+    # Fuse the softmax producer into forall
+    softmax_ops = match_and_split(func, ops={"linalg.softmax"}, nhandles=1)
+    softmax_op = softmax_ops[0]
+    fused_softmax_op, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=softmax_op,
+        containing_op=forall_loop,
+    )
     transform.apply_cse(func)
     canonicalize(func)
+
+    # Fuse linalg.mul (scaling) into forall
+    mul_ops = match_and_split(func, ops={"linalg.mul"}, nhandles=1)
+    mul_op = mul_ops[0]
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=mul_op,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    # Fuse the first matmul (Q @ K^T) into forall
+    matmul_ops = match_and_split(
+        func, ops={"linalg.matmul"}, nhandles=2
+    )  # Two matmuls are present.
+    first_matmul = matmul_ops[0]
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=first_matmul,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    # Fuse linalg.transpose (K transpose) into forall
+    transpose_ops = match_and_split(func, ops={"linalg.transpose"}, nhandles=1)
+    transpose_op = transpose_ops[0]
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=transpose_op,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    # At this point all of the key operations are fused into the forall loop.
+    # Remaining linalg.fill ops can be fused trivially.
+    fill_ops = match_and_split(func, ops={"linalg.fill"}, nhandles=3)
+    for fill_op in fill_ops:
+        _, forall_loop = structured.structured_fuse_into_containing_op(
+            anytype,
+            anytype,
+            producer_op=fill_op,
+            containing_op=forall_loop,
+        )
+        transform.apply_cse(func)
+        canonicalize(func)
+
+    # tensor.empty() holding the result of transpose can be fused.
+    transpose_op = match_and_split(func, ops={"linalg.transpose"}, nhandles=1)[0]
+    transpose_init = transform.get_producer_of_operand(
+        anytype, transpose_op, operand_number=1
+    )
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=transpose_init,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    # tensor.empty() ops holding the result of the softmax can also be fused.
+    softmax_op = match_and_split(func, ops={"linalg.softmax"}, nhandles=1)[0]
+    softmax_init = transform.get_producer_of_operand(
+        anytype, softmax_op, operand_number=1
+    )
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=softmax_init,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    if stop_at_stage == "outer-tiled":
+        raise PipelineInterrupt()
+
+    # # vectorize (placeholder)
+    # # func = structured.VectorizeChildrenAndApplyPatternsOp(
+    # #     func,
+    # #     fold_type_extensions_into_contract=True,
+    # # ).result
+    # transform.apply_cse(func)
+    # canonicalize(func)
+
+    if stop_at_stage == "inner-tiled":
+        raise PipelineInterrupt()
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
