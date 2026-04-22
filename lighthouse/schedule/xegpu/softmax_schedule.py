@@ -102,6 +102,22 @@ def xegpu_softmax_transform_schedule(
         transform.yield_()
 
 
+def match_and_print_parent_function(op, msg):
+    """Get the parent function of an operation and print it.
+
+    Args:
+        op: The operation whose parent function to find
+        func_name: Name label to use when printing the function
+    """
+    anytype = transform.AnyOpType.get()
+    func = transform.get_parent_op(
+        anytype,
+        op,
+        op_name="func.func",
+        deduplicate=True,
+    )
+    transform.print_(target=func, name=msg)
+
 def bundle_xegpu_softmax_schedule(
     mod: ir.Value[transform.AnyOpType],
     parameters: dict,
@@ -120,6 +136,8 @@ def bundle_xegpu_softmax_schedule(
         transform.AnyOpType.get(), mod, ops=["linalg.softmax"]
     )
 
+    match_and_print_parent_function(softmax_op, "initial")
+
     # Tile the softmax operation using tile_using_forall
     tiled_op, for_op = structured.structured_tile_using_forall(
         anytype,
@@ -129,6 +147,7 @@ def bundle_xegpu_softmax_schedule(
         tile_sizes=[],
         static_tile_sizes=(parameters["wg_rows"],),
     )
+    match_and_print_parent_function(for_op, "after tiling parallel dim")
 
     func = transform.get_parent_op(
         anytype,
@@ -142,9 +161,12 @@ def bundle_xegpu_softmax_schedule(
     )
     structured.structured_decompose_interface(anytype, softmax_ops)
 
+
+
     linalg_ops = match_and_split(
         func, ops={"linalg.generic", "linalg.fill"}, nhandles=6
     )
+    match_and_print_parent_function(linalg_ops[0], "after decomposing softmax")
     max_reduction = linalg_ops[1]
     max_center_and_exp_op = linalg_ops[2]
     sum_reduction = linalg_ops[4]
@@ -156,6 +178,10 @@ def bundle_xegpu_softmax_schedule(
     _, div_loop = structured.TileUsingForOp(
         div_op, sizes=[0, reduction_step_size]
     ).results
+    # Cleanup after tiling and fusion
+    transform.apply_cse(func)
+    canonicalize(func)
+    match_and_print_parent_function(div_loop, "after tiling div")
 
     # Fuse max_center_and_exp_op into the div loop
     _, fused_loop = structured.structured_fuse_into_containing_op(
@@ -164,6 +190,10 @@ def bundle_xegpu_softmax_schedule(
         producer_op=max_center_and_exp_op,
         containing_op=div_loop,
     )
+    # Cleanup after tiling and fusion
+    transform.apply_cse(func)
+    canonicalize(func)
+    match_and_print_parent_function(fused_loop, "after fusing max_center_and_exp into div loop")
 
     # Tile the sum reduction and fuse the sub+exp producer into it
     _, _, _, sum_loop = structured.structured_tile_reduction_using_for(
@@ -174,6 +204,10 @@ def bundle_xegpu_softmax_schedule(
         target=sum_reduction,
         tile_sizes=[0, reduction_step_size],
     )
+    # Cleanup after tiling and fusion
+    transform.apply_cse(func)
+    canonicalize(func)
+    match_and_print_parent_function(sum_loop, "after tiling sum reduction")
 
     func = transform.get_parent_op(
         anytype,
@@ -193,10 +227,14 @@ def bundle_xegpu_softmax_schedule(
         producer_op=max_center_and_exp_op,
         containing_op=sum_loop,
     )
+    # Cleanup after tiling and fusion
+    transform.apply_cse(func)
+    canonicalize(func)
+    match_and_print_parent_function(fused_sum_loop, "after fusing max_center_and_exp into sum reduction loop")
 
     # Tile the max reduction.
     max_reduction = linalg_ops[0]
-    structured.structured_tile_reduction_using_for(
+    _, _, _, max_loop = structured.structured_tile_reduction_using_for(
         [anytype],
         anytype,
         anytype,
@@ -204,6 +242,7 @@ def bundle_xegpu_softmax_schedule(
         target=max_reduction,
         tile_sizes=[0, reduction_step_size],
     )
+    match_and_print_parent_function(max_loop, "after tiling max reduction")
 
     # Cleanup after tiling and fusion
     transform.apply_cse(func)
