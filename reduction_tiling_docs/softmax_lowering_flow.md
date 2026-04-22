@@ -100,16 +100,6 @@ func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
 }
 ```
 
-**Loop structure:**
-- **Outer**: `scf.forall` with 16 parallel iterations
-- Each iteration performs 4 sequential linalg ops
-
-**Key operations:**
-1. **Max reduction**: Reduces from `(64, 512)` to `(64,)` using `maxnumf`
-2. **Center+exp**: Element-wise subtract max and apply exp
-3. **Sum reduction**: Reduces from `(64, 512)` to `(64,)` using `addf`
-4. **Division**: Element-wise divide by sum
-
 ---
 
 ## Stage 4: After Tiling Division
@@ -156,12 +146,6 @@ func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
   }
 }
 ```
-
-**Loop structure:**
-- **Outer**: `scf.forall` with 16 parallel iterations (64-row tiles)
-- **Inner**: `scf.for` with 32 sequential iterations (512/16 = 32 column tiles)
-
-**Key change:** Division now operates on `64x16` tiles instead of full `64x512`
 
 ---
 
@@ -219,11 +203,6 @@ func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
 }
 ```
 
-**Loop structure:**
-- **Outer**: `scf.forall` with 16 parallel iterations
-- **Inner**: `scf.for` with 32 sequential iterations
-
-**Key change:** Inside the division loop, center+exp is recomputed on `64x16` tiles from the original input, avoiding the need to store the full `64x512` exp tensor.
 
 ---
 
@@ -278,14 +257,6 @@ func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
   }
 }
 ```
-
-**Loop structure:**
-- **Outer**: `scf.forall` with 16 parallel iterations
-- **Sum reduction loop**: `scf.for` with 32 iterations, accumulating into `64x16`
-- **Final reduction**: `linalg.reduce` from `(64, 16)` to `(64,)`
-- **Division loop**: `scf.for` with 32 iterations
-
-**Key change:** Sum reduction split into partial accumulation (loop) + final reduction (linalg.reduce)
 
 ---
 
@@ -365,14 +336,6 @@ func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
   }
 }
 ```
-
-**Loop structure:**
-- **Outer**: `scf.forall` with 16 parallel iterations
-- **Sum reduction loop**: `scf.for` with 32 iterations (fused center+exp+accumulate)
-- **Final reduction**: `linalg.reduce`
-- **Division loop**: `scf.for` with 32 iterations (fused center+exp+div)
-
-**Key change:** Center+exp is recomputed twice (once for sum, once for division) to avoid storing intermediate `64x512` tensor.
 
 ---
 
@@ -473,14 +436,6 @@ func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
 }
 ```
 
-**Loop structure:**
-- **Outer**: `scf.forall` with 16 parallel iterations (64-row tiles)
-- **Max reduction loop**: `scf.for` with 32 iterations → `linalg.reduce`
-- **Sum reduction loop**: `scf.for` with 32 iterations → `linalg.reduce`
-- **Division loop**: `scf.for` with 32 iterations
-
-**Key change:** All three stages (max, sum, div) now use tiled loops operating on `64x16` chunks.
-
 ---
 
 ## Stage 9: Final Vectorized XeGPU Version
@@ -565,21 +520,6 @@ gpu.module @payload_kernel {
 }
 ```
 
-**Loop structure:**
-- **Grid**: 16 blocks (one per 64-row tile)
-- **Per block**:
-  - **Max reduction loop**: 32 iterations (512/16)
-  - **Final max reduction**: `vector.multi_reduction`
-  - **Sum reduction loop**: 32 iterations (512/16)
-  - **Final sum reduction**: `vector.multi_reduction`
-  - **Division loop**: 32 iterations (512/16)
-
-**Key transformations:**
-- Linalg operations → vectorized operations on `vector<64x16xf32>`
-- Tensor buffers → SLM allocation (`memref<64x16xf32, 3>`)
-- Memory operations → XeGPU load/store operations (`xegpu.load_nd`, `xegpu.store_nd`, `xegpu.load_matrix`, `xegpu.store_matrix`)
-- GPU kernel launch with 16 blocks × 128 threads
-
 ---
 
 ## Summary of Transformations
@@ -600,9 +540,3 @@ gpu.module @payload_kernel {
 1. **Max reduction**: 32-iteration loop with SLM accumulation → final reduction
 2. **Sum reduction**: 32-iteration loop (fused center+exp) with SLM accumulation → final reduction
 3. **Division**: 32-iteration loop (fused center+exp+div) writing to global memory
-
-This progressive lowering enables efficient GPU execution with:
-- Parallelism across 64-row tiles
-- SLM for partial reduction storage
-- Recomputation of center+exp to reduce memory traffic
-- Vectorized 64x16 tile operations
