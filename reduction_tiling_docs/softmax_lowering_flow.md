@@ -540,3 +540,193 @@ gpu.module @payload_kernel {
 1. **Max reduction**: 32-iteration loop with SLM accumulation → final reduction
 2. **Sum reduction**: 32-iteration loop (fused center+exp) with SLM accumulation → final reduction
 3. **Division**: 32-iteration loop (fused center+exp+div) writing to global memory
+
+---
+
+## Optimization: Fusing Max and Sum Reduction Loops
+
+After Stage 8, we can apply an additional optimization to fuse the max reduction loop and sum reduction loop into a single loop. This reduces the number of loops from 3 to 2.
+
+### Key Insight
+
+The optimization leverages the **online softmax algorithm**, which allows us to incrementally update both the global maximum and the global sum as we process each tile of the reduction dimension. For each 16-column tile:
+
+1. Compute the **local max** for the tile
+2. Update the **global max** using the local max
+3. Compute the **local centered sum** using exp(x - local_max)
+4. **Rescale** the global sum by exp(global_max_old - global_max_new)
+5. **Add** the rescaled local sum to the global sum
+
+This maintains numerical stability while processing tiles incrementally, since we adjust previous sums by the correction factor when we discover a new maximum.
+
+### Before: Separate Max and Sum Loops (3 loops total)
+
+```mlir
+func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
+  %2 = scf.forall (%arg2) in (16) shared_outs(%arg3 = %1) -> (tensor<1024x512xf32>) {
+    %slice = tensor.extract_slice %0[%3, 0] [64, 512] [1, 1]
+
+    // Loop 1: Max reduction
+    %8 = scf.for %arg4 = %c0 to %c512 step %c16 iter_args(%arg5 = %7) -> (tensor<64x16xf32>) {
+      %slice_7 = tensor.extract_slice %slice[0, %arg4] [64, 16] [1, 1]
+
+      %14 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%slice_7 : tensor<64x16xf32>) outs(%slice_8 : tensor<64x16xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          %15 = arith.maxnumf %in, %out : f32
+          linalg.yield %15 : f32
+      } -> tensor<64x16xf32>
+
+      scf.yield %14 : tensor<64x16xf32>
+    }
+    %reduced = linalg.reduce ins(%8) outs(%5) dimensions = [1] { maxnumf }
+
+    // Loop 2: Sum reduction with center+exp
+    %12 = scf.for %arg4 = %c0 to %c512 step %c16 iter_args(%arg5 = %11) -> (tensor<64x16xf32>) {
+      %slice_7 = tensor.extract_slice %slice[0, %arg4] [64, 16] [1, 1]
+
+      // Center+exp using global max
+      %14 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%slice_7, %reduced : tensor<64x16xf32>, tensor<64xf32>) outs(%slice_8) {
+        ^bb0(%in: f32, %in_9: f32, %out: f32):
+          %16 = arith.subf %in, %in_9 : f32
+          %17 = math.exp %16 : f32
+          linalg.yield %17 : f32
+      } -> tensor<64x16xf32>
+
+      // Accumulate sum
+      %15 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%14) outs(%arg5) {
+        ^bb0(%in: f32, %out: f32):
+          %16 = arith.addf %in, %out : f32
+          linalg.yield %16 : f32
+      } -> tensor<64x16xf32>
+
+      scf.yield %15 : tensor<64x16xf32>
+    }
+    %reduced_6 = linalg.reduce ins(%12) outs(%9) dimensions = [1] { addf }
+
+    // Loop 3: Division with center+exp+div
+    %13 = scf.for %arg4 = %c0 to %c512 step %c16 iter_args(%arg5 = %slice_1) -> (tensor<64x512xf32>) {
+      // ... fused center+exp+div ...
+    }
+  }
+}
+```
+
+### After: Fused Max+Sum Loop (2 loops total)
+
+```mlir
+func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
+  %2 = scf.forall (%arg2) in (16) shared_outs(%arg3 = %1) -> (tensor<1024x512xf32>) {
+    %slice = tensor.extract_slice %0[%3, 0] [64, 512] [1, 1]
+
+    // Loop 1: Fused max+sum reduction (online softmax)
+    %fused = scf.for %arg4 = %c0 to %c512 step %c16
+             iter_args(%global_max = %init_max, %global_sum_buffer = %7)
+             -> (tensor<64xf32>, tensor<64x16xf32>) {
+      %slice_7 = tensor.extract_slice %slice[0, %arg4] [64, 16] [1, 1]
+
+      // Step 1: Compute local max for this tile
+      %local_max = linalg.reduce ins(%slice_7 : tensor<64x16xf32>) outs(%5 : tensor<64xf32>) dimensions = [1] {
+        (%in: f32, %init: f32) {
+          %max = arith.maxnumf %in, %init : f32
+          linalg.yield %max : f32
+        }
+      }
+
+      // Step 2: Update global max
+      %new_global_max = linalg.generic {iterator_types = ["parallel"]}
+            ins(%global_max, %local_max : tensor<64xf32>, tensor<64xf32>) outs(%out_max : tensor<64xf32>) {
+        ^bb0(%old_max: f32, %curr_max: f32, %out: f32):
+          %updated = arith.maxnumf %old_max, %curr_max : f32
+          linalg.yield %updated : f32
+      } -> tensor<64xf32>
+
+      // Step 3: Compute local centered sum: exp(x - local_max)
+      %local_exp = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%slice_7, %local_max : tensor<64x16xf32>, tensor<64xf32>) outs(%slice_8 : tensor<64x16xf32>) {
+        ^bb0(%in: f32, %max: f32, %out: f32):
+          %centered = arith.subf %in, %max : f32
+          %exp_val = math.exp %centered : f32
+          linalg.yield %exp_val : f32
+      } -> tensor<64x16xf32>
+
+      // Reduce to get tile sum
+      %local_sum_buffer = linalg.reduce ins(%local_exp : tensor<64x16xf32>) outs(%9 : tensor<64x16xf32>) dimensions = [1] {
+        (%in: f32, %init: f32) {
+          %sum = arith.addf %in, %init : f32
+          linalg.yield %sum : f32
+        }
+      }
+
+      // Step 4: Rescale global sum by exp(old_max - new_max) and add local sum
+      %updated_global_sum = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%global_sum_buffer, %global_max, %new_global_max, %local_sum_buffer :
+                tensor<64x16xf32>, tensor<64xf32>, tensor<64xf32>, tensor<64x16xf32>)
+            outs(%out_sum : tensor<64x16xf32>) {
+        ^bb0(%old_sum: f32, %old_max: f32, %new_max: f32, %local: f32, %out: f32):
+          // Correction factor: exp(old_max - new_max)
+          %max_diff = arith.subf %old_max, %new_max : f32
+          %scale = math.exp %max_diff : f32
+          %rescaled_sum = arith.mulf %old_sum, %scale : f32
+
+          // Add local sum (already centered on local_max, need to rescale)
+          %local_scale_diff = arith.subf %local_max, %new_max : f32
+          %local_scale = math.exp %local_scale_diff : f32
+          %rescaled_local = arith.mulf %local, %local_scale : f32
+
+          %updated = arith.addf %rescaled_sum, %rescaled_local : f32
+          linalg.yield %updated : f32
+      } -> tensor<64x16xf32>
+
+      scf.yield %new_global_max, %updated_global_sum : tensor<64xf32>, tensor<64x16xf32>
+    }
+
+    // Extract final results
+    %final_max = %fused#0 : tensor<64xf32>
+    %final_sum_buffer = %fused#1 : tensor<64x16xf32>
+    %final_sum = linalg.reduce ins(%final_sum_buffer) outs(%9) dimensions = [1] { addf }
+
+    // Loop 2: Division with center+exp+div
+    %13 = scf.for %arg4 = %c0 to %c512 step %c16 iter_args(%arg5 = %slice_1) -> (tensor<64x512xf32>) {
+      %slice_7 = tensor.extract_slice %slice[0, %arg4] [64, 16] [1, 1]
+
+      // Center+exp
+      %14 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%slice_7, %final_max : tensor<64x16xf32>, tensor<64xf32>) outs(%slice_8) {
+        ^bb0(%in: f32, %max: f32, %out: f32):
+          %centered = arith.subf %in, %max : f32
+          %exp_val = math.exp %centered : f32
+          linalg.yield %exp_val : f32
+      } -> tensor<64x16xf32>
+
+      // Division
+      %15 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%14, %final_sum : tensor<64x16xf32>, tensor<64xf32>) outs(%slice_8) {
+        ^bb0(%exp_val: f32, %sum: f32, %out: f32):
+          %result = arith.divf %exp_val, %sum : f32
+          linalg.yield %result : f32
+      } -> tensor<64x16xf32>
+
+      %inserted = tensor.insert_slice %15 into %arg5[0, %arg4] [64, 16] [1, 1]
+      scf.yield %inserted : tensor<64x512xf32>
+    }
+  }
+}
+```
+
+### Benefits
+
+1. **Reduced loop count**: 3 loops → 2 loops (fused max+sum, division)
+2. **Better memory locality**: Input data is read only twice instead of three times
+3. **Lower latency**: One fewer synchronization point between reduction phases
+4. **Same numerical stability**: Uses the online softmax algorithm which maintains stability through incremental rescaling
+
+### Trade-offs
+
+- **Increased per-iteration complexity**: Each iteration of the fused loop performs more operations (max update, sum rescaling, correction factors)
+- **More register pressure**: Need to carry both `global_max` and `global_sum_buffer` across iterations
+- **Additional exp operations**: Computing correction factors requires exp(old_max - new_max) and exp(local_max - new_max) per tile
+
+This optimization is particularly valuable for GPU implementations where memory bandwidth is the bottleneck, as reducing the number of passes over the input data can significantly improve performance despite the increased computational complexity per iteration.
