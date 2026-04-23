@@ -193,13 +193,13 @@ def parse_cli():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
+        default=1,
         help="Batch size (Z)",
     )
     parser.add_argument(
         "--num-heads",
         type=int,
-        default=8,
+        default=1,
         help="Number of attention heads (H)",
     )
     parser.add_argument(
