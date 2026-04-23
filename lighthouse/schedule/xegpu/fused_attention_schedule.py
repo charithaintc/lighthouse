@@ -7,7 +7,6 @@ from mlir.dialects import transform
 from mlir.dialects.transform import structured
 
 from lighthouse.pipeline.helper import (
-    canonicalize,
     match,
     match_and_split,
     PipelineInterrupt,
@@ -228,7 +227,6 @@ def bundle_xegpu_fused_attention_schedule(
     # )
     # transform.apply_cse(func)
     # canonicalize(func)
-
 
     if stop_at_stage == "outer-tiled":
         raise PipelineInterrupt()

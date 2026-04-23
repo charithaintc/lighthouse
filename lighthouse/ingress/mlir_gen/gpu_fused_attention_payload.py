@@ -1,7 +1,5 @@
 """Generate MLIR payload for GPU fused attention operation."""
 
-import math
-
 from mlir import ir
 from mlir.dialects import arith, bufferization, linalg, tensor
 
