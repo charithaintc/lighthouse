@@ -720,13 +720,5 @@ func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
 
 1. **Reduced loop count**: 3 loops → 2 loops (fused max+sum, division)
 2. **Better memory locality**: Input data is read only twice instead of three times
-3. **Lower latency**: One fewer synchronization point between reduction phases
-4. **Same numerical stability**: Uses the online softmax algorithm which maintains stability through incremental rescaling
-
-### Trade-offs
-
-- **Increased per-iteration complexity**: Each iteration of the fused loop performs more operations (max update, sum rescaling, correction factors)
-- **More register pressure**: Need to carry both `global_max` and `global_sum_buffer` across iterations
-- **Additional exp operations**: Computing correction factors requires exp(old_max - new_max) and exp(local_max - new_max) per tile
 
 This optimization is particularly valuable for GPU implementations where memory bandwidth is the bottleneck, as reducing the number of passes over the input data can significantly improve performance despite the increased computational complexity per iteration.
