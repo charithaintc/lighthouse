@@ -7,7 +7,7 @@ Input sizes:
 - K: 4096x64
 - V: 4096x64
 
-```
+```mlir
 func.func @attention(%Q : memref<4096x64xf32>, %K: memref<4096x64xf32>,
 %V: memref<4096x64xf32>, %out: memref<4096x64xf32>) {
   ...
@@ -56,7 +56,7 @@ func.func @attention(%Q : memref<4096x64xf32>, %K: memref<4096x64xf32>,
 
 After tiling the final matmul `%o = linalg.matmul ins(%p, %v)` along the K dimension with tile size 16:
 
-```
+```mlir
 func.func @attention(%Q : memref<4096x64xf32>, %K: memref<4096x64xf32>,
 %V: memref<4096x64xf32>, %out: memref<4096x64xf32>) {
   ...
@@ -97,7 +97,7 @@ func.func @attention(%Q : memref<4096x64xf32>, %K: memref<4096x64xf32>,
 
 After tiling the softmax computation in the reduction dimension with tile size 16 and fusing operations, following the pattern from the softmax lowering flow:
 
-```
+```mlir
 func.func @attention(%Q : memref<4096x64xf32>, %K: memref<4096x64xf32>,
 %V: memref<4096x64xf32>, %out: memref<4096x64xf32>) {
   ...
