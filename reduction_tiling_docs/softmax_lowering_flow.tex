@@ -1,0 +1,567 @@
+\documentclass[aspectratio=169]{beamer}
+\usepackage[utf8]{inputenc}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{booktabs}
+
+\usetheme{default}
+\usecolortheme{default}
+
+% MLIR syntax highlighting - simplified for slides
+\lstdefinelanguage{MLIR}{
+  morekeywords={func, memref, tensor, linalg, scf, forall, for, arith, math, gpu, xegpu, vector},
+  sensitive=true,
+  morecomment=[l]{//},
+  morestring=[b]",
+}
+
+\lstset{
+  language=MLIR,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{red},
+  numbers=none,
+  backgroundcolor=\color{white},
+  showspaces=false,
+  showstringspaces=false,
+  showtabs=false,
+  frame=single,
+  tabsize=2,
+  breaklines=true,
+  breakatwhitespace=false,
+  escapeinside={\%*}{*)}
+}
+
+\title{Softmax Lowering Flow: IR Transformation Stages}
+\author{}
+\date{}
+
+\begin{document}
+
+\begin{frame}
+\titlepage
+\end{frame}
+
+\begin{frame}{Problem Setup}
+\textbf{Input Shape}: $1024 \times 512 \times f32$ (1024 rows, 512 columns)
+
+\textbf{Softmax Dimension}: dim=1 (along the 512-element rows)
+
+\vspace{0.5cm}
+
+\textbf{Softmax Formula}:
+$$\text{softmax}(x_i) = \frac{e^{x_i - \max(x)}}{\sum_j e^{x_j - \max(x)}}$$
+\end{frame}
+
+\begin{frame}[fragile]{Stage 1: Initial IR}
+Single high-level \texttt{linalg.softmax} operation on the full tensor.
+
+\begin{lstlisting}
+// Pseudo code:
+output = softmax(input[1024x512], dim=1)
+\end{lstlisting}
+
+\vspace{0.3cm}
+
+\textbf{Key Points}:
+\begin{itemize}
+\item Single operation on entire tensor
+\item No parallelism or tiling yet
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Stage 2: After Tiling Parallel Dimension}
+Parallel dimension (rows) tiled into 16 chunks of 64 rows each.
+
+\begin{lstlisting}
+// Pseudo code:
+parallel for tile_id in [0..16):
+  row_offset = tile_id * 64
+  slice = input[row_offset:row_offset+64, 0:512]
+  output_slice = softmax(slice, dim=1)
+  output[row_offset:row_offset+64, :] = output_slice
+\end{lstlisting}
+
+\vspace{0.3cm}
+
+\textbf{Key Points}:
+\begin{itemize}
+\item 16 parallel tiles: $1024 / 64 = 16$
+\item Each tile: $64 \times 512$
+\item Introduces \texttt{scf.forall} for parallel execution
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Stage 3: After Decomposing Softmax}
+Softmax decomposed into 4 operations:
+\textbf{max} $\rightarrow$ \textbf{center+exp} $\rightarrow$ \textbf{sum} $\rightarrow$ \textbf{division}
+
+\begin{lstlisting}
+// Pseudo code:
+parallel for tile_id in [0..16):
+  slice = input[tile_id*64:(tile_id+1)*64, :]
+
+  // Step 1: Max reduction (64,512) -> (64,)
+  max_vals = reduce_max(slice, dim=1)
+
+  // Step 2: Center and exp (64,512) -> (64,512)
+  exp_vals = exp(slice - max_vals)
+
+  // Step 3: Sum reduction (64,512) -> (64,)
+  sum_vals = reduce_sum(exp_vals, dim=1)
+
+  // Step 4: Division (64,512) -> (64,512)
+  output_slice = exp_vals / sum_vals
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Stage 4: After Tiling Division}
+Division operation tiled along dimension 1 into chunks of 16 columns.
+
+\begin{lstlisting}
+// Pseudo code:
+parallel for tile_id in [0..16):
+  slice = input[tile_id*64:(tile_id+1)*64, :]
+
+  max_vals = reduce_max(slice, dim=1)      // (64,512)->(64,)
+  exp_vals = exp(slice - max_vals)         // (64,512)->(64,512)
+  sum_vals = reduce_sum(exp_vals, dim=1)   // (64,512)->(64,)
+
+  // Division tiled: 32 iterations (512/16 = 32)
+  for col_offset in [0:512:16]:
+    exp_tile = exp_vals[:, col_offset:col_offset+16]
+    output[:, col_offset:col_offset+16] = exp_tile / sum_vals
+\end{lstlisting}
+
+\vspace{0.2cm}
+\textbf{Key}: Division loop operates on $64 \times 16$ tiles
+\end{frame}
+
+\begin{frame}[fragile]{Stage 5: Fusing Center+Exp into Division Loop}
+Recompute center-and-exp on-the-fly in division loop.
+
+\begin{lstlisting}
+// Pseudo code:
+parallel for tile_id in [0..16):
+  slice = input[tile_id*64:(tile_id+1)*64, :]
+
+  max_vals = reduce_max(slice, dim=1)      // (64,)
+
+  // Still materialized for sum reduction
+  exp_vals = exp(slice - max_vals)         // (64,512)
+  sum_vals = reduce_sum(exp_vals, dim=1)   // (64,)
+
+  // Division loop: recompute exp on-the-fly
+  for col_offset in [0:512:16]:
+    input_tile = slice[:, col_offset:col_offset+16]
+    exp_tile = exp(input_tile - max_vals)  // Recomputed
+    output[:, col_offset:col_offset+16] = exp_tile / sum_vals
+\end{lstlisting}
+
+\vspace{0.2cm}
+\textbf{Benefit}: Reduces memory footprint (partial recomputation)
+\end{frame}
+
+\begin{frame}[fragile]{Stage 6: After Tiling Sum Reduction}
+Sum reduction tiled into 16-column chunks with partial sums.
+
+\begin{lstlisting}
+// Pseudo code:
+parallel for tile_id in [0..16):
+  slice = input[tile_id*64:(tile_id+1)*64, :]
+
+  max_vals = reduce_max(slice, dim=1)      // (64,)
+  exp_vals = exp(slice - max_vals)         // (64,512)
+
+  // Tiled sum reduction: accumulate into buffer (64,16)
+  sum_buffer = zeros(64, 16)
+  for col_offset in [0:512:16]:
+    exp_tile = exp_vals[:, col_offset:col_offset+16]
+    sum_buffer += exp_tile  // Accumulate
+
+  sum_vals = reduce_sum(sum_buffer, dim=1)  // (64,16)->(64,)
+
+  // Division loop (same as before)
+  for col_offset in [0:512:16]: ...
+\end{lstlisting}
+
+\vspace{0.2cm}
+\textbf{Key}: Sum uses partial accumulation buffer
+\end{frame}
+
+\begin{frame}[fragile]{Stage 7: Fusing into Sum Reduction Loop}
+Fuse center-and-exp into sum reduction loop as well.
+
+\begin{lstlisting}
+// Pseudo code:
+parallel for tile_id in [0..16):
+  slice = input[tile_id*64:(tile_id+1)*64, :]
+
+  max_vals = reduce_max(slice, dim=1)      // (64,)
+
+  // Sum reduction with fused center+exp
+  sum_buffer = zeros(64, 16)
+  for col_offset in [0:512:16]:
+    input_tile = slice[:, col_offset:col_offset+16]
+    exp_tile = exp(input_tile - max_vals)  // Fused
+    sum_buffer += exp_tile
+
+  sum_vals = reduce_sum(sum_buffer, dim=1)  // (64,)
+
+  // Division loop with fused center+exp+div
+  for col_offset in [0:512:16]:
+    input_tile = slice[:, col_offset:col_offset+16]
+    exp_tile = exp(input_tile - max_vals)  // Recomputed
+    output[:, col_offset:col_offset+16] = exp_tile / sum_vals
+\end{lstlisting}
+\end{frame}
+
+\section{Stage 8: After Tiling Max Reduction}
+
+Max reduction also tiled into 16-column chunks with partial max followed by final reduction.
+
+\begin{lstlisting}
+func.func @payload(%arg0: memref<1024x512xf32>, %arg1: memref<1024x512xf32>) {
+  %2 = scf.forall (%arg2) in (16) shared_outs(%arg3 = %1) -> (tensor<1024x512xf32>) {
+    %slice = tensor.extract_slice %0[%3, 0] [64, 512] [1, 1]
+
+    // Tiled max reduction: accumulate into 64x16 buffer
+    %8 = scf.for %arg4 = %c0 to %c512 step %c16 iter_args(%arg5 = %7) -> (tensor<64x16xf32>) {
+      %slice_7 = tensor.extract_slice %slice[0, %arg4] [64, 16] [1, 1]
+
+      // Max accumulation
+      %14 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%slice_7 : tensor<64x16xf32>) outs(%slice_8 : tensor<64x16xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          %15 = arith.maxnumf %in, %out : f32
+          linalg.yield %15 : f32
+      } -> tensor<64x16xf32>
+
+      %inserted = tensor.insert_slice %14 into %arg5[0, 0] [64, 16] [1, 1]
+      scf.yield %inserted : tensor<64x16xf32>
+    }
+
+    // Final max reduction: (64,16) -> (64,)
+    %reduced = linalg.reduce ins(%8 : tensor<64x16xf32>) outs(%5 : tensor<64xf32>) dimensions = [1] {
+      (%in: f32, %init: f32) {
+        %14 = arith.maxnumf %in, %init : f32
+        linalg.yield %14 : f32
+      }
+    }
+
+    // Sum reduction loop with fused center+exp
+    %12 = scf.for %arg4 = %c0 to %c512 step %c16 iter_args(%arg5 = %11) -> (tensor<64x16xf32>) {
+      %slice_7 = tensor.extract_slice %slice[0, %arg4] [64, 16] [1, 1]
+
+      // Fused center+exp using reduced max
+      %14 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%slice_7, %reduced : tensor<64x16xf32>, tensor<64xf32>) outs(%slice_8 : tensor<64x16xf32>) {
+        ^bb0(%in: f32, %in_9: f32, %out: f32):
+          %16 = arith.subf %in, %in_9 : f32
+          %17 = math.exp %16 : f32
+          linalg.yield %17 : f32
+      } -> tensor<64x16xf32>
+
+      // Sum accumulation
+      %15 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%14 : tensor<64x16xf32>) outs(%arg5 : tensor<64x16xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          %16 = arith.addf %in, %out : f32
+          linalg.yield %16 : f32
+      } -> tensor<64x16xf32>
+
+      scf.yield %15 : tensor<64x16xf32>
+    }
+
+    // Final sum reduction: (64,16) -> (64,)
+    %reduced_6 = linalg.reduce ins(%12 : tensor<64x16xf32>) outs(%9 : tensor<64xf32>) dimensions = [1] {
+      (%in: f32, %init: f32) {
+        %14 = arith.addf %in, %init : f32
+        linalg.yield %14 : f32
+      }
+    }
+
+    // Division loop with fused center+exp+div
+    %13 = scf.for %arg4 = %c0 to %c512 step %c16 iter_args(%arg5 = %slice_1) -> (tensor<64x512xf32>) {
+      %slice_7 = tensor.extract_slice %slice[0, %arg4] [64, 16] [1, 1]
+
+      // Fused center+exp
+      %14 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%slice_7, %reduced : tensor<64x16xf32>, tensor<64xf32>) outs(%slice_8 : tensor<64x16xf32>) {
+        ^bb0(%in: f32, %in_9: f32, %out: f32):
+          %16 = arith.subf %in, %in_9 : f32
+          %17 = math.exp %16 : f32
+          linalg.yield %17 : f32
+      } -> tensor<64x16xf32>
+
+      // Division
+      %15 = linalg.generic {iterator_types = ["parallel", "parallel"]}
+            ins(%14, %reduced_6 : tensor<64x16xf32>, tensor<64xf32>) outs(%slice_8 : tensor<64x16xf32>) {
+        ^bb0(%in: f32, %in_9: f32, %out: f32):
+          %16 = arith.divf %in, %in_9 : f32
+          linalg.yield %16 : f32
+      } -> tensor<64x16xf32>
+
+      %inserted = tensor.insert_slice %15 into %arg5[0, %arg4] [64, 16] [1, 1]
+      scf.yield %inserted : tensor<64x512xf32>
+    }
+
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %13 into %arg3[%3, 0] [64, 512] [1, 1]
+    }
+  }
+}
+\end{lstlisting}
+
+\begin{frame}[fragile]{Stage 8: After Tiling Max Reduction (Part 1)}
+Max reduction tiled with partial buffers, creating 3 loops total.
+
+\begin{lstlisting}
+// Pseudo code (continued from Stage 7):
+parallel for tile_id in [0..16):
+  slice = input[tile_id*64:(tile_id+1)*64, :]
+
+  // Loop 1: Tiled max reduction
+  max_buffer = fill(-inf, 64, 16)
+  for col_offset in [0:512:16]:
+    input_tile = slice[:, col_offset:col_offset+16]
+    max_buffer = max(max_buffer, input_tile)
+  max_vals = reduce_max(max_buffer, dim=1)  // (64,)
+
+  // Loop 2: Sum reduction with fused center+exp
+  sum_buffer = zeros(64, 16)
+  for col_offset in [0:512:16]:
+    input_tile = slice[:, col_offset:col_offset+16]
+    exp_tile = exp(input_tile - max_vals)
+    sum_buffer += exp_tile
+  sum_vals = reduce_sum(sum_buffer, dim=1)  // (64,)
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Stage 8: After Tiling Max Reduction (Part 2)}
+\begin{lstlisting}
+  // Loop 3: Division with fused center+exp+div
+  for col_offset in [0:512:16]:
+    input_tile = slice[:, col_offset:col_offset+16]
+    exp_tile = exp(input_tile - max_vals)
+    output[:, col_offset:col_offset+16] = exp_tile / sum_vals
+\end{lstlisting}
+
+\vspace{0.3cm}
+
+\textbf{Key Points}:
+\begin{itemize}
+\item All 3 operations (max, sum, div) are now tiled
+\item 3 separate loops over columns (32 iterations each)
+\item Each loop processes $64 \times 16$ tiles
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Stage 9: Final Vectorized XeGPU Version}
+After vectorization, bufferization, and XeGPU lowering.
+
+\begin{lstlisting}
+// Pseudo code:
+gpu.kernel:
+  block_id = get_block_id()
+  slice = input[block_id*64:(block_id+1)*64, :]
+
+  // Allocate SLM buffer (64x16) for partial reductions
+  slm_buffer = alloc_shared_memory(64, 16)
+
+  // Loop 1: Max reduction (32 iterations)
+  slm_buffer = fill(-inf)
+  for col_offset in [0:512:16]:
+    tile = load_vector(slice[:, col_offset:col_offset+16])
+    slm_buffer = max(slm_buffer, tile)  // Update in SLM
+  max_vals = reduce_across_cols(slm_buffer)
+
+  // Loop 2: Sum reduction (32 iterations)
+  slm_buffer = zeros()
+  for col_offset in [0:512:16]:
+    tile = load_vector(slice[:, col_offset:col_offset+16])
+    exp_tile = exp(tile - max_vals)
+    slm_buffer += exp_tile  // Accumulate in SLM
+  sum_vals = reduce_across_cols(slm_buffer)
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Stage 9: Final Vectorized XeGPU Version (cont'd)}
+\begin{lstlisting}
+  // Loop 3: Division (32 iterations)
+  for col_offset in [0:512:16]:
+    tile = load_vector(slice[:, col_offset:col_offset+16])
+    exp_tile = exp(tile - max_vals)
+    result = exp_tile / sum_vals
+    store_vector(output[:, col_offset:col_offset+16], result)
+\end{lstlisting}
+
+\vspace{0.3cm}
+
+\textbf{Key Features}:
+\begin{itemize}
+\item Uses vector operations ($64 \times 16$ SIMD)
+\item Shared Local Memory (SLM) for partial reductions
+\item XeGPU dialect for Intel GPU operations
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Summary of Transformations}
+\begin{table}
+\centering
+\small
+\begin{tabular}{@{}rll@{}}
+\toprule
+\textbf{Stage} & \textbf{Key Transformation} & \textbf{Loop Structure} \\
+\midrule
+1 & Initial high-level softmax & No loops \\
+2 & Tile parallel dimension & \texttt{forall(16)} \\
+3 & Decompose softmax & \texttt{forall(16)} + 4 ops \\
+4 & Tile division & \texttt{forall(16)} $\rightarrow$ \texttt{for(32)} \\
+5 & Fuse into division loop & Recompute center+exp \\
+6 & Tile sum reduction & Add sum loop \\
+7 & Fuse into sum loop & Recompute center+exp \\
+8 & Tile max reduction & 3 loops total \\
+9 & Vectorize + XeGPU & GPU with SLM \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{0.3cm}
+
+\textbf{Final pattern per GPU block}: 3 loops of 32 iterations each
+\begin{enumerate}
+\item Max reduction $\rightarrow$ SLM $\rightarrow$ final reduction
+\item Sum reduction (fused center+exp) $\rightarrow$ SLM $\rightarrow$ final reduction
+\item Division (fused center+exp+div) $\rightarrow$ global memory
+\end{enumerate}
+\end{frame}
+
+\begin{frame}{Optimization: Fusing Max and Sum Loops}
+After Stage 8, we can fuse max and sum loops into one.
+
+\textbf{Result}: 3 loops $\rightarrow$ 2 loops
+
+\vspace{0.5cm}
+
+\textbf{Key Insight}: \emph{Online Softmax Algorithm}
+
+Incrementally update both global max and sum as we process each tile:
+
+\begin{enumerate}
+\item Compute \textbf{local max} for the tile
+\item Update \textbf{global max} = $\max(\text{old\_max}, \text{local\_max})$
+\item Compute \textbf{local sum} = $\sum \exp(x - \text{local\_max})$
+\item \textbf{Rescale} global sum by $\exp(\text{old\_max} - \text{new\_max})$
+\item \textbf{Add} rescaled local sum to global sum
+\end{enumerate}
+
+\vspace{0.3cm}
+
+Maintains numerical stability while reducing memory bandwidth!
+\end{frame}
+
+\begin{frame}[fragile]{Before Fusion: 3 Separate Loops}
+\begin{lstlisting}
+// Pseudo code:
+parallel for tile_id in [0..16):
+  slice = input[tile_id*64:(tile_id+1)*64, :]
+
+  // Loop 1: Max reduction
+  max_buffer = fill(-inf, 64, 16)
+  for col_offset in [0:512:16]:
+    tile = slice[:, col_offset:col_offset+16]
+    max_buffer = max(max_buffer, tile)
+  max_vals = reduce_max(max_buffer, dim=1)
+
+  // Loop 2: Sum reduction
+  sum_buffer = zeros(64, 16)
+  for col_offset in [0:512:16]:
+    tile = slice[:, col_offset:col_offset+16]
+    exp_tile = exp(tile - max_vals)  // Uses final max
+    sum_buffer += exp_tile
+  sum_vals = reduce_sum(sum_buffer, dim=1)
+
+  // Loop 3: Division
+  for col_offset in [0:512:16]: ...
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{After Fusion: 2 Loops (Online Softmax)}
+\begin{lstlisting}
+// Pseudo code:
+parallel for tile_id in [0..16):
+  slice = input[tile_id*64:(tile_id+1)*64, :]
+
+  // Loop 1: Fused max+sum (online softmax algorithm)
+  global_max = fill(-inf, 64)
+  global_sum = zeros(64)
+
+  for col_offset in [0:512:16]:
+    tile = slice[:, col_offset:col_offset+16]
+
+    // Update max incrementally
+    local_max = reduce_max(tile, dim=1)
+    new_max = max(global_max, local_max)
+
+    // Compute local sum centered on local_max
+    local_sum = sum(exp(tile - local_max), dim=1)
+
+    // Rescale and accumulate sum
+    correction = exp(global_max - new_max)
+    local_correction = exp(local_max - new_max)
+    global_sum = global_sum * correction + local_sum * local_correction
+
+    global_max = new_max
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{After Fusion: 2 Loops (cont'd)}
+\begin{lstlisting}
+  // Loop 2: Division (same as before)
+  for col_offset in [0:512:16]:
+    tile = slice[:, col_offset:col_offset+16]
+    exp_tile = exp(tile - global_max)
+    output[:, col_offset:col_offset+16] = exp_tile / global_sum
+\end{lstlisting}
+
+\vspace{0.5cm}
+
+\textbf{Benefits}:
+\begin{itemize}
+\item Reduced loop count: 3 $\rightarrow$ 2 loops
+\item Better memory locality: Input read twice instead of three times
+\item Same numerical stability (still uses max-centering)
+\end{itemize}
+
+\vspace{0.3cm}
+
+\textbf{Trade-off}: More computation per iteration (exponentials for rescaling)
+\end{frame}
+
+\begin{frame}{Summary}
+\textbf{Softmax Lowering Journey}: 9 transformation stages
+
+\begin{enumerate}
+\item Start: High-level \texttt{linalg.softmax} operation
+\item Decompose into: max $\rightarrow$ center+exp $\rightarrow$ sum $\rightarrow$ div
+\item Tile parallel dimension (16 workgroups)
+\item Tile reduction dimension (32 iterations per loop)
+\item Fuse operations to reduce memory footprint
+\item Lower to GPU with vectorization and SLM
+\item \textbf{Optional}: Fuse max+sum loops (online softmax)
+\end{enumerate}
+
+\vspace{0.5cm}
+
+\textbf{Key Techniques}:
+\begin{itemize}
+\item Tiling for parallelism and memory hierarchy
+\item Fusion for memory efficiency (recomputation)
+\item Online softmax for bandwidth optimization
+\end{itemize}
+\end{frame}
+
+\end{document}
