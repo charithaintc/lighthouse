@@ -133,7 +133,7 @@ def bundle_xegpu_fused_attention_schedule(
         last_matmul,
         num_threads=[],
         tile_sizes=[],
-        static_tile_sizes=(1, wg_tile_size, 0, 0)
+        static_tile_sizes=(1, wg_tile_size, 0, 0),
     )
 
     # Fuse the softmax producer into forall
