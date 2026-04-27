@@ -16,8 +16,8 @@ from lighthouse.pipeline.helper import (
     match_and_split,
     PipelineInterrupt,
 )
-from lighthouse.schedule.xegpu.helper import bundle_xegpu_to_binary
 
+from lighthouse.schedule import schedule_boilerplate
 from lighthouse.dialects import smt_ext
 from lighthouse.dialects.transform import smt_ext as td_smt_ext
 from lighthouse.dialects.transform.tune_ext import knob, KnobValue
@@ -104,66 +104,39 @@ def params_with_constraints_imposed(
     }
 
 
-def get_schedule_module(
+def mlp_schedule(
     params: list[dict[str, int | None]],
     stop_at_stage: str = "",
 ) -> ir.Module:
-    """Generate transform schedule module."""
+    """Generate transform schedule module for MLP payload."""
     assert params is not None and len(params) > 0, "params must be provided."
-    mod = ir.Module.create()
-    mod.operation.attributes["transform.with_named_sequence"] = ir.UnitAttr.get()
-    with ir.InsertionPoint(mod.body):
-        named_sequence = transform.named_sequence(
-            "__transform_main",
-            [transform.AnyOpType.get()],  # input types
-            [],  # output types
-            arg_attrs=[{"transform.readonly": ir.UnitAttr.get()}],
+    with schedule_boilerplate() as (schedule, named_seq):
+        # match the payload module
+        anytype = transform.AnyOpType.get()
+        func = match(named_seq.bodyTarget, ops={"func.func"})
+        payload_mod = transform.get_parent_op(
+            anytype,
+            func,
+            op_name="builtin.module",
+            deduplicate=True,
         )
-        with ir.InsertionPoint(named_sequence.body):
-            # match the payload module
-            anytype = transform.AnyOpType.get()
-            func = match(named_sequence.bodyTarget, ops={"func.func"})
-            payload_mod = transform.get_parent_op(
-                anytype,
-                func,
-                op_name="builtin.module",
-                deduplicate=True,
+        for i, layer_params in enumerate(params):
+            layer_params |= params_with_constraints_imposed(
+                layer_params, knob_name_prefix=f"layer_{i}_"
             )
-            for i, layer_params in enumerate(params):
-                layer_params |= params_with_constraints_imposed(
-                    layer_params, knob_name_prefix=f"layer_{i}_"
-                )
 
-            xegpu_mlp_transform_schedule(
+        try:
+            bundle_xegpu_mlp_schedule(
                 payload_mod,
                 params=params,
                 stop_at_stage=stop_at_stage,
             )
+        except PipelineInterrupt:
+            pass
+        finally:
+            transform.yield_()
 
-    return mod
-
-
-def xegpu_mlp_transform_schedule(
-    mod: ir.Value[transform.AnyOpType],
-    params: list[dict[str, int | KnobValue]],
-    stop_at_stage: str = "",
-):
-    """Transform schedule for MLP-like payload."""
-    try:
-        mod = bundle_xegpu_mlp_schedule(
-            mod,
-            params=params,
-            stop_at_stage=stop_at_stage,
-        )
-
-        mod = bundle_xegpu_to_binary(
-            mod,
-            stop_at_stage=stop_at_stage,
-        )
-    except PipelineInterrupt:
-        pass
-    finally:
-        transform.yield_()
+    return schedule
 
 
 def bundle_xegpu_mlp_schedule(
@@ -183,25 +156,26 @@ def bundle_xegpu_mlp_schedule(
 
     # tile each layer separately
     for matmul_op, layer_params in zip(matmul_ops, params):
+        # tunable parameters: wg and k tiling
+        wg_tile = [layer_params["wg_m"], layer_params["wg_n"]]
+        k_tile = layer_params["k_tile"]
+
         # find the last tileable consumer of the matmul
         consumers = transform_ext.get_tileable_consumers(matmul_op)
         leaf_consumer_op = transform_ext.extract_handle(consumers, -1)
 
-        # tunable parameters: wg level tiling
-        wg_tile = [layer_params["wg_m"], layer_params["wg_n"]]
-        k_tile = layer_params["k_tile"]
-
-        _, wg_loop = structured.FuseOp(
-            leaf_consumer_op, tile_sizes=wg_tile, use_forall=True
-        ).results
-        transform.apply_cse(mod)
-        canonicalize(mod)
+        # wg tiling
+        _, [wg_loop], _ = lh_transform.tile(
+            leaf_consumer_op,
+            tile_sizes=wg_tile,
+            fuse_producers=True,
+            use_forall=True,
+            apply_cleanup=False,
+        )
 
         # k loop tiling
         wg_matmul = match(wg_loop, ops={"linalg.matmul"})
-        wgk_matmul, k_loop = structured.TileUsingForOp(
-            wg_matmul, sizes=[0, 0, k_tile]
-        ).results
+        _, [k_loop], _ = lh_transform.tile(wg_matmul, tile_sizes=[0, 0, k_tile])
 
     func = transform.get_parent_op(
         anytype,
@@ -209,25 +183,22 @@ def bundle_xegpu_mlp_schedule(
         op_name="func.func",
         deduplicate=True,
     )
-    transform.apply_cse(func)
-    canonicalize(func)
+    lh_transform.cleanup(func)
 
     if stop_at_stage == "tiled":
         raise PipelineInterrupt()
 
     # vectorize
-    # FIXME use structured.structured_vectorize_children_and_apply_patterns
-    func = structured.VectorizeChildrenAndApplyPatternsOp(
+    func = structured.structured_vectorize_children_and_apply_patterns(
+        transform.any_op_t(),
         func,
         fold_type_extensions_into_contract=True,
-    ).result
+    )
 
     # hoist loop invariant vector read/store ops
     k_loop = match(func, ops={"scf.for"})
-    loop.HoistLoopInvariantSubsetsOp(k_loop)
-
-    transform.apply_cse(func)
-    canonicalize(func)
+    lh_transform.loop_hoisting(k_loop)
+    lh_transform.cleanup(func)
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
