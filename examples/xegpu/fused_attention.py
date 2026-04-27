@@ -22,7 +22,7 @@ from lighthouse.ingress.mlir_gen.gpu_fused_attention_payload import (
     generate_gpu_fused_attention_payload,
 )
 from lighthouse.schedule.xegpu.fused_attention_schedule import (
-    get_fused_attention_schedule_module,
+    fused_attention_schedule,
 )
 
 
@@ -175,7 +175,7 @@ class XeGPUFusedAttention:
         """Generate transform schedule for fused attention."""
         return [
             Runner.get_bench_wrapper_schedule(self.payload_function_name),
-            get_fused_attention_schedule_module(
+            fused_attention_schedule(
                 stop_at_stage=stop_at_stage,
                 parameters=parameters,
             ),
