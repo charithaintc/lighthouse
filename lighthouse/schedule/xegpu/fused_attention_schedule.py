@@ -145,58 +145,58 @@ def bundle_xegpu_fused_attention_schedule(
     transform.apply_cse(func)
     canonicalize(func)
 
-    # # Fuse linalg.transpose (K transpose) into forall
-    # transpose_ops = match_and_split(func, ops={"linalg.transpose"}, nhandles=1)
-    # transpose_op = transpose_ops[0]
-    # _, forall_loop = structured.structured_fuse_into_containing_op(
-    #     anytype,
-    #     anytype,
-    #     producer_op=transpose_op,
-    #     containing_op=forall_loop,
-    # )
-    # transform.apply_cse(func)
-    # canonicalize(func)
+    # Fuse linalg.transpose (K transpose) into forall
+    transpose_ops = match_and_split(func, ops={"linalg.transpose"}, nhandles=1)
+    transpose_op = transpose_ops[0]
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=transpose_op,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
 
-    # # At this point all of the key operations are fused into the forall loop.
-    # # Remaining linalg.fill ops can be fused trivially.
-    # fill_ops = match_and_split(func, ops={"linalg.fill"}, nhandles=3)
-    # for fill_op in fill_ops:
-    #     _, forall_loop = structured.structured_fuse_into_containing_op(
-    #         anytype,
-    #         anytype,
-    #         producer_op=fill_op,
-    #         containing_op=forall_loop,
-    #     )
-    #     transform.apply_cse(func)
-    #     canonicalize(func)
+    # At this point all of the key operations are fused into the forall loop.
+    # Remaining linalg.fill ops can be fused trivially.
+    fill_ops = match_and_split(func, ops={"linalg.fill"}, nhandles=3)
+    for fill_op in fill_ops:
+        _, forall_loop = structured.structured_fuse_into_containing_op(
+            anytype,
+            anytype,
+            producer_op=fill_op,
+            containing_op=forall_loop,
+        )
+        transform.apply_cse(func)
+        canonicalize(func)
 
-    # # tensor.empty() holding the result of transpose can be fused.
-    # transpose_op = match_and_split(func, ops={"linalg.transpose"}, nhandles=1)[0]
-    # transpose_init = transform.get_producer_of_operand(
-    #     anytype, transpose_op, operand_number=1
-    # )
-    # _, forall_loop = structured.structured_fuse_into_containing_op(
-    #     anytype,
-    #     anytype,
-    #     producer_op=transpose_init,
-    #     containing_op=forall_loop,
-    # )
-    # transform.apply_cse(func)
-    # canonicalize(func)
+    # tensor.empty() holding the result of transpose can be fused.
+    transpose_op = match_and_split(func, ops={"linalg.transpose"}, nhandles=1)[0]
+    transpose_init = transform.get_producer_of_operand(
+        anytype, transpose_op, operand_number=1
+    )
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=transpose_init,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
 
-    # # tensor.empty() ops holding the result of the softmax can also be fused.
-    # softmax_op = match_and_split(func, ops={"linalg.softmax"}, nhandles=1)[0]
-    # softmax_init = transform.get_producer_of_operand(
-    #     anytype, softmax_op, operand_number=1
-    # )
-    # _, forall_loop = structured.structured_fuse_into_containing_op(
-    #     anytype,
-    #     anytype,
-    #     producer_op=softmax_init,
-    #     containing_op=forall_loop,
-    # )
-    # transform.apply_cse(func)
-    # canonicalize(func)
+    # tensor.empty() ops holding the result of the softmax can also be fused.
+    softmax_op = match_and_split(func, ops={"linalg.softmax"}, nhandles=1)[0]
+    softmax_init = transform.get_producer_of_operand(
+        anytype, softmax_op, operand_number=1
+    )
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=softmax_init,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
 
     if stop_at_stage == "outer-tiled":
         raise PipelineInterrupt()
