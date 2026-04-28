@@ -105,96 +105,80 @@ def bundle_xegpu_fused_attention_schedule(
         tile_sizes=[],
         static_tile_sizes=(1, wg_tile_size, 0, 0),
     )
+    # Fuse the zero initialization of the output of the last matmul (tensor.empty) into the forall loop.
+    tiled_matmul_init = transform.get_producer_of_operand(
+        anytype, forall_loop, operand_number=0
+    )
+    _, forall_loop = structured.structured_fuse_into_containing_op(
+        anytype,
+        anytype,
+        producer_op=tiled_matmul_init,
+        containing_op=forall_loop,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
 
-    # Fuse the softmax producer into forall
+    # Decompose softmax into generic ops
     softmax_ops = match_and_split(func, ops={"linalg.softmax"}, nhandles=1)
     softmax_op = softmax_ops[0]
-    fused_softmax_op, forall_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=softmax_op,
-        containing_op=forall_loop,
-    )
+    structured.structured_decompose_interface(anytype, softmax_op)
     transform.apply_cse(func)
     canonicalize(func)
 
-    # Fuse linalg.mul (scaling) into forall
-    mul_ops = match_and_split(func, ops={"linalg.mul"}, nhandles=1)
-    mul_op = mul_ops[0]
-    _, forall_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=mul_op,
-        containing_op=forall_loop,
-    )
+    # Fuse all linalg.generic ops from softmax decomposition (4 ops: max, sub+exp, sum, div)
+    # Match and fuse in reverse order (from consumer to producer)
+    generic_ops = match_and_split(func, ops={"linalg.generic"}, nhandles=4)
+    for generic_op in reversed(generic_ops):
+        _, forall_loop = structured.structured_fuse_into_containing_op(
+            anytype,
+            anytype,
+            producer_op=generic_op,
+            containing_op=forall_loop,
+        )
     transform.apply_cse(func)
     canonicalize(func)
 
-    # Fuse the first matmul (Q @ K^T) into forall
-    # TODO: This fusion does not work??
-    matmul_ops = match_and_split(
-        func, ops={"linalg.batch_matmul"}, nhandles=2
-    )  # Two matmuls are present.
-    first_matmul = matmul_ops[0]
-    _, forall_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=first_matmul,
-        containing_op=forall_loop,
-    )
-    transform.apply_cse(func)
-    canonicalize(func)
-
-    # Fuse linalg.transpose (K transpose) into forall
-    transpose_ops = match_and_split(func, ops={"linalg.transpose"}, nhandles=1)
-    transpose_op = transpose_ops[0]
-    _, forall_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=transpose_op,
-        containing_op=forall_loop,
-    )
-    transform.apply_cse(func)
-    canonicalize(func)
-
-    # At this point all of the key operations are fused into the forall loop.
-    # Remaining linalg.fill ops can be fused trivially.
-    fill_ops = match_and_split(func, ops={"linalg.fill"}, nhandles=3)
-    for fill_op in fill_ops:
+    # Max and add reductions use linalg.fill to intialize the reduction output. Fuse these fill ops as well.
+    fill_ops = match_and_split(func, ops={"linalg.fill"}, nhandles=5)
+    # Max fill is the third fill op and add fill is the fourth fill op (based on the pattern of decomposition)
+    max_fill_op = fill_ops[2]
+    add_fill_op = fill_ops[3]
+    for fill_op in [max_fill_op, add_fill_op]:
         _, forall_loop = structured.structured_fuse_into_containing_op(
             anytype,
             anytype,
             producer_op=fill_op,
             containing_op=forall_loop,
         )
-        transform.apply_cse(func)
-        canonicalize(func)
-
-    # tensor.empty() holding the result of transpose can be fused.
-    transpose_op = match_and_split(func, ops={"linalg.transpose"}, nhandles=1)[0]
-    transpose_init = transform.get_producer_of_operand(
-        anytype, transpose_op, operand_number=1
-    )
-    _, forall_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=transpose_init,
-        containing_op=forall_loop,
-    )
     transform.apply_cse(func)
     canonicalize(func)
 
-    # tensor.empty() ops holding the result of the softmax can also be fused.
-    softmax_op = match_and_split(func, ops={"linalg.softmax"}, nhandles=1)[0]
-    softmax_init = transform.get_producer_of_operand(
-        anytype, softmax_op, operand_number=1
+    linalg_mul_op = match_and_split(func, ops={"linalg.mul"}, nhandles=1)[0]
+    first_matmul = transform.get_producer_of_operand(
+        anytype, linalg_mul_op, operand_number=0
     )
-    _, forall_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=softmax_init,
-        containing_op=forall_loop,
+    scale_fill_op = transform.get_producer_of_operand(
+        anytype, linalg_mul_op, operand_number=1
     )
+    transpose_op = transform.get_producer_of_operand(
+        anytype, first_matmul, operand_number=1
+    )
+    matmul_fill_op = transform.get_producer_of_operand(
+        anytype, first_matmul, operand_number=2
+    )
+    for op in [
+        linalg_mul_op,
+        scale_fill_op,
+        first_matmul,
+        matmul_fill_op,
+        transpose_op,
+    ]:
+        _, forall_loop = structured.structured_fuse_into_containing_op(
+            anytype,
+            anytype,
+            producer_op=op,
+            containing_op=forall_loop,
+        )
     transform.apply_cse(func)
     canonicalize(func)
 
