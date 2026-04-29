@@ -38,7 +38,7 @@ class UpdateAddressSpace(
             new_ops = []
 
             # Verify this is a memref.alloca operation
-            if target_op.OPERATION_NAME != "memref.alloca":
+            if not isinstance(target_op.opview, memref.AllocaOp):
                 return DiagnosedSilenceableFailure.emit_silenceable_error(
                     f"Expected memref.alloca operation, got {target_op.OPERATION_NAME}"
                 )
