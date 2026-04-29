@@ -5,7 +5,7 @@ from mlir.dialects.transform import DiagnosedSilenceableFailure
 from lighthouse.dialects.transform.transform_ext import TransformExtensionDialect
 
 
-class UpdateAddressSpace(
+class UpdateAddressSpaceOp(
     TransformExtensionDialect.Operation, name="update_address_space"
 ):
     """Update the address space of a memref allocation operation.
@@ -26,7 +26,7 @@ class UpdateAddressSpace(
     class TransformOpInterfaceModel(transform.TransformOpInterface):
         @staticmethod
         def apply(
-            op: "UpdateAddressSpace",
+            op: "UpdateAddressSpaceOp",
             rewriter: transform.TransformRewriter,
             results: transform.TransformResults,
             state: transform.TransformState,
@@ -82,7 +82,7 @@ class UpdateAddressSpace(
             return DiagnosedSilenceableFailure.Success
 
         @staticmethod
-        def allow_repeated_handle_operands(_op: "UpdateAddressSpace") -> bool:
+        def allow_repeated_handle_operands(_op: "UpdateAddressSpaceOp") -> bool:
             return False
 
     class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
@@ -101,4 +101,4 @@ def update_address_space(
         address_space = ir.IntegerAttr.get(
             ir.IntegerType.get_signless(64), address_space
         )
-    return UpdateAddressSpace(target, address_space=address_space).updated_op
+    return UpdateAddressSpaceOp(target, address_space=address_space).updated_op
