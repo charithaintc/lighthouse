@@ -164,7 +164,7 @@ def parse_cli():
         "--sizes",
         type=int,
         nargs=2,
-        default=[1024, 64],
+        default=[1024, 512],
         help="M,N matrix sizes (MxN)",
     )
     parser.add_argument(
@@ -184,6 +184,12 @@ def parse_cli():
         type=int,
         default=16,
         help="Subgroup size.",
+    )
+    parser.add_argument(
+        "--reduction-step-size",
+        type=int,
+        default=16,
+        help="Step size for reduction loop tiling (optional).",
     )
     parser.add_argument(
         "--nruns",
@@ -210,6 +216,7 @@ def parse_cli():
             "tiled",
             "vectorized",
             "bufferized",
+            "gpu-outlining",
             "xegpu-initial",
             "xegpu-wg",
             "final",
@@ -241,6 +248,7 @@ if __name__ == "__main__":
         "wg_rows": args.wg_rows,
         "sg_rows": args.sg_rows,
         "subgroup_size": args.subgroup_size,
+        "reduction_step_size": args.reduction_step_size,
     }
 
     M, N = args.sizes
@@ -291,6 +299,8 @@ if __name__ == "__main__":
                 )
                 if not success:
                     raise ValueError("Result mismatch!")
+                else:
+                    print("Result is correct. Proceeding to benchmark...")
 
             times = runner.benchmark(
                 host_input_buffers=wload._initial_host_arrays,
