@@ -3,7 +3,7 @@
 import math
 
 from mlir import ir
-from mlir.dialects import arith, bufferization, linalg, tensor
+from mlir.dialects import arith, bufferization, linalg, memref, tensor
 
 from lighthouse.utils.mlir import func_cif
 from lighthouse.ingress.mlir_gen.gpu_utils import emit_gpu_util_funcs
@@ -40,35 +40,41 @@ def generate_gpu_fused_attention_payload(
     memref_t = ir.MemRefType.get(shape, dtype)
 
     with ir.InsertionPoint(mod.body):
+        # Collapse first 2 dimensions (Z, H) into a batch dimension
+        # From (Z, H, n_ctx, n_head) to (Z*H, n_ctx, n_head)
+        batch_dim = Z * H
+        collapsed_shape_3d = (batch_dim, n_ctx, n_head)
+        memref_3d_t = ir.MemRefType.get(collapsed_shape_3d, dtype)
+
         # Function signature: payload(output, Q, K, V)
         @func_cif(memref_t, memref_t, memref_t, memref_t, name=func_name)
         def payload(output, Q_arg, K_arg, V_arg):
-            # Convert memrefs to tensors
-            emit_buf_to_tensor(output, restrict=True, writable=True)
-            Q_tensor = emit_buf_to_tensor(Q_arg, restrict=True)
-            K_tensor = emit_buf_to_tensor(K_arg, restrict=True)
-            V_tensor = emit_buf_to_tensor(V_arg, restrict=True)
+            # Collapse memrefs from 4D to 3D
+            Q_3d_memref = memref.collapse_shape(
+                memref_3d_t,
+                Q_arg,
+                reassociation=[[0, 1], [2], [3]],
+            )
+            K_3d_memref = memref.collapse_shape(
+                memref_3d_t,
+                K_arg,
+                reassociation=[[0, 1], [2], [3]],
+            )
+            V_3d_memref = memref.collapse_shape(
+                memref_3d_t,
+                V_arg,
+                reassociation=[[0, 1], [2], [3]],
+            )
+            output_3d_memref = memref.collapse_shape(
+                memref_3d_t,
+                output,
+                reassociation=[[0, 1], [2], [3]],
+            )
 
-            # Collapse first 2 dimensions (Z, H) into a batch dimension
-            # From (Z, H, n_ctx, n_head) to (Z*H, n_ctx, n_head)
-            batch_dim = Z * H
-            collapsed_shape_3d = (batch_dim, n_ctx, n_head)
-
-            Q_3d = tensor.collapse_shape(
-                ir.RankedTensorType.get(collapsed_shape_3d, dtype),
-                Q_tensor,
-                reassociation=[[0, 1], [2], [3]],
-            )
-            K_3d = tensor.collapse_shape(
-                ir.RankedTensorType.get(collapsed_shape_3d, dtype),
-                K_tensor,
-                reassociation=[[0, 1], [2], [3]],
-            )
-            V_3d = tensor.collapse_shape(
-                ir.RankedTensorType.get(collapsed_shape_3d, dtype),
-                V_tensor,
-                reassociation=[[0, 1], [2], [3]],
-            )
+            # Convert 3D memrefs to tensors
+            Q_3d = emit_buf_to_tensor(Q_3d_memref, restrict=True)
+            K_3d = emit_buf_to_tensor(K_3d_memref, restrict=True)
+            V_3d = emit_buf_to_tensor(V_3d_memref, restrict=True)
 
             # Step 1: Transpose K to get K^T
             # Permute from (batch_dim, n_ctx, n_head) to (batch_dim, n_head, n_ctx)
@@ -119,18 +125,9 @@ def generate_gpu_fused_attention_payload(
                 attention_weights, V_3d, outs=[output_3d_init_filled]
             )
 
-            # Expand back to 4D: (Z*H, n_ctx, n_head) -> (Z, H, n_ctx, n_head)
-            result = tensor.expand_shape(
-                ir.RankedTensorType.get(shape, dtype),
-                result_3d,
-                reassociation=[[0, 1], [2], [3]],
-                output_shape=[],
-                static_output_shape=shape,
-            )
-
-            # Materialize result back to output memref
+            # Materialize 3D result back to 3D output memref
             bufferization.materialize_in_destination(
-                None, result, output, restrict=True, writable=True
+                None, result_3d, output_3d_memref, restrict=True, writable=True
             )
 
         # Emit utility functions for GPU memory management

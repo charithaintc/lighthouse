@@ -4,15 +4,19 @@ from typing import Optional
 
 from mlir import ir
 from mlir.dialects import transform
-from mlir.dialects.transform import structured
+from mlir.dialects.transform import structured, loop, xegpu
+from mlir.dialects.transform import bufferization as transform_bufferization
+from mlir.dialects.bufferization import LayoutMapOption
 
 from lighthouse.pipeline.helper import (
     canonicalize,
     match,
     match_and_split,
     PipelineInterrupt,
+    apply_registered_pass,
 )
 from lighthouse.schedule import schedule_boilerplate
+from lighthouse.dialects.transform import transform_ext
 
 
 def fused_attention_schedule(
@@ -36,7 +40,9 @@ def fused_attention_schedule(
             - num_heads: Number of attention heads (H)
             - n_ctx: Context length
             - n_head: Head dimension
-            - wg_tile_size: Workgroup tile size for the collapsed batch dimension (Z*H*n_ctx)
+            - wg_rows: Number of Q*K^T*V rows computed by each work group
+            - sg_rows: Number of Q*K^T*V rows computed by each subgroup
+            - subgroup_size: Size of subgroup
 
     Returns:
         MLIR module containing the transform schedule
@@ -95,7 +101,7 @@ def bundle_xegpu_fused_attention_schedule(
     )
 
     # Tile the last matmul in both batch and M dimensions.
-    wg_tile_size = parameters["wg_tile_size"]
+    wg_rows = parameters["wg_rows"]
 
     tiled_matmul, forall_loop = structured.structured_tile_using_forall(
         anytype,
@@ -103,7 +109,7 @@ def bundle_xegpu_fused_attention_schedule(
         last_matmul,
         num_threads=[],
         tile_sizes=[],
-        static_tile_sizes=(1, wg_tile_size, 0, 0),
+        static_tile_sizes=(1, wg_rows, 0, 0),
     )
     # Fuse the zero initialization of the output of the last matmul (tensor.empty) into the forall loop.
     tiled_matmul_init = transform.get_producer_of_operand(
@@ -185,38 +191,97 @@ def bundle_xegpu_fused_attention_schedule(
     if stop_at_stage == "outer-tiled":
         raise PipelineInterrupt()
 
-    # # vectorize (placeholder)
-    # # func = structured.VectorizeChildrenAndApplyPatternsOp(
-    # #     func,
-    # #     fold_type_extensions_into_contract=True,
-    # # ).result
-    # transform.apply_cse(func)
-    # canonicalize(func)
-
     if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()
+
+    # vectorize (placeholder)
+    func = structured.VectorizeChildrenAndApplyPatternsOp(
+        func,
+        fold_type_extensions_into_contract=True,
+    ).result
+    transform.apply_cse(func)
+    canonicalize(func)
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
 
     # bufferize (placeholder)
-    # mod = apply_registered_pass(mod, "eliminate-empty-tensors")
-    # identity_layout = LayoutMapOption.IdentityLayoutMap
-    # mod = transform_bufferization.OneShotBufferizeOp(
-    #     mod,
-    #     allow_return_allocs_from_loops=True,
-    #     bufferize_function_boundaries=True,
-    #     function_boundary_type_conversion=identity_layout,
-    # ).result
+    mod = apply_registered_pass(mod, "eliminate-empty-tensors")
+    identity_layout = LayoutMapOption.IdentityLayoutMap
+    mod = transform_bufferization.OneShotBufferizeOp(
+        mod,
+        allow_return_allocs_from_loops=True,
+        bufferize_function_boundaries=True,
+        function_boundary_type_conversion=identity_layout,
+    ).result
+    transform.apply_cse(mod)
+    canonicalize(mod)
 
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
 
+    # convert forall to parallel
+    wg_loops = match_and_split(mod, ops={"scf.forall"})
+    for wg_loop in wg_loops:
+        wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
+    func = transform.get_parent_op(anytype, wg_loop)
+
+    # convert scf.parallel to gpu.launch
+    func = apply_registered_pass(func, "gpu-map-parallel-loops")
+    func = apply_registered_pass(func, "convert-parallel-loops-to-gpu")
+    func = apply_registered_pass(func, "lower-affine")
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    # set the number of threads for the gpu.launch operation
+    launch_op = match_and_split(func, ops={"gpu.launch"})
+    wg_rows = parameters["wg_rows"]
+    sg_rows = parameters["sg_rows"]
+    subgroup_size = parameters["subgroup_size"]
+    num_subgroups = wg_rows // sg_rows
+    num_threads = num_subgroups * subgroup_size
+    xegpu.set_gpu_launch_threads(launch_op[0], threads=[num_threads, 1, 1])
+
+    # outline gpu func
+    func = apply_registered_pass(func, "lower-affine")
+    canonicalize(func)
+    func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
+    mod = apply_registered_pass(mod, "gpu-kernel-outlining")
+    transform.apply_cse(mod)
+
     if stop_at_stage == "gpu-outlining":
         raise PipelineInterrupt()
 
+    # set xevm target
+    mod = apply_registered_pass(
+        mod,
+        "xevm-attach-target",
+        options={"O": "3", "chip": "bmg"},
+    )
+
+    # for each gpu function in the gpu module, change memref.alloca address
+    # space to 3 (SLM) and convert vector to xegpu.
+    gpu_mod_ops = match_and_split(mod, ops={"gpu.module"})
+    for gpu_mod in gpu_mod_ops:
+        gpu_func = match(gpu_mod, ops={"gpu.func"})
+        allocas = match_and_split(gpu_func, ops={"memref.alloca"})
+        for alloca in allocas:
+            transform_ext.update_address_space(alloca, address_space=3)
+        gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
+        transform.apply_cse(gpu_func)
+
+    # Cleanup.
+    transform.apply_cse(mod)
+    canonicalize(mod)
+
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
+
+    # Set layout attributes for xegpu store operations
+    # Note: The exact operations to match depend on what gets generated
+    # after vectorization and xegpu conversion for fused attention
+    # This is a placeholder that may need adjustment based on the actual IR
+    gpu_func = match(gpu_mod_ops[0], ops={"gpu.func"})
 
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()
