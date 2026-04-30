@@ -21,9 +21,7 @@ from lighthouse.ingress.mlir_gen import get_mlir_elem_type
 from lighthouse.ingress.mlir_gen.gpu_fused_attention_payload import (
     generate_gpu_fused_attention_payload,
 )
-from lighthouse.schedule.xegpu.fused_attention_schedule import (
-    fused_attention_schedule,
-)
+from lighthouse.schedule.xegpu import fused_attention_schedule, xegpu_to_binary
 
 
 def fused_attention_complexity(Z: int, H: int, n_ctx: int, n_head: int, nbytes: int):
@@ -173,13 +171,22 @@ class XeGPUFusedAttention:
         self, stop_at_stage: Optional[str] = None, parameters: Optional[dict] = None
     ) -> list[ir.Module]:
         """Generate transform schedule for fused attention."""
-        return [
-            Runner.get_bench_wrapper_schedule(self.payload_function_name),
+        schedules = []
+        schedules.append(Runner.get_bench_wrapper_schedule(self.payload_function_name))
+
+        schedules.append(
             fused_attention_schedule(
                 stop_at_stage=stop_at_stage,
                 parameters=parameters,
-            ),
-        ]
+            )
+        )
+
+        if stop_at_stage and stop_at_stage != "final":
+            return schedules
+
+        schedules.append(xegpu_to_binary())
+
+        return schedules
 
     def shared_libs(self) -> list[str]:
         return ["libmlir_levelzero_runtime.so"]
@@ -205,7 +212,7 @@ def parse_cli():
     parser.add_argument(
         "--n-ctx",
         type=int,
-        default=512,
+        default=128,
         help="Context length (sequence length)",
     )
     parser.add_argument(
