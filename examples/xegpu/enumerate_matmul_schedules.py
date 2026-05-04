@@ -1,6 +1,6 @@
 # RUN: %PYTHON %s | lh-tune - -n 1 | FileCheck %s
-# RUN: %PYTHON %s | lh-tune - -n 2147483647 --count-only | FileCheck %s --check-prefix=ENUM-CHECK
-# ENUM-CHECK: count: 192
+# RUN: %PYTHON %s | lh-tune - -n 100000 --count-only | FileCheck %s --check-prefix=ENUM-CHECK
+# ENUM-CHECK: count: 93
 
 """Enumerate concrete schedules given a schedule with tunable parameters."""
 
@@ -42,7 +42,8 @@ with ir.Context(), ir.Location.unknown():
         "prefetch_a_k": 16,
         "prefetch_b_k": 16,
         "prefetch_b_n": 16,
-        "prefetch_nb": 1,
+        "prefetch_a_nb": 1,
+        "prefetch_b_nb": 1,
     }
 
     # Check that at least one constraint was reified into the schedule.

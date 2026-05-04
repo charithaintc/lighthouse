@@ -1,6 +1,6 @@
-# RUN: %PYTHON %s --dry-run | FileCheck %s
-# CHECK: Total complexity: 2657205 configurations
-# CHECK: Number of executed configurations: 5292
+# RUN: %PYTHON %s --dry-run --max-iters 1000 | FileCheck %s
+# CHECK: Total complexity: 23914845 configurations
+# CHECK: Number of executed configurations: 1000
 
 from time import perf_counter
 from datetime import timedelta
@@ -23,6 +23,16 @@ from genetic_algorithm import (
     VariableSet,
 )
 from tune_utils import dump_configs_json, execute_and_log
+from lighthouse.schedule.xegpu.mlp_schedule import (
+    MAX_NB_SG_THREADS,
+    LOAD_MAX_COLS,
+    LOAD_MAX_ROWS,
+    PFETCH_MAX_COLS,
+    PFETCH_MAX_ROWS,
+    PFETCH_MIN_COLS,
+    PFETCH_MIN_ROWS,
+    MIN_NB_THREADS,
+)
 
 
 def run_experiment(
@@ -103,18 +113,6 @@ def check_constraints(params: dict, verbose: bool = False) -> bool:
         if verbose:
             print(f"  Invalid: {msg}")
 
-    # hardware constraints
-    max_nb_sg_threads = 64
-    load_max_rows = 32
-    load_max_cols = 16
-    pfetch_min_rows = 8
-    pfetch_max_rows = 32
-    pfetch_min_cols = 16
-    pfetch_max_cols = 32
-
-    # heuristics: skip likely suboptimal configurations
-    min_nb_threads = 16
-
     M = params["m"]
     N = params["n"]
     wg_tile_m = params["wg_m"]
@@ -157,10 +155,10 @@ def check_constraints(params: dict, verbose: bool = False) -> bool:
     nb_sg_threads_m = wg_tile_m // sg_tile_m
     nb_sg_threads_n = wg_tile_n // sg_tile_n
     nb_sg_threads = nb_sg_threads_m * nb_sg_threads_n
-    if nb_sg_threads > max_nb_sg_threads:
+    if nb_sg_threads > MAX_NB_SG_THREADS:
         print_reason("too many sg threads")
         return False
-    if nb_sg_threads < min_nb_threads:
+    if nb_sg_threads < MIN_NB_THREADS:
         print_reason("too few sg threads")
         return False
 
@@ -176,16 +174,16 @@ def check_constraints(params: dict, verbose: bool = False) -> bool:
     if sg_tile_n % load_tile_b_n != 0:
         print_reason("load_tile_b_n does not divide sg_tile_n")
         return False
-    if load_tile_a_m > load_max_rows:
+    if load_tile_a_m > LOAD_MAX_ROWS:
         print_reason("too large load_tile_a_m")
         return False
-    if load_tile_a_k > load_max_cols:
+    if load_tile_a_k > LOAD_MAX_COLS:
         print_reason("too large load_tile_a_k")
         return False
-    if load_tile_b_k > load_max_rows:
+    if load_tile_b_k > LOAD_MAX_ROWS:
         print_reason("too large load_tile_b_k")
         return False
-    if load_tile_b_n > load_max_cols:
+    if load_tile_b_n > LOAD_MAX_COLS:
         print_reason("too large load_tile_b_n")
         return False
     if sg_tile_m % prefetch_tile_a_m != 0:
@@ -200,28 +198,28 @@ def check_constraints(params: dict, verbose: bool = False) -> bool:
     if sg_tile_n % prefetch_tile_b_n != 0:
         print_reason("prefetch_tile_b_n does not divide sg_tile_n")
         return False
-    if prefetch_tile_a_m > pfetch_max_rows:
+    if prefetch_tile_a_m > PFETCH_MAX_ROWS:
         print_reason("too large prefetch_tile_a_m")
         return False
-    if prefetch_tile_a_k > pfetch_max_cols:
+    if prefetch_tile_a_k > PFETCH_MAX_COLS:
         print_reason("too large prefetch_tile_a_k")
         return False
-    if prefetch_tile_b_k > pfetch_max_rows:
+    if prefetch_tile_b_k > PFETCH_MAX_ROWS:
         print_reason("too large prefetch_tile_b_k")
         return False
-    if prefetch_tile_b_n > pfetch_max_cols:
+    if prefetch_tile_b_n > PFETCH_MAX_COLS:
         print_reason("too large prefetch_tile_b_n")
         return False
-    if prefetch_tile_a_m < pfetch_min_rows:
+    if prefetch_tile_a_m < PFETCH_MIN_ROWS:
         print_reason("too small prefetch_tile_a_m")
         return False
-    if prefetch_tile_a_k < pfetch_min_cols:
+    if prefetch_tile_a_k < PFETCH_MIN_COLS:
         print_reason("too small prefetch_tile_a_k")
         return False
-    if prefetch_tile_b_k < pfetch_min_rows:
+    if prefetch_tile_b_k < PFETCH_MIN_ROWS:
         print_reason("too small prefetch_tile_b_k")
         return False
-    if prefetch_tile_b_n < pfetch_min_cols:
+    if prefetch_tile_b_n < PFETCH_MIN_COLS:
         print_reason("too small prefetch_tile_b_n")
         return False
     if load_tile_a_m % DPAS.M != 0:
@@ -247,20 +245,20 @@ def check_constraints(params: dict, verbose: bool = False) -> bool:
     # prefetch A layout
     nb_prefetch_a_m = wg_tile_m // prefetch_tile_a_m
     nb_prefetch_a_k = k_tile // prefetch_tile_a_k
-    if nb_prefetch_a_m * nb_prefetch_a_k > max_nb_sg_threads:
+    if nb_prefetch_a_m * nb_prefetch_a_k > MAX_NB_SG_THREADS:
         print_reason("too many prefetch A tiles")
         return False
-    if nb_prefetch_a_m * nb_prefetch_a_k < min_nb_threads:
+    if nb_prefetch_a_m * nb_prefetch_a_k < MIN_NB_THREADS:
         print_reason("too few prefetch A threads")
         return False
 
     # prefetch B layout
     nb_prefetch_b_k = k_tile // prefetch_tile_b_k
     nb_prefetch_b_n = wg_tile_n // prefetch_tile_b_n
-    if nb_prefetch_b_k * nb_prefetch_b_n > max_nb_sg_threads:
+    if nb_prefetch_b_k * nb_prefetch_b_n > MAX_NB_SG_THREADS:
         print_reason("too many prefetch B tiles")
         return False
-    if nb_prefetch_b_k * nb_prefetch_b_n < min_nb_threads:
+    if nb_prefetch_b_k * nb_prefetch_b_n < MIN_NB_THREADS:
         print_reason("too few prefetch B threads")
         return False
 
@@ -291,7 +289,7 @@ def construct_search_space(M: int, N: int, K: int):
     sg_tiles_n = divisible_by(get_divisors(N, *sg_tile_lim_n), DPAS.N)
     k_tiles = divisible_by(get_divisors(K, 16, min(K, 256)), DPAS.K)
     load_tiles = [8, 16, 32]
-    prefetches = [1]
+    prefetch_nb = [1, 2, 3]
 
     def sample_is_valid(sample_params, verbose=False):
         params = {"m": M, "n": N, "k": K}
@@ -313,7 +311,8 @@ def construct_search_space(M: int, N: int, K: int):
             Variable("prefetch_a_k", load_tiles),
             Variable("prefetch_b_k", load_tiles),
             Variable("prefetch_b_n", load_tiles),
-            Variable("prefetch_nb", prefetches),
+            Variable("prefetch_a_nb", prefetch_nb),
+            Variable("prefetch_b_nb", prefetch_nb),
         ],
         is_valid_fn=sample_is_valid,
     )
@@ -334,6 +333,11 @@ if __name__ == "__main__":
         "--dry-run",
         action="store_true",
         help="Check validity of combinations but do not execute kernels.",
+    )
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        help="Maximum number of executed configurations.",
     )
     parser.add_argument(
         "--no-check-result",
@@ -389,6 +393,9 @@ if __name__ == "__main__":
             continue
 
         i += 1
+        if args.max_iters is not None and i >= args.max_iters:
+            print(f"Reached maximum number of iterations: {args.max_iters}")
+            break
         if args.dry_run:
             continue
         time, gflops = execute_and_log(
@@ -411,12 +418,12 @@ if __name__ == "__main__":
     print(f"Number of executed configurations: {i}")
     print(f"Total duration: {timedelta(seconds=duration)}")
 
-    if args.n_dump_json > 0:
+    if args.n_dump_json > 0 and not args.dry_run:
         executed_configs.sort(key=lambda x: x[0], reverse=True)
         best_configs = [c for c in executed_configs[: args.n_dump_json]]
         print("Best configurations found:")
         for gflops, params in best_configs:
-            print(f" GFLOPS: {gflops:.2f}: {list(params.values)}")
+            print(f" GFLOPS: {gflops:.2f}: {list(params.values())}")
         sizes_str = "-".join(str(s) for s in sizes)
         relu_str = "_relu" if has_relu else ""
         bias_str = "_bias" if has_bias else ""
