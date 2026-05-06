@@ -126,14 +126,14 @@ class XeGPUFusedAttention:
         H: int,
         n_ctx: int,
         n_head: int,
-        dtype: str = "f32",
+        dtype: str = "f16",
     ):
         self.Z = Z
         self.H = H
         self.n_ctx = n_ctx
         self.n_head = n_head
         self.shape = (Z, H, n_ctx, n_head)
-        assert dtype == "f32", "Only f32 type is supported for fused attention"
+        assert dtype == "f16", "Only f16 type is supported for fused attention"
         self.elem_type = get_mlir_elem_type(dtype)
         self.dtype = mlir_to_numpy_dtype(self.elem_type)
         self.memory_manager_class = GPUMemoryManager
@@ -212,7 +212,7 @@ def parse_cli():
     parser.add_argument(
         "--n-ctx",
         type=int,
-        default=128,
+        default=1024,
         help="Context length (sequence length)",
     )
     parser.add_argument(
@@ -306,7 +306,7 @@ if __name__ == "__main__":
     H = args.num_heads
     n_ctx = args.n_ctx
     n_head = args.n_head
-    dtype = "f32"
+    dtype = "f16"
 
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()

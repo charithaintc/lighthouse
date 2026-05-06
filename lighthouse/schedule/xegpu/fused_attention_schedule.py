@@ -9,6 +9,7 @@ from mlir.dialects.transform import bufferization as transform_bufferization
 from mlir.dialects.bufferization import LayoutMapOption
 from mlir.dialects.transform.vector import (
     apply_patterns_vector_cast_away_vector_leading_one_dim,
+    apply_patterns_vector_drop_unit_dims_with_shape_cast,
 )
 
 from lighthouse.pipeline.helper import (
@@ -19,6 +20,7 @@ from lighthouse.pipeline.helper import (
     apply_registered_pass,
 )
 from lighthouse.schedule import schedule_boilerplate
+from lighthouse.dialects.transform.transform_ext import generate_fused_attention
 
 
 def fused_attention_schedule(
@@ -192,6 +194,51 @@ def bundle_xegpu_fused_attention_schedule(
     if stop_at_stage == "outer-tiled":
         raise PipelineInterrupt()
 
+    # Match Q, K, V slices inside the forall loop
+    # K slice is the first operand of the transpose op
+    transpose_op = match_and_split(forall_loop, ops={"linalg.transpose"}, nhandles=1)[0]
+    k_slice = transform.get_producer_of_operand(
+        anytype, transpose_op, operand_number=0
+    )
+    # Q slice is the first operand of the first batch matmul
+    batch_matmuls = match_and_split(forall_loop, ops={"linalg.batch_matmul"}, nhandles=2)
+    q_slice = transform.get_producer_of_operand(
+        anytype, batch_matmuls[0], operand_number=0
+    )
+    # V slice is the second operand of the last batch matmul (inside the forall loop)
+    # Need to match the tiled version of the last matmul inside the loop
+    last_matmul = batch_matmuls[1]
+    v_slice = transform.get_producer_of_operand(
+        anytype, last_matmul, operand_number=1
+    )
+
+    # Match the scaling operation (linalg.mul) to get the scaling factor
+    # The QK output is scaled before softmax: QK * scale
+    mul_op = match_and_split(forall_loop, ops={"linalg.mul"}, nhandles=1)[0]
+    scale_slice = transform.get_producer_of_operand(
+        anytype, mul_op, operand_number=1
+    )
+    # transform.print_(target=k_slice, name="k_slice")
+    # transform.print_(target=q_slice, name="q_slice")
+    # transform.print_(target=v_slice, name="v_slice")
+    # transform.print_(target=scale_slice, name="scale_slice")
+    # transform.print_(target=last_matmul, name="tiled_attention_weights_v_matmul")
+
+    # Generate fused attention computation with inner tiling (flash attention)
+    # This replaces the current unfused computation with a tiled loop that
+    # maintains online max and sum for efficient memory usage
+    tile_size = 64
+    new_output = generate_fused_attention(
+        q_slice=q_slice,
+        k_slice=k_slice,
+        scale_slice=scale_slice,
+        v_slice=v_slice,
+        output=last_matmul,
+        tile_size=tile_size,
+    )
+    # transform.apply_cse(func)
+    # canonicalize(func)
+
     if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()
 
@@ -205,6 +252,7 @@ def bundle_xegpu_fused_attention_schedule(
     # Try to remove any unit dimensions that may have been introduced due to tiling (e.g. batch dim of 1)
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
         apply_patterns_vector_cast_away_vector_leading_one_dim()
+        apply_patterns_vector_drop_unit_dims_with_shape_cast()
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
