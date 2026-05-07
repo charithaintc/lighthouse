@@ -236,8 +236,8 @@ def bundle_xegpu_fused_attention_schedule(
         output=last_matmul,
         tile_size=tile_size,
     )
-    # transform.apply_cse(func)
-    # canonicalize(func)
+    transform.apply_cse(func)
+    canonicalize(func)
 
     if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()

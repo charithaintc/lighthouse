@@ -1,7 +1,7 @@
 """Transform extension to generate fused attention computation."""
 
 from mlir import ir
-from mlir.dialects import ext, transform, arith, scf, linalg, tensor
+from mlir.dialects import ext, transform, arith, scf, linalg, tensor, math
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from lighthouse.dialects.transform.transform_ext import TransformExtensionDialect
@@ -118,7 +118,6 @@ class GenerateFusedAttention(
                 seq_q_dim = q_type.shape[1]
                 head_dim = q_type.shape[2]
                 seq_k_size = arith.constant(index_type, k_type.shape[1])
-                print(f"Seq Q dim: {seq_q_dim}, Head dim: {head_dim}, Sequence length K: {seq_k_size}")
 
                 # Initialize max to -inf
                 # Shape: [seq_q] (1D for 2D tensors)
@@ -161,33 +160,161 @@ class GenerateFusedAttention(
                     old_output = loop_result.inner_iter_args[2]
 
                     # Slice K and V for this tile
-                    # TODO: Implement proper slicing logic here
-                    # This is a placeholder - needs to be filled with actual slice operations
+                    # K: [seq_k, head_dim] -> K_tile: [tile_size, head_dim]
+                    # V: [seq_k, head_dim] -> V_tile: [tile_size, head_dim]
+                    one = arith.constant(index_type, 1)
+                    k_tile_type = ir.RankedTensorType.get([tile_size_value, head_dim], element_type)
+                    k_tile = tensor.extract_slice(
+                        k_tile_type,
+                        source=k_2d,
+                        offsets=[k_idx],
+                        sizes=[],
+                        strides=[],
+                        static_offsets=[ir.ShapedType.get_dynamic_size(), 0],
+                        static_sizes=[tile_size_value, head_dim],
+                        static_strides=[1, 1],
+                    )
+
+                    v_tile_type = ir.RankedTensorType.get([tile_size_value, head_dim], element_type)
+                    v_tile = tensor.extract_slice(
+                        v_tile_type,
+                        source=v_2d,
+                        offsets=[k_idx],
+                        sizes=[],
+                        strides=[],
+                        static_offsets=[ir.ShapedType.get_dynamic_size(), 0],
+                        static_sizes=[tile_size_value, head_dim],
+                        static_strides=[1, 1],
+                    )
+                    # Transpose K_tile: [tile_size, head_dim] -> [head_dim, tile_size]
+                    k_tile_t_shape = [head_dim, tile_size_value]
+                    k_tile_t_init = tensor.empty(k_tile_t_shape, element_type)
+                    k_tile_t = linalg.transpose(k_tile, outs=[k_tile_t_init], permutation=[1, 0])
 
                     # Compute Q @ K^T for this tile
                     # Q: [seq_q, head_dim]
-                    # K_tile: [tile_size, head_dim] (transposed from [head_dim, tile_size])
+                    # K_tile_T: [head_dim, tile_size]
                     # Result: [seq_q, tile_size]
+                    qk_shape = [seq_q_dim, tile_size_value]
+                    qk_init = tensor.empty(qk_shape, element_type)
+                    qk_filled = linalg.fill(zero, outs=[qk_init])
+                    qk = linalg.matmul(q_2d, k_tile_t, outs=[qk_filled])
+
+                    # Compute row-wise max of qk
+                    # row_max: [seq_q] = max(qk, axis=1)
+                    row_max_init = tensor.empty([seq_q_dim], element_type)
+                    row_max_filled = linalg.fill(neg_inf, outs=[row_max_init])
+                    dims_attr = ir.DenseI64ArrayAttr.get([1])
+                    f16 = ir.F16Type.get()
+
+                    @linalg.reduce(
+                        result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
+                        inputs=[qk],
+                        inits=[row_max_filled],
+                        dimensions=dims_attr,
+                    )
+                    def row_max(elem : f16 , acc: f16):
+                        return arith.maximumf(elem, acc)
 
                     # Compute new max across this tile
-                    # new_max: [seq_q] = max(old_max, row_max(Q @ K^T_tile))
+                    # new_max: [seq_q] = max(old_max, row_max)
+                    new_max_init = tensor.empty([seq_q_dim], element_type)
+                    new_max = linalg.max(old_max, row_max, outs=[new_max_init])
 
-                    # Compute exp(Q @ K^T_tile - new_max)
-                    # exp_scores: [seq_q, tile_size]
+                    # Compute exp(qk - new_max)
+                    # First broadcast new_max to [seq_q, 1] then to [seq_q, tile_size]
+                    new_max_2d_type = ir.RankedTensorType.get([seq_q_dim, 1], element_type)
+                    new_max_2d_init = tensor.empty([seq_q_dim, tile_size_value], element_type)
+                    new_max_2d = linalg.broadcast(new_max, outs=[new_max_2d_init], dimensions=[0])
+
+                    # exp_scores: [seq_q, tile_size] = exp(qk - new_max_2d)
+                    exp_scores_init = tensor.empty(qk_shape, element_type)
+
+                    @linalg.map(
+                        result=[ir.RankedTensorType.get(qk_shape, element_type)],
+                        inputs=[qk, new_max_2d],
+                        init=exp_scores_init,
+                    )
+                    def exp_scores(qk_val : f16, max_val: f16, _ : f16):
+                        diff = arith.subf(qk_val, max_val)
+                        return math.exp(diff)
+
+                    # Compute row-wise sum of exp_scores
+                    # row_sum_exp: [seq_q] = sum(exp_scores, axis=1)
+                    row_sum_exp_init = tensor.empty([seq_q_dim], element_type)
+                    row_sum_exp_filled = linalg.fill(zero, outs=[row_sum_exp_init])
+
+                    @linalg.reduce(
+                        result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
+                        inputs=[exp_scores],
+                        inits=[row_sum_exp_filled],
+                        dimensions=dims_attr,
+                    )
+                    def row_sum_exp(elem: f16, acc: f16):
+                        return arith.addf(elem, acc)
+
+                    # Compute correction factor for old values: exp(old_max - new_max)
+                    correction_init = tensor.empty([seq_q_dim], element_type)
+
+                    @linalg.map(
+                        result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
+                        inputs=[old_max, new_max],
+                        init=correction_init,
+                    )
+                    def correction(old_val: f16, new_val: f16, _: f16):
+                        diff = arith.subf(old_val, new_val)
+                        return math.exp(diff)
 
                     # Update running sum with rescaling
-                    # new_sum: [seq_q] = old_sum * exp(old_max - new_max) + row_sum(exp_scores)
+                    # new_sum: [seq_q] = old_sum * correction + row_sum_exp
+                    new_sum_init = tensor.empty([seq_q_dim], element_type)
+
+                    @linalg.map(
+                        result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
+                        inputs=[old_sum, correction, row_sum_exp],
+                        init=new_sum_init,
+                    )
+                    def new_sum(old_s: f16, corr: f16, new_s: f16, _: f16):
+                        rescaled = arith.mulf(old_s, corr)
+                        return arith.addf(rescaled, new_s)
+
+                    # Compute exp_scores @ V_tile
+                    # exp_scores: [seq_q, tile_size]
+                    # V_tile: [tile_size, head_dim]
+                    # Result: [seq_q, head_dim]
+                    exp_v_init = tensor.empty([seq_q_dim, head_dim], element_type)
+                    exp_v_filled = linalg.fill(zero, outs=[exp_v_init])
+                    exp_v = linalg.matmul(exp_scores, v_tile, outs=[exp_v_filled])
 
                     # Update output with rescaling
-                    # new_output: [seq_q, head_dim] = old_output * (old_sum * exp(old_max - new_max) / new_sum)
-                    #                                + (exp_scores @ V_tile) / new_sum
+                    # new_output: [seq_q, head_dim] = old_output * (correction * old_sum / new_sum) + (exp_v / new_sum)
+                    # First compute rescale factor: correction / new_sum (broadcasted to [seq_q, 1])
+                    rescale_factor_div_init = tensor.empty([seq_q_dim], element_type)
+                    rescale_factor_div = linalg.div(correction, new_sum, outs=[rescale_factor_div_init])
+                    rescale_factor_mul_init = tensor.empty([seq_q_dim], element_type)
+                    rescale_factor_mul = linalg.mul(rescale_factor_div, old_sum, outs=[rescale_factor_mul_init])
+                    rescale_factor_2d_init = tensor.empty([seq_q_dim, tile_size_value], element_type)
+                    rescale_factor_2d = linalg.broadcast(rescale_factor_mul, outs=[rescale_factor_2d_init], dimensions=[0])
 
-                    # For now, yield the unchanged values (placeholder)
-                    scf.yield_([old_max, old_sum, old_output])
+                    # Rescale old output
+                    rescaled_old_init = tensor.empty([seq_q_dim, head_dim], element_type)
+                    rescaled_old = linalg.mul(old_output, rescale_factor_2d, outs=[rescaled_old_init])
 
-                # Extract final results from loop
-                final_max = loop_result.results[0]
-                final_sum = loop_result.results[1]
+                    # Compute: exp_v / new_sum (broadcast new_sum to [seq_q, tile_size])
+                    norm_factor_2d_init = tensor.empty([seq_q_dim, tile_size_value], element_type)
+                    norm_factor_2d = linalg.broadcast(new_sum, outs=[norm_factor_2d_init], dimensions=[0])
+
+                    # Normalize new contribution
+                    normalized_exp_v_init = tensor.empty([seq_q_dim, head_dim], element_type)
+                    normalized_exp_v = linalg.div(exp_v, norm_factor_2d, outs=[normalized_exp_v_init])
+
+                    # Add both contributions
+                    new_output_init = tensor.empty([seq_q_dim, head_dim], element_type)
+                    new_output = linalg.add(rescaled_old, normalized_exp_v, outs=[new_output_init])
+
+                    scf.yield_([new_max, new_sum, new_output])
+
+                # Extract final result from loop
                 final_output_2d = loop_result.results[2]
 
                 # Expand the 2D output back to 3D to match the original output shape
