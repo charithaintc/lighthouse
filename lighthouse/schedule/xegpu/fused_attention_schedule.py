@@ -197,27 +197,23 @@ def bundle_xegpu_fused_attention_schedule(
     # Match Q, K, V slices inside the forall loop
     # K slice is the first operand of the transpose op
     transpose_op = match_and_split(forall_loop, ops={"linalg.transpose"}, nhandles=1)[0]
-    k_slice = transform.get_producer_of_operand(
-        anytype, transpose_op, operand_number=0
-    )
+    k_slice = transform.get_producer_of_operand(anytype, transpose_op, operand_number=0)
     # Q slice is the first operand of the first batch matmul
-    batch_matmuls = match_and_split(forall_loop, ops={"linalg.batch_matmul"}, nhandles=2)
+    batch_matmuls = match_and_split(
+        forall_loop, ops={"linalg.batch_matmul"}, nhandles=2
+    )
     q_slice = transform.get_producer_of_operand(
         anytype, batch_matmuls[0], operand_number=0
     )
     # V slice is the second operand of the last batch matmul (inside the forall loop)
     # Need to match the tiled version of the last matmul inside the loop
     last_matmul = batch_matmuls[1]
-    v_slice = transform.get_producer_of_operand(
-        anytype, last_matmul, operand_number=1
-    )
+    v_slice = transform.get_producer_of_operand(anytype, last_matmul, operand_number=1)
 
     # Match the scaling operation (linalg.mul) to get the scaling factor
     # The QK output is scaled before softmax: QK * scale
     mul_op = match_and_split(forall_loop, ops={"linalg.mul"}, nhandles=1)[0]
-    scale_slice = transform.get_producer_of_operand(
-        anytype, mul_op, operand_number=1
-    )
+    scale_slice = transform.get_producer_of_operand(anytype, mul_op, operand_number=1)
     # transform.print_(target=k_slice, name="k_slice")
     # transform.print_(target=q_slice, name="q_slice")
     # transform.print_(target=v_slice, name="v_slice")

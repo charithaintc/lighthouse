@@ -90,7 +90,9 @@ class GenerateFusedAttention(
             scale_type = ir.RankedTensorType(scale_result.type)
             v_type = ir.RankedTensorType(v_result.type)
             output_type = ir.RankedTensorType(output_result.type)
-            print(f"Q type: {q_type}, K type: {k_type}, Scale type: {scale_type}, V type: {v_type}, Output type: {output_type}")
+            print(
+                f"Q type: {q_type}, K type: {k_type}, Scale type: {scale_type}, V type: {v_type}, Output type: {output_type}"
+            )
 
             element_type = q_type.element_type
             index_type = ir.IndexType.get()
@@ -102,14 +104,30 @@ class GenerateFusedAttention(
                 # K: [1, seq_k, head_dim] -> [seq_k, head_dim]
                 # V: [1, seq_k, head_dim] -> [seq_k, head_dim]
                 # Scale: [1, seq_q, 1] -> [seq_q, 1]
-                q_2d_ty = ir.RankedTensorType.get((q_type.shape[1], q_type.shape[2]), element_type)
-                k_2d_ty = ir.RankedTensorType.get((k_type.shape[1], k_type.shape[2]), element_type)
-                v_2d_ty = ir.RankedTensorType.get((v_type.shape[1], v_type.shape[2]), element_type)
-                scale_2d_ty = ir.RankedTensorType.get((scale_type.shape[1], scale_type.shape[2]), element_type)
-                q_2d = tensor.collapse_shape(q_2d_ty, src=q_result, reassociation=[[0, 1], [2]])
-                k_2d = tensor.collapse_shape(k_2d_ty, src=k_result, reassociation=[[0, 1], [2]])
-                v_2d = tensor.collapse_shape(v_2d_ty, src=v_result, reassociation=[[0, 1], [2]])
-                scale_2d = tensor.collapse_shape(scale_2d_ty, src=scale_result, reassociation=[[0, 1], [2]])
+                q_2d_ty = ir.RankedTensorType.get(
+                    (q_type.shape[1], q_type.shape[2]), element_type
+                )
+                k_2d_ty = ir.RankedTensorType.get(
+                    (k_type.shape[1], k_type.shape[2]), element_type
+                )
+                v_2d_ty = ir.RankedTensorType.get(
+                    (v_type.shape[1], v_type.shape[2]), element_type
+                )
+                scale_2d_ty = ir.RankedTensorType.get(
+                    (scale_type.shape[1], scale_type.shape[2]), element_type
+                )
+                q_2d = tensor.collapse_shape(
+                    q_2d_ty, src=q_result, reassociation=[[0, 1], [2]]
+                )
+                k_2d = tensor.collapse_shape(
+                    k_2d_ty, src=k_result, reassociation=[[0, 1], [2]]
+                )
+                v_2d = tensor.collapse_shape(
+                    v_2d_ty, src=v_result, reassociation=[[0, 1], [2]]
+                )
+                scale_2d = tensor.collapse_shape(
+                    scale_2d_ty, src=scale_result, reassociation=[[0, 1], [2]]
+                )
 
                 # Get dimensions from 2D tensors
                 # Q: [seq_q, head_dim]
@@ -122,7 +140,8 @@ class GenerateFusedAttention(
                 # Initialize max to -inf
                 # Shape: [seq_q] (1D for 2D tensors)
                 neg_inf = arith.constant(
-                    element_type, float("-inf") if element_type == ir.F32Type.get() else -1e10
+                    element_type,
+                    float("-inf") if element_type == ir.F32Type.get() else -1e10,
                 )
                 max_shape = [seq_q_dim]
                 max_init = tensor.empty(max_shape, element_type)
@@ -163,7 +182,9 @@ class GenerateFusedAttention(
                     # K: [seq_k, head_dim] -> K_tile: [tile_size, head_dim]
                     # V: [seq_k, head_dim] -> V_tile: [tile_size, head_dim]
                     one = arith.constant(index_type, 1)
-                    k_tile_type = ir.RankedTensorType.get([tile_size_value, head_dim], element_type)
+                    k_tile_type = ir.RankedTensorType.get(
+                        [tile_size_value, head_dim], element_type
+                    )
                     k_tile = tensor.extract_slice(
                         k_tile_type,
                         source=k_2d,
@@ -175,7 +196,9 @@ class GenerateFusedAttention(
                         static_strides=[1, 1],
                     )
 
-                    v_tile_type = ir.RankedTensorType.get([tile_size_value, head_dim], element_type)
+                    v_tile_type = ir.RankedTensorType.get(
+                        [tile_size_value, head_dim], element_type
+                    )
                     v_tile = tensor.extract_slice(
                         v_tile_type,
                         source=v_2d,
@@ -189,7 +212,9 @@ class GenerateFusedAttention(
                     # Transpose K_tile: [tile_size, head_dim] -> [head_dim, tile_size]
                     k_tile_t_shape = [head_dim, tile_size_value]
                     k_tile_t_init = tensor.empty(k_tile_t_shape, element_type)
-                    k_tile_t = linalg.transpose(k_tile, outs=[k_tile_t_init], permutation=[1, 0])
+                    k_tile_t = linalg.transpose(
+                        k_tile, outs=[k_tile_t_init], permutation=[1, 0]
+                    )
 
                     # Compute Q @ K^T for this tile
                     # Q: [seq_q, head_dim]
@@ -213,7 +238,7 @@ class GenerateFusedAttention(
                         inits=[row_max_filled],
                         dimensions=dims_attr,
                     )
-                    def row_max(elem : f16 , acc: f16):
+                    def row_max(elem: f16, acc: f16):
                         return arith.maximumf(elem, acc)
 
                     # Compute new max across this tile
@@ -223,9 +248,15 @@ class GenerateFusedAttention(
 
                     # Compute exp(qk - new_max)
                     # First broadcast new_max to [seq_q, 1] then to [seq_q, tile_size]
-                    new_max_2d_type = ir.RankedTensorType.get([seq_q_dim, 1], element_type)
-                    new_max_2d_init = tensor.empty([seq_q_dim, tile_size_value], element_type)
-                    new_max_2d = linalg.broadcast(new_max, outs=[new_max_2d_init], dimensions=[0])
+                    new_max_2d_type = ir.RankedTensorType.get(
+                        [seq_q_dim, 1], element_type
+                    )
+                    new_max_2d_init = tensor.empty(
+                        [seq_q_dim, tile_size_value], element_type
+                    )
+                    new_max_2d = linalg.broadcast(
+                        new_max, outs=[new_max_2d_init], dimensions=[0]
+                    )
 
                     # exp_scores: [seq_q, tile_size] = exp(qk - new_max_2d)
                     exp_scores_init = tensor.empty(qk_shape, element_type)
@@ -235,7 +266,7 @@ class GenerateFusedAttention(
                         inputs=[qk, new_max_2d],
                         init=exp_scores_init,
                     )
-                    def exp_scores(qk_val : f16, max_val: f16, _ : f16):
+                    def exp_scores(qk_val: f16, max_val: f16, _: f16):
                         diff = arith.subf(qk_val, max_val)
                         return math.exp(diff)
 
@@ -290,27 +321,51 @@ class GenerateFusedAttention(
                     # new_output: [seq_q, head_dim] = old_output * (correction * old_sum / new_sum) + (exp_v / new_sum)
                     # First compute rescale factor: correction / new_sum (broadcasted to [seq_q, 1])
                     rescale_factor_div_init = tensor.empty([seq_q_dim], element_type)
-                    rescale_factor_div = linalg.div(correction, new_sum, outs=[rescale_factor_div_init])
+                    rescale_factor_div = linalg.div(
+                        correction, new_sum, outs=[rescale_factor_div_init]
+                    )
                     rescale_factor_mul_init = tensor.empty([seq_q_dim], element_type)
-                    rescale_factor_mul = linalg.mul(rescale_factor_div, old_sum, outs=[rescale_factor_mul_init])
-                    rescale_factor_2d_init = tensor.empty([seq_q_dim, tile_size_value], element_type)
-                    rescale_factor_2d = linalg.broadcast(rescale_factor_mul, outs=[rescale_factor_2d_init], dimensions=[0])
+                    rescale_factor_mul = linalg.mul(
+                        rescale_factor_div, old_sum, outs=[rescale_factor_mul_init]
+                    )
+                    rescale_factor_2d_init = tensor.empty(
+                        [seq_q_dim, tile_size_value], element_type
+                    )
+                    rescale_factor_2d = linalg.broadcast(
+                        rescale_factor_mul,
+                        outs=[rescale_factor_2d_init],
+                        dimensions=[0],
+                    )
 
                     # Rescale old output
-                    rescaled_old_init = tensor.empty([seq_q_dim, head_dim], element_type)
-                    rescaled_old = linalg.mul(old_output, rescale_factor_2d, outs=[rescaled_old_init])
+                    rescaled_old_init = tensor.empty(
+                        [seq_q_dim, head_dim], element_type
+                    )
+                    rescaled_old = linalg.mul(
+                        old_output, rescale_factor_2d, outs=[rescaled_old_init]
+                    )
 
                     # Compute: exp_v / new_sum (broadcast new_sum to [seq_q, tile_size])
-                    norm_factor_2d_init = tensor.empty([seq_q_dim, tile_size_value], element_type)
-                    norm_factor_2d = linalg.broadcast(new_sum, outs=[norm_factor_2d_init], dimensions=[0])
+                    norm_factor_2d_init = tensor.empty(
+                        [seq_q_dim, tile_size_value], element_type
+                    )
+                    norm_factor_2d = linalg.broadcast(
+                        new_sum, outs=[norm_factor_2d_init], dimensions=[0]
+                    )
 
                     # Normalize new contribution
-                    normalized_exp_v_init = tensor.empty([seq_q_dim, head_dim], element_type)
-                    normalized_exp_v = linalg.div(exp_v, norm_factor_2d, outs=[normalized_exp_v_init])
+                    normalized_exp_v_init = tensor.empty(
+                        [seq_q_dim, head_dim], element_type
+                    )
+                    normalized_exp_v = linalg.div(
+                        exp_v, norm_factor_2d, outs=[normalized_exp_v_init]
+                    )
 
                     # Add both contributions
                     new_output_init = tensor.empty([seq_q_dim, head_dim], element_type)
-                    new_output = linalg.add(rescaled_old, normalized_exp_v, outs=[new_output_init])
+                    new_output = linalg.add(
+                        rescaled_old, normalized_exp_v, outs=[new_output_init]
+                    )
 
                     scf.yield_([new_max, new_sum, new_output])
 
@@ -319,7 +374,13 @@ class GenerateFusedAttention(
 
                 # Expand the 2D output back to 3D to match the original output shape
                 # [seq_q, head_dim] -> [1, seq_q, head_dim]
-                final_output_3d = tensor.expand_shape(output_type, src=final_output_2d, reassociation=[[0, 1], [2]], output_shape=[], static_output_shape=output_type.shape)
+                final_output_3d = tensor.expand_shape(
+                    output_type,
+                    src=final_output_2d,
+                    reassociation=[[0, 1], [2]],
+                    output_shape=[],
+                    static_output_shape=output_type.shape,
+                )
 
                 # Create a dummy add operation to wrap the final output
                 # This is needed because replace_op requires an operation, not a value
@@ -331,7 +392,9 @@ class GenerateFusedAttention(
 
                 # Create the add operation: final_output_3d + 0
                 output_init_for_add = tensor.empty(zero_tensor_shape, element_type)
-                dummy_add = linalg.add(final_output_3d, zero_tensor, outs=[output_init_for_add])
+                dummy_add = linalg.add(
+                    final_output_3d, zero_tensor, outs=[output_init_for_add]
+                )
 
                 # Replace the original output operation with the dummy add
                 rewriter.replace_op(output_op, dummy_add.owner)
