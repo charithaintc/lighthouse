@@ -36,8 +36,8 @@ from lighthouse.ingress.mlir_gen import (
     generate_gpu_mlp_payload,
     get_mlir_elem_type,
 )
+from lighthouse.schedule.xegpu import xegpu_parameter_selector
 
-import parameter_selector
 from matmul import matmul_complexity
 
 
@@ -322,8 +322,6 @@ def parse_cli():
             "bufferized",
             "xegpu-initial",
             "xegpu-wg",
-            "xegpu-sg",
-            "xegpu-inst",
             "final",
         ],
         help="Dump kernel IR at different stages of lowering and exit without "
@@ -373,7 +371,7 @@ if __name__ == "__main__":
         ab_type = wload.ab_type
         acc_type = wload.acc_type
 
-        params = parameter_selector.get_parameters_for_layers(matmuls)
+        params = xegpu_parameter_selector.get_parameters_for_layers(matmuls)
 
         if args.dump_kernel or args.dump_schedule:
             pipeline = TransformDriver(
@@ -397,10 +395,9 @@ if __name__ == "__main__":
             )
             if args.check_result:
                 # Setup callback function to copy result from device to host.
-                result_host_copy, argument_access_callback = (
-                    Runner.get_gpu_argument_access_callback(
-                        wload.output_shape, wload.ab_dtype
-                    )
+                result_host_copy = np.zeros(wload.output_shape, dtype=wload.ab_dtype)
+                argument_access_callback = Runner.get_gpu_argument_access_callback(
+                    result_host_copy, arg_index=0
                 )
 
                 # Execute kernel once.

@@ -29,8 +29,7 @@ from lighthouse.execution import (
 from lighthouse.schedule.xegpu import mlp_schedule, xegpu_to_binary
 from lighthouse.utils.numpy import mlir_to_numpy_dtype
 from lighthouse.ingress.mlir_gen import generate_gpu_matmul_payload, get_mlir_elem_type
-
-import parameter_selector
+from lighthouse.schedule.xegpu import xegpu_parameter_selector
 
 
 def matmul_complexity(
@@ -373,7 +372,7 @@ enabled via CLI arguments.
     m, n, k = args.sizes if args.sizes else (4096, 4096, 4096)
     # Get default parameters from the database
     try:
-        params = parameter_selector.get_matmul_parameters(m, n, k)
+        params = xegpu_parameter_selector.get_matmul_parameters(m, n, k)
     except ValueError:
         # Initialize with a stub and assume the rest will be populated
         params = {
@@ -462,11 +461,11 @@ enabled via CLI arguments.
             )
             if args.check_result:
                 # Setup callback function to copy result from device to host.
-                D_host_copy, argument_access_callback = (
-                    Runner.get_gpu_argument_access_callback(
-                        wload.c_shape, wload.c_dtype
-                    )
+                D_host_copy = np.zeros(wload.c_shape, dtype=wload.c_dtype)
+                argument_access_callback = Runner.get_gpu_argument_access_callback(
+                    D_host_copy, arg_index=0
                 )
+
                 runner.execute(
                     host_input_buffers=wload._initial_host_arrays,
                     payload_function_name=wload.payload_function_name,
