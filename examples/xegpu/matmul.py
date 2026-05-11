@@ -29,8 +29,7 @@ from lighthouse.execution import (
 from lighthouse.schedule.xegpu import mlp_schedule, xegpu_to_binary
 from lighthouse.utils.numpy import mlir_to_numpy_dtype
 from lighthouse.ingress.mlir_gen import generate_gpu_matmul_payload, get_mlir_elem_type
-
-import parameter_selector
+from lighthouse.schedule.xegpu import xegpu_parameter_selector
 
 
 def matmul_complexity(
@@ -296,9 +295,14 @@ def parse_cli_args(description):
         help="Tile size for cooperative prefetching of subgroup B matrix",
     )
     parser.add_argument(
-        "--prefetch-nb",
+        "--prefetch-a-nb",
         type=int,
-        help="Number of initial prefetches.",
+        help="Number of initial prefetches for A matrix.",
+    )
+    parser.add_argument(
+        "--prefetch-b-nb",
+        type=int,
+        help="Number of initial prefetches for B matrix.",
     )
     parser.add_argument(
         "--check-result",
@@ -368,7 +372,7 @@ enabled via CLI arguments.
     m, n, k = args.sizes if args.sizes else (4096, 4096, 4096)
     # Get default parameters from the database
     try:
-        params = parameter_selector.get_matmul_parameters(m, n, k)
+        params = xegpu_parameter_selector.get_matmul_parameters(m, n, k)
     except ValueError:
         # Initialize with a stub and assume the rest will be populated
         params = {
@@ -388,7 +392,8 @@ enabled via CLI arguments.
             "prefetch_a_k": None,
             "prefetch_b_k": None,
             "prefetch_b_n": None,
-            "prefetch_nb": None,
+            "prefetch_a_nb": None,
+            "prefetch_b_nb": None,
         }
     if args.json:
         # Override parameters with values from JSON file if provided
@@ -411,8 +416,10 @@ enabled via CLI arguments.
         params["prefetch_a_m"], params["prefetch_a_k"] = args.prefetch_tile_a
     if args.prefetch_tile_b:
         params["prefetch_b_k"], params["prefetch_b_n"] = args.prefetch_tile_b
-    if args.prefetch_nb is not None:
-        params["prefetch_nb"] = args.prefetch_nb
+    if args.prefetch_a_nb is not None:
+        params["prefetch_a_nb"] = args.prefetch_a_nb
+    if args.prefetch_b_nb is not None:
+        params["prefetch_b_nb"] = args.prefetch_b_nb
 
     for k, v in params.items():
         if v is None:
@@ -454,11 +461,11 @@ enabled via CLI arguments.
             )
             if args.check_result:
                 # Setup callback function to copy result from device to host.
-                D_host_copy, argument_access_callback = (
-                    Runner.get_gpu_argument_access_callback(
-                        wload.c_shape, wload.c_dtype
-                    )
+                D_host_copy = np.zeros(wload.c_shape, dtype=wload.c_dtype)
+                argument_access_callback = Runner.get_gpu_argument_access_callback(
+                    D_host_copy, arg_index=0
                 )
+
                 runner.execute(
                     host_input_buffers=wload._initial_host_arrays,
                     payload_function_name=wload.payload_function_name,

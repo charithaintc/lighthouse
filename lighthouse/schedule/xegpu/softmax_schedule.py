@@ -122,7 +122,7 @@ def bundle_xegpu_softmax_schedule(
 
     reduction_step_size = parameters["reduction_step_size"]
 
-    # Tile the division op and fuse the sub+exp producer into it
+    # Tile the division op first.
     _, div_loop = structured.TileUsingForOp(
         div_op, sizes=[0, reduction_step_size]
     ).results
@@ -135,7 +135,7 @@ def bundle_xegpu_softmax_schedule(
         containing_op=div_loop,
     )
 
-    # Tile the sum reduction and fuse the sub+exp producer into it
+    # Tile the sum reduction.
     _, _, _, sum_loop = structured.structured_tile_reduction_using_for(
         [anytype],
         anytype,
@@ -262,9 +262,8 @@ def bundle_xegpu_softmax_schedule(
     gpu_mod_ops = match_and_split(mod, ops={"gpu.module"})
     for gpu_mod in gpu_mod_ops:
         gpu_func = match(gpu_mod, ops={"gpu.func"})
-        allocas = match_and_split(gpu_func, ops={"memref.alloca"})
-        for alloca in allocas:
-            transform_ext.update_address_space(alloca, address_space=3)
+        allocas = match(gpu_func, ops={"memref.alloca"})
+        transform_ext.update_address_space(allocas, address_space=3)
         gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
         transform.apply_cse(gpu_func)
 

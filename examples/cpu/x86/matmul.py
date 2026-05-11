@@ -1,12 +1,19 @@
 # RUN: %PYTHON %s --dump-kernel=vectorized | FileCheck %s
 # RUN: %PYTHON %s --dump-kernel=vectorized --tile-size=64 | FileCheck %s
-# FIXME: Re-enable test once avx512 bf16 lowering is fixed upstream.
-# SKIPPED: %PYTHON %s --dump-kernel=vectorized --dtype=bf16 --avx512 | FileCheck %s --check-prefix=AVX512
+# RUN: %PYTHON %s --dump-kernel=vectorized --dtype=bf16 --avx512 | FileCheck %s --check-prefix=AVX512
+# RUN: %PYTHON %s --nwarmup 0 --nruns 1 --sizes 128 128 128 | FileCheck %s --check-prefix=BENCH
+
+# REQUIRES: x86
 
 # CHECK: vector.broadcast
 # CHECK: vector.fma
 
 # AVX512: x86.avx512.dot
+
+# BENCH: MxNxK: [128, 128, 128]
+# BENCH: Input dtype: f32
+# BENCH: Timings
+# BENCH: Throughput
 
 """
 Matrix multiplication C = A * B on CPU.
@@ -25,9 +32,9 @@ from mlir.dialects.transform import tensor
 
 from lighthouse import dialects as lh_dialects
 from lighthouse.execution.runner import Runner
-from lighthouse.pipeline.driver import TransformDriver
+from lighthouse.pipeline.descriptor import Descriptor
+from lighthouse.pipeline.driver import PipelineDriver
 from lighthouse.utils.numpy import numpy_to_mlir_type
-from lighthouse.pipeline.helper import apply_registered_pass
 import lighthouse.utils as lh_utils
 from lighthouse import schedule as lh_schedule
 import lighthouse.schedule.x86 as lh_schedule_x86
@@ -66,13 +73,17 @@ class Matmul:
         self.K = K
         self.dtype = dtype
         self.tile_size = tile_size
+        self.mod = ir.Module.create()
+        self.context = self.mod.context
 
     @cached_property
     def _input_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         np.random.seed(123)
         A = np.random.rand(self.M, self.K).astype(self.dtype)
         B = np.random.rand(self.K, self.N).astype(self.dtype)
-        C = np.random.rand(self.M, self.N).astype(self.dtype)
+        C = np.random.rand(self.M, self.N).astype(
+            np.float32
+        )  # Always accumulate in F32
         return [A, B, C]
 
     def _get_input_arrays(self) -> list[ctypes.Structure]:
@@ -89,9 +100,7 @@ class Matmul:
         return (flop_count, memory_reads, memory_writes)
 
     def payload_module(self) -> ir.Module:
-        mod = ir.Module.create()
-
-        with ir.InsertionPoint(mod.body):
+        with ir.InsertionPoint(self.mod.body):
             mlir_dtype = numpy_to_mlir_type(self.dtype)
 
             def tensor_t(shape, dtype=mlir_dtype):
@@ -119,47 +128,41 @@ class Matmul:
                     None, matmul, C, restrict=True, writable=True
                 )
 
-        return mod
+        return self.mod
 
-    def schedule_modules(
+    def get_pipeline(
         self,
         stop_at_stage: Optional[str] = None,
         parameters: Optional[dict] = None,
-    ) -> list[ir.Module]:
-        scheds = []
+    ) -> PipelineDriver:
+        scheds = PipelineDriver(self.context)
 
         # Insert performance measurements.
-        scheds.append(Runner.get_bench_wrapper_schedule(self.payload_function_name))
+        scheds.add_transform(
+            Runner.get_bench_wrapper_schedule(self.payload_function_name)
+        )
 
         if stop_at_stage == "initial":
             return scheds
 
         # GEMM block packing.
         # Create cache-friendly access pattern across matmul tiles.
-        scheds.append(
+        scheds.add_transform(
             lh_schedule.block_pack_matmuls(
                 block_factors=[self.tile_size, self.tile_size, self.tile_size],
                 rhs_transpose_outer_block=True,
                 rhs_transpose_inner_block=False,
             )
         )
-        scheds.append(lh_schedule_x86.lower_packs_unpacks(self.tile_size))
+        scheds.add_transform(lh_schedule_x86.lower_packs_unpacks(self.tile_size))
 
         # Convert to category ops for easier op matching.
-        with lh_schedule.schedule_boilerplate() as (sched, named_seq):
-            ops = lh_transform.match_op(named_seq.bodyTarget, "func.func")
-            transform.apply_registered_pass(
-                transform.any_op_t(),
-                ops,
+        scheds.add_pass(
+            Descriptor(
                 "linalg-morph-ops",
-                options={
-                    "named-to-category": True,
-                    "generic-to-category": True,
-                },
+                opts={"named-to-category": True, "generic-to-category": True},
             )
-            lh_transform.cleanup(named_seq.bodyTarget)
-            transform.yield_()
-        scheds.append(sched)
+        )
 
         # GEMM cache tiling.
         # Create memory friendly access pattern.
@@ -168,15 +171,15 @@ class Matmul:
             ops = lh_transform.match_op(named_seq.bodyTarget, gemm_op)
             with lh_transform.foreach(ops) as op:
                 lh_transform_x86.matmul_cache_tiling(
-                    op, num_tiles=6, tile_size=self.tile_size, fuse_producers=True
+                    op, tile_size=self.tile_size, fuse_producers=True
                 )
                 transform.yield_()
             transform.yield_()
-        scheds.append(sched)
+        scheds.add_transform(sched)
 
         # Fold extra parallel outer unit dims before further tiling to help later
         # vectorization rewrites to recognize ops.
-        scheds.append(lh_schedule.linalg_contract_fold_unit_dims())
+        scheds.add_transform(lh_schedule.linalg_contract_fold_unit_dims())
 
         # GEMM register tiling.
         # Ensure that computation can fit into vector registers.
@@ -190,7 +193,7 @@ class Matmul:
             reg_peel_loops.append(1)
         if self.tile_size % reg_tile_m != 0:
             reg_peel_loops.append(0)
-        scheds.append(
+        scheds.add_transform(
             lh_schedule.tile_ops(
                 gemm_op,
                 tile_sizes=[reg_tile_batch, reg_tile_m, reg_tile_n, reg_tile_k],
@@ -210,7 +213,7 @@ class Matmul:
             reg_tile_n // reg_unroll_n,
             reg_tile_k // reg_unroll_k,
         ]
-        scheds.append(
+        scheds.add_transform(
             lh_schedule.tile_ops(
                 gemm_op,
                 tile_sizes=[0, reg_unroll_m, reg_unroll_n, reg_unroll_k],
@@ -219,15 +222,15 @@ class Matmul:
         )
 
         # Further tiling into hardware-friendly sizes for vectorization.
-        scheds.append(lh_schedule.tile_ops("linalg.fill", tile_sizes=[1, 1, 1]))
-        scheds.append(lh_schedule.tile_ops("linalg.generic", tile_sizes=[1, 8]))
+        scheds.add_transform(lh_schedule.tile_ops("linalg.fill", tile_sizes=[1, 1, 1]))
+        scheds.add_transform(lh_schedule.tile_ops("linalg.generic", tile_sizes=[1, 8]))
 
         if stop_at_stage == "tiled":
             return scheds
 
         # Vectorization.
-        scheds.append(lh_schedule.vectorize_linalg())
-        scheds.append(lh_schedule.hoist_loops())
+        scheds.add_transform(lh_schedule.vectorize_linalg())
+        scheds.add_transform(lh_schedule.hoist_loops())
 
         with lh_schedule.schedule_boilerplate() as (sched, named_seq):
             with ir.InsertionPoint(
@@ -236,46 +239,32 @@ class Matmul:
                 tensor.apply_patterns_tensor_fold_tensor_subset_ops_into_vector_transfers()
                 transform.apply_patterns_canonicalization()
             transform.yield_()
-        scheds.append(sched)
+        scheds.add_transform(sched)
 
         # Rewrite vector ops into x86-specific sequences.
-        scheds.append(lh_schedule.x86_vectorization())
+        scheds.add_transform(lh_schedule.x86_vectorization())
 
         # Lower to memrefs.
-        scheds.append(lh_schedule.bufferize(deallocation_pipeline=True))
+        scheds.add_descriptor(Descriptor("bufferization.yaml"))
+        scheds.add_descriptor(Descriptor("bufferization_cleanup.yaml"))
 
         # Apply x86 vectorization again as some patterns require memref abstraction.
-        scheds.append(lh_schedule.x86_vectorization())
+        scheds.add_transform(lh_schedule.x86_vectorization())
         # Vectorize any remaining ops.
-        scheds.append(lh_schedule.vectorize_all())
+        scheds.add_transform(lh_schedule.vectorize_all())
 
         # Cleanup vector ops.
         with lh_schedule.schedule_boilerplate() as (sched, named_seq):
             lh_transform.flatten_vector_ops(named_seq.bodyTarget)
             lh_transform.cleanup(named_seq.bodyTarget)
             transform.yield_()
-        scheds.append(sched)
+        scheds.add_transform(sched)
 
         if stop_at_stage == "vectorized":
             return scheds
 
         # Lower to LLVM.
-        with lh_schedule.schedule_boilerplate() as (sched, named_seq):
-            target = named_seq.bodyTarget
-            target = apply_registered_pass(target, "convert-linalg-to-loops")
-            target = apply_registered_pass(target, "fold-memref-alias-ops")
-            target = apply_registered_pass(target, "expand-strided-metadata")
-            target = apply_registered_pass(target, "canonicalize")
-            target = apply_registered_pass(target, "convert-vector-to-scf")
-            target = apply_registered_pass(target, "lower-affine")
-            target = apply_registered_pass(target, "convert-scf-to-cf")
-            target = apply_registered_pass(target, "convert-vector-to-llvm")
-            target = apply_registered_pass(target, "convert-to-llvm")
-            target = apply_registered_pass(target, "reconcile-unrealized-casts")
-            lh_transform.cleanup(target)
-
-            transform.yield_()
-        scheds.append(sched)
+        scheds.add_descriptor(Descriptor("llvm_lowering.yaml"))
 
         return scheds
 
@@ -364,9 +353,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
         wload = Matmul(*args.sizes, dtype=in_dtype, tile_size=args.tile_size)
-        pipeline = TransformDriver(
-            wload.schedule_modules(stop_at_stage=args.dump_kernel)
-        )
+        pipeline = wload.get_pipeline(stop_at_stage=args.dump_kernel)
         payload = pipeline.apply(wload.payload_module())
 
         if args.dump_kernel or args.dump_schedule:

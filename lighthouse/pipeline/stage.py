@@ -7,7 +7,8 @@ import os
 from mlir import ir
 from mlir.passmanager import PassManager
 from mlir.dialects import transform
-from lighthouse.pipeline.helper import import_mlir_module, parse_args_and_opts
+from lighthouse.pipeline.helper import import_mlir_module
+from lighthouse.pipeline.descriptor import Descriptor, PipelineDescriptor
 
 
 class Pass:
@@ -17,9 +18,13 @@ class Pass:
     Or used directly with the Transform Schedule by passing the options as a dictionary.
     """
 
-    def __init__(self, name: str, options: dict = {}):
-        self.name = name
-        self.options = options
+    def __init__(self, desc: Descriptor):
+        if not isinstance(desc, Descriptor):
+            raise ValueError(
+                f"Pass must be initialized with a Descriptor, got {type(desc)}"
+            )
+        self.name = desc.basename
+        self.options = desc.opts
 
     def __str__(self) -> str:
         """serialize name + options dictionary for pass manager consumption"""
@@ -29,55 +34,27 @@ class Pass:
         return f"{self.name}{{{options_str}}}"
 
 
-# Predefined pass bundles for common transformations.
-# These are not exhaustive and can be extended as needed.
-# The idea is to group together passes that are commonly used together in a pipeline,
-# so that they can be easily added to a PassManager or Transform Schedule with a single function call.
-# FIXME: Deprecate bundles in favor of YAML pipeline descriptors.
-PassBundles = {
-    # All in one bufferization bundle.
-    # This is self consistent and should be used together.
-    "BufferizationBundle": [
-        Pass(
-            "one-shot-bufferize",
-            {
-                "function-boundary-type-conversion": "identity-layout-map",
-                "bufferize-function-boundaries": True,
-            },
-        ),
-        Pass("drop-equivalent-buffer-results"),
-        # This last pass only works with the pass manager, not schedules.
-        # Pass("buffer-deallocation-pipeline"),
-    ],
-    # Lowers most dialects to basic control flow.
-    "MLIRLoweringBundle": [
-        Pass("convert-linalg-to-loops"),
-    ],
-    # Lowers most dialects to LLVM Dialect
-    "LLVMLoweringBundle": [
-        Pass("convert-scf-to-cf"),
-        Pass("convert-to-llvm"),
-        Pass("reconcile-unrealized-casts"),
-    ],
-    # Canonicalization bundle.
-    "CleanupBundle": [
-        Pass("cse"),
-        Pass("canonicalize"),
-    ],
-}
-
-
 # Utility function to add a bundle of passes to a PassManager.
-def add_bundle(pm: PassManager, bundle: list[Pass]) -> None:
-    for p in bundle:
-        pm.add(str(p))
+def add_bundle(pm: PassManager, filename: str) -> None:
+    desc = PipelineDescriptor(Descriptor(filename))
+    for p in desc.get_stages():
+        if not isinstance(p, Descriptor) or not p.is_pass():
+            raise ValueError(
+                f"Expected Descriptor of type Pass in bundle, got {type(p)}"
+            )
+        pm.add(str(Pass(p)))
 
 
 # Utility function to add a bundle of passes to a Schedule.
-def apply_bundle(op, bundle: list[Pass], *args, **kwargs) -> None:
-    for p in bundle:
+def apply_bundle(op, filename: str, *args, **kwargs) -> None:
+    desc = PipelineDescriptor(Descriptor(filename))
+    for p in desc.get_stages():
+        if not isinstance(p, Descriptor) or not p.is_pass():
+            raise ValueError(
+                f"Expected Descriptor of type Pass in bundle, got {type(p)}"
+            )
         op = transform.apply_registered_pass(
-            transform.AnyOpType.get(), op, p.name, options=p.options, *args, **kwargs
+            transform.AnyOpType.get(), op, p.basename, options=p.opts, *args, **kwargs
         )
     return op
 
@@ -105,23 +82,26 @@ class Transform:
         MLIR = 1
         Python = 2
 
-    def __init__(self, filename: str):
-        # First, eliminate arguments and options
-        filename, args, self.options = parse_args_and_opts(filename)
-        if filename.endswith(".mlir"):
+    def __init__(self, desc: Descriptor):
+        if not isinstance(desc, Descriptor):
+            raise ValueError(
+                f"Transform must be initialized with a Descriptor, got {type(desc)}"
+            )
+        if desc.basename.endswith(".mlir"):
             self.type = Transform.Type.MLIR
-        elif filename.endswith(".py"):
+        elif desc.basename.endswith(".py"):
             self.type = Transform.Type.Python
         else:
-            raise ValueError(f"Unsupported transform file type: {filename}")
-        self.filename = filename
-        self.generator = args["gen"] if "gen" in args else "create_schedule"
-        self.sequence = args["seq"] if "seq" in args else ""
+            raise ValueError(f"Unsupported transform file type: {desc.basename}")
+        self.filename = desc.basename
+        self.options = desc.opts
+        self.generator = desc.args["gen"] if "gen" in desc.args else "create_schedule"
+        self.sequence = desc.args["seq"] if "seq" in desc.args else ""
 
     def __str__(self) -> str:
         """serialize name + filename for debugging purposes"""
         if not self.options:
-            return self.name
+            return self.filename
         return f"{self.filename}{{{self.options}}}"
 
 
@@ -148,7 +128,8 @@ class PassStage(Stage):
         self.context = context
         self.pm = PassManager("builtin.module", self.context)
         self.passes = passes
-        add_bundle(self.pm, passes)
+        for p in passes:
+            self.pm.add(str(p))
 
     def apply(self, module: ir.Module) -> ir.Module:
         if module is None:
