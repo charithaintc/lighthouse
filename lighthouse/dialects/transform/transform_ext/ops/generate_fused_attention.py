@@ -338,9 +338,9 @@ class GenerateFusedAttention(
                     )
 
                     # Rescale old output
-                    rescaled_old_init = tensor.empty(
-                        [seq_q_dim, head_dim], element_type
-                    )
+                    # rescaled_old_init = tensor.empty(
+                    #     [seq_q_dim, head_dim], element_type
+                    # )
                     rescaled_old = linalg.mul(
                         old_output, rescale_factor_2d, outs=[old_output]
                     )
@@ -362,7 +362,7 @@ class GenerateFusedAttention(
                     )
 
                     # Add both contributions
-                    new_output_init = tensor.empty([seq_q_dim, head_dim], element_type)
+                    # new_output_init = tensor.empty([seq_q_dim, head_dim], element_type)
                     new_output = linalg.add(
                         rescaled_old, normalized_exp_v, outs=[old_output]
                     )
