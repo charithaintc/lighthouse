@@ -244,7 +244,7 @@ class GenerateFusedAttention(
                     # Compute new max across this tile
                     # new_max: [seq_q] = max(old_max, row_max)
                     new_max_init = tensor.empty([seq_q_dim], element_type)
-                    new_max = linalg.max(old_max, row_max, outs=[new_max_init])
+                    new_max = linalg.max(old_max, row_max, outs=[old_max])
 
                     # Compute exp(qk - new_max)
                     # First broadcast new_max to [seq_q, 1] then to [seq_q, tile_size]
@@ -298,12 +298,12 @@ class GenerateFusedAttention(
 
                     # Update running sum with rescaling
                     # new_sum: [seq_q] = old_sum * correction + row_sum_exp
-                    new_sum_init = tensor.empty([seq_q_dim], element_type)
+                    # new_sum_init = tensor.empty([seq_q_dim], element_type)
 
                     @linalg.map(
                         result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
                         inputs=[old_sum, correction, row_sum_exp],
-                        init=new_sum_init,
+                        init=old_sum,
                     )
                     def new_sum(old_s: f16, corr: f16, new_s: f16, _: f16):
                         rescaled = arith.mulf(old_s, corr)
@@ -342,7 +342,7 @@ class GenerateFusedAttention(
                         [seq_q_dim, head_dim], element_type
                     )
                     rescaled_old = linalg.mul(
-                        old_output, rescale_factor_2d, outs=[rescaled_old_init]
+                        old_output, rescale_factor_2d, outs=[old_output]
                     )
 
                     # Compute: exp_v / new_sum (broadcast new_sum to [seq_q, tile_size])
@@ -364,7 +364,7 @@ class GenerateFusedAttention(
                     # Add both contributions
                     new_output_init = tensor.empty([seq_q_dim, head_dim], element_type)
                     new_output = linalg.add(
-                        rescaled_old, normalized_exp_v, outs=[new_output_init]
+                        rescaled_old, normalized_exp_v, outs=[old_output]
                     )
 
                     scf.yield_([new_max, new_sum, new_output])
