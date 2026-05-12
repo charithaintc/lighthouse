@@ -20,7 +20,10 @@ from lighthouse.pipeline.helper import (
     apply_registered_pass,
 )
 from lighthouse.schedule import schedule_boilerplate
-from lighthouse.dialects.transform.transform_ext import generate_fused_attention, update_address_space
+from lighthouse.dialects.transform.transform_ext import (
+    generate_fused_attention,
+    update_address_space,
+)
 
 
 def fused_attention_schedule(
@@ -246,9 +249,9 @@ def bundle_xegpu_fused_attention_schedule(
     transform.apply_cse(func)
     canonicalize(func)
     # Try to remove any unit dimensions that may have been introduced due to tiling (e.g. batch dim of 1)
-    # with ir.InsertionPoint(transform.apply_patterns(func).patterns):
-    #     apply_patterns_vector_cast_away_vector_leading_one_dim()
-    #     apply_patterns_vector_drop_unit_dims_with_shape_cast()
+    with ir.InsertionPoint(transform.apply_patterns(func).patterns):
+        apply_patterns_vector_cast_away_vector_leading_one_dim()
+        apply_patterns_vector_drop_unit_dims_with_shape_cast()
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
@@ -264,6 +267,21 @@ def bundle_xegpu_fused_attention_schedule(
     ).result
     transform.apply_cse(mod)
     canonicalize(mod)
+    # fold memref.subviews into vector.transfer_read/write ops
+    mod = apply_registered_pass(mod, "fold-memref-alias-ops")
+    transform.apply_cse(mod)
+    canonicalize(mod)
+
+    # promote memref.alloc to memref.alloca in payload function
+    func = match(mod, ops={"func.func"})
+    func = apply_registered_pass(
+        func,
+        "promote-buffers-to-stack",
+        options={
+            "max-alloc-size-in-bytes": "8192",
+            "max-rank-of-allocated-memref": "2",
+        },
+    )
 
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
@@ -312,8 +330,9 @@ def bundle_xegpu_fused_attention_schedule(
     gpu_mod_ops = match_and_split(mod, ops={"gpu.module"})
     for gpu_mod in gpu_mod_ops:
         gpu_func = match(gpu_mod, ops={"gpu.func"})
-        allocas = match_and_split(gpu_func, ops={"memref.alloca"})
+        allocas = match_and_split(gpu_func, ops={"memref.alloca"}, nhandles=3)
         for alloca in allocas:
+            # print("Updating address space for alloca:")
             update_address_space(alloca, address_space=3)
         gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
         transform.apply_cse(gpu_func)
@@ -327,9 +346,47 @@ def bundle_xegpu_fused_attention_schedule(
 
     # Set layout attributes for xegpu.store_nd ops.
     store_nd_op = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)[0]
-    sg_layout = [sg_rows, 1]
-    sg_data = [sg_rows, parameters["n_head"]]
-    xegpu.set_anchor_layout(store_nd_op, sg_layout=sg_layout, sg_data=sg_data)
+    out_sg_layout = [num_subgroups, 1]
+    out_sg_data = [sg_rows, parameters["n_head"]]
+    xegpu.set_anchor_layout(store_nd_op, sg_layout=out_sg_layout, sg_data=out_sg_data)
+
+    # Set layout attributes for xegpu.store_matrix ops. same as store_nd ops.
+    store_matrix_ops = match_and_split(gpu_func, ops={"xegpu.store_matrix"}, nhandles=2)
+    for store_matrix_op in store_matrix_ops:
+        xegpu.set_anchor_layout(
+            store_matrix_op, sg_layout=out_sg_layout, sg_data=out_sg_data
+        )
+
+    # Set layout for xegpu.dpas ops
+    dpas_ops = match_and_split(gpu_func, ops={"xegpu.dpas"}, nhandles=2)
+    # layouts for the first dpas op (Q*K^T):
+    first_dpas_op = dpas_ops[0]
+    qk_a_sg_layout = out_sg_layout
+    qk_a_sg_data = out_sg_data
+    qk_b_sg_layout = [1, num_subgroups]
+    qk_b_sg_data = [parameters["n_head"], num_subgroups]
+    qk_cd_sg_layout = out_sg_layout
+    qk_cd_sg_data = [sg_rows, 16]
+    xegpu.set_anchor_layout(
+        first_dpas_op, sg_layout=qk_a_sg_layout, sg_data=qk_a_sg_data, index=0
+    )
+    xegpu.set_anchor_layout(
+        first_dpas_op, sg_layout=qk_b_sg_layout, sg_data=qk_b_sg_data, index=1
+    )
+    xegpu.set_anchor_layout(
+        first_dpas_op, sg_layout=qk_cd_sg_layout, sg_data=qk_cd_sg_data, index=2
+    )
+    # layouts for the second dpas op (attention_weights*V):
+    second_dpas_op = dpas_ops[1]
+    xegpu.set_anchor_layout(
+        second_dpas_op, sg_layout=qk_cd_sg_layout, sg_data=qk_cd_sg_data, index=0
+    )
+    xegpu.set_anchor_layout(
+        second_dpas_op, sg_layout=qk_b_sg_layout, sg_data=qk_b_sg_data, index=1
+    )
+    xegpu.set_anchor_layout(
+        second_dpas_op, sg_layout=out_sg_layout, sg_data=out_sg_data, index=2
+    )
 
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()

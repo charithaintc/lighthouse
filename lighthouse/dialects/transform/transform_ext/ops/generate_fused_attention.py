@@ -90,9 +90,9 @@ class GenerateFusedAttention(
             scale_type = ir.RankedTensorType(scale_result.type)
             v_type = ir.RankedTensorType(v_result.type)
             output_type = ir.RankedTensorType(output_result.type)
-            print(
-                f"Q type: {q_type}, K type: {k_type}, Scale type: {scale_type}, V type: {v_type}, Output type: {output_type}"
-            )
+            # print(
+            #     f"Q type: {q_type}, K type: {k_type}, Scale type: {scale_type}, V type: {v_type}, Output type: {output_type}"
+            # )
 
             element_type = q_type.element_type
             index_type = ir.IndexType.get()
