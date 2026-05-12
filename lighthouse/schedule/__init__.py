@@ -6,6 +6,8 @@ from .func import convert_function_results
 from .linalg import linalg_contract_fold_unit_dims
 from .packing import block_pack_matmuls
 from .tiling import tile_ops
+from .vectorization import flatten_vector_ops
+from .vectorization import simplify_vector_ops
 from .vectorization import vectorize_linalg
 from .vectorization import vectorize_all
 from .vectorization import x86_vectorization
@@ -18,10 +20,12 @@ __all__ = [
     "convert_function_results",
     "create_named_sequence",
     "create_schedule",
+    "flatten_vector_ops",
     "hoist_loops",
     "linalg_contract_fold_unit_dims",
     "print_ir",
     "schedule_boilerplate",
+    "simplify_vector_ops",
     "tile_ops",
     "vectorize_all",
     "vectorize_linalg",

@@ -10,10 +10,7 @@ from lighthouse import transform as lh_transform
 
 
 def lower_packs_for_vectorization(
-    pack_ops,
-    pack_tile_sizes: list[int],
-    vector_tile_sizes: list[int] | None = None,
-    vector_unroll_factors: list[int] = [],
+    pack_ops, pack_tile_sizes, vector_tile_sizes=None, vector_unroll_factors=[]
 ):
     """
     Lower packs into hardware-friendly operations.
@@ -45,9 +42,7 @@ def lower_packs_for_vectorization(
 
 
 def lower_unpacks_for_vectorization(
-    unpack_ops,
-    unpack_tile_sizes: list[int],
-    vector_tile_sizes: list[int] | None = None,
+    unpack_ops, unpack_tile_sizes, vector_tile_sizes=None
 ):
     """
     Lower unpacks into hardware-friendly operations.
@@ -91,18 +86,16 @@ def lower_packs_unpacks(tile_size: int) -> ir.Module:
         pack_unpack_vector_n = min(64, tile_size)
         packs = lh_transform.match_op(named_seq.bodyTarget, "linalg.pack")
         lower_packs_for_vectorization(
-            packs,
+            pack_ops=packs,
             pack_tile_sizes=[1, 1],
             vector_tile_sizes=[1, 1, pack_unpack_vector_m, pack_unpack_vector_n],
-            vector_unroll_factors=[
-                tile_size // pack_unpack_vector_n,
-            ],
+            vector_unroll_factors=[tile_size // pack_unpack_vector_n],
         )
         lh_transform.cleanup(named_seq.bodyTarget)
 
         unpacks = lh_transform.match_op(named_seq.bodyTarget, "linalg.unpack")
         lower_unpacks_for_vectorization(
-            unpacks,
+            unpack_ops=unpacks,
             unpack_tile_sizes=[tile_size, tile_size],
             vector_tile_sizes=[1],
         )

@@ -4,36 +4,47 @@
 # REQUIRES: kernel_bench
 
 import subprocess
+import platform
 from pathlib import Path
 
+script_path = Path(__file__).parent
+project_root = script_path.parent.parent.parent
+kb_program = project_root / "tools" / "kernel_bench"
+kb_default_pipeline = kb_program.parent / "kernel_bench.yaml"
+kb_path = project_root / "third_party" / "KernelBench" / "KernelBench"
+arch = platform.machine()
 tests = [
     {
         "kernel": "level1/1_Square_matrix_multiplication_.py",
         "input_shapes": "32x32xf32xrnd,32x32xf32xid",
         "output_shape": "32x32xf32x0",
+        "pipeline": f"{script_path}/cpu_matmul.yaml"
+        if arch == "x86_64"
+        else str(kb_default_pipeline),
     },
     {
         "kernel": "level1/1_Square_matrix_multiplication_.py",
         "input_shapes": "32x32xbf16xrnd,32x32xbf16xid",
         "output_shape": "32x32xbf16x0",
+        "pipeline": str(kb_default_pipeline),
     },
     {
         "kernel": "level1/2_Standard_matrix_multiplication_.py",
         "input_shapes": "8x16xf32xrnd,16x8xf32xrnd",
         "output_shape": "8x8xf32x0",
+        "pipeline": f"{script_path}/cpu_matmul.yaml"
+        if arch == "x86_64"
+        else str(kb_default_pipeline),
     },
     {
         "kernel": "level1/2_Standard_matrix_multiplication_.py",
         "input_shapes": "8x16xbf16xrnd,16x8xbf16xrnd",
         "output_shape": "8x8xbf16x0",
+        "pipeline": str(kb_default_pipeline),
     },
 ]
 
 if __name__ == "__main__":
-    project_root = Path(__file__).parent.parent.parent.parent
-    kb_program = project_root / "tools" / "kernel_bench"
-    kb_path = project_root / "third_party" / "KernelBench" / "KernelBench"
-
     for test in tests:
         kb_kernel = kb_path / test["kernel"]
         command_line = [
@@ -43,6 +54,8 @@ if __name__ == "__main__":
             test["input_shapes"],
             "--output-shape",
             test["output_shape"],
+            "--pipeline",
+            test["pipeline"],
             "--print-tensor=1",
             "--seed=42",
         ]
@@ -61,8 +74,8 @@ if __name__ == "__main__":
         assert result.returncode == 0, "Execution failed"
 
 # CHECK: 1_Square_matrix_multiplication_.mlir
-# CHECK  0.37454012 0.9507143  0.7319939  ... 0.04645041 0.60754484 0.17052412
-# CHECK: 0.27214515 0.59023064 0.3609739  ... 0.297349   0.9243962  0.97105825
+# CHECK  0.3745{{.*}} 0.9507{{.*}} 0.7319{{.*}} ... 0.0464{{.*}} 0.6075{{.*}} 0.1705{{.*}}
+# CHECK: 0.2721{{.*}} 0.5902{{.*}} 0.3609{{.*}} ... 0.2973{{.*}} 0.9243{{.*}} 0.9710{{.*}}
 
 # CHECK-NOT: Execution failed
 
@@ -73,8 +86,8 @@ if __name__ == "__main__":
 # CHECK-NOT: Execution failed
 
 # CHECK: 2_Standard_matrix_multiplication_.mlir
-# CHECK: 3.120935  3.7697    4.5365195 4.397648  4.4506536 3.2665431 3.5362916
-# CHECK: 5.036752  5.312808  5.8109508 4.810084  4.7435184 4.35573   5.311559
+# CHECK: 3.1209{{.*}} 3.7697{{.*}} 4.5365{{.*}} 4.3976{{.*}} 4.4506{{.*}} 3.2665{{.*}} 3.5362{{.*}}
+# CHECK: 5.0367{{.*}} 5.3128{{.*}} 5.8109{{.*}} 4.8100{{.*}} 4.7435{{.*}} 4.3557{{.*}} 5.3115{{.*}}
 
 # CHECK-NOT: Execution failed
 

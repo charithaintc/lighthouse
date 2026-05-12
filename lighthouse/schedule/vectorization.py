@@ -1,9 +1,8 @@
 from mlir import ir
 from mlir.dialects import transform
-from mlir.dialects.transform import structured
-from mlir.dialects.transform import vector
+from mlir.dialects.transform import structured, vector, tensor
 
-from .builders import schedule_boilerplate
+from lighthouse.schedule.builders import schedule_boilerplate
 import lighthouse.transform as lh_transform
 
 
@@ -62,5 +61,39 @@ def x86_vectorization() -> ir.Module:
         lh_transform.x86_vector_patterns(named_seq.bodyTarget)
         lh_transform.cleanup(named_seq.bodyTarget)
 
+        transform.yield_()
+    return schedule
+
+
+def simplify_vector_ops() -> ir.Module:
+    """
+    Apply simplification patterns to vector operations.
+
+    Returns:
+        Schedule
+    """
+    with schedule_boilerplate() as (schedule, named_seq):
+        with ir.InsertionPoint(
+            transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
+        ):
+            # FIXME: This transform breaks AVX512 FMA recognition,
+            # but it's in the other sub-schedule of the same name.
+            # vector.apply_patterns_vector_cast_away_vector_leading_one_dim()
+            tensor.apply_patterns_tensor_fold_tensor_subset_ops_into_vector_transfers()
+            transform.apply_patterns_canonicalization()
+        transform.yield_()
+    return schedule
+
+
+def flatten_vector_ops() -> ir.Module:
+    """
+    Flatten vector ops to 1D.
+
+    Returns:
+        Schedule
+    """
+    with schedule_boilerplate() as (schedule, named_seq):
+        lh_transform.flatten_vector_ops(named_seq.bodyTarget)
+        lh_transform.cleanup(named_seq.bodyTarget)
         transform.yield_()
     return schedule
