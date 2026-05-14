@@ -264,9 +264,11 @@ class GenerateFusedAttention(
                     # Step 7: Broadcast m_ij from [wg_rows] to [wg_rows, tile_size]
                     m_ij_bcasted_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
                     m_ij_bcasted = vector.broadcast(m_ij_bcasted_type, m_ij)
+                    m_ij_transposed_type = ir.VectorType.get([tile_size_value, wg_rows], element_type)
+                    m_ij_transposed = vector.transpose(m_ij_transposed_type, m_ij_bcasted, [1, 0])
 
-                    # Step 8: Center the scores: qkt_centered = qkt_scaled - m_ij_bcasted
-                    qkt_centered = arith.subf(qkt_scaled, m_ij_bcasted)
+                    # Step 8: Center the scores: qkt_centered = qkt_scaled - m_ij_transposed
+                    qkt_centered = arith.subf(qkt_scaled, m_ij_transposed)
 
                     # Step 9: Compute exponential: qkt_exp = exp(qkt_centered)
                     qkt_exp = math.exp(qkt_centered)
@@ -291,9 +293,11 @@ class GenerateFusedAttention(
                     # Step 13: Broadcast alpha from [wg_rows] to [wg_rows, d_head]
                     alpha_bcasted_type = ir.VectorType.get([wg_rows, d_head], element_type)
                     alpha_bcasted = vector.broadcast(alpha_bcasted_type, alpha)
+                    alpha_transposed_type = ir.VectorType.get([d_head, wg_rows], element_type)
+                    alpha_transposed = vector.transpose(alpha_transposed_type, alpha_bcasted, [1, 0])
 
                     # Step 14: Update accumulator: acc_updated = acc * alpha_bcasted
-                    acc_updated = arith.mulf(acc, alpha_bcasted)
+                    acc_updated = arith.mulf(acc, alpha_transposed)
 
                     # Step 15: Load the current V tile: shape [tile_size, d_head]
                     # Use the same memref and indices as v_load, but replace second-to-last index with loop_idx
@@ -369,17 +373,26 @@ class GenerateFusedAttention(
                     scf.yield_([m_ij, l_i_updated, pv_out])
 
             # Extract the final accumulator result (3rd output) from the loop
-            final_output = loop.results[2]
+            pv_out = loop.results[2]
+            l_i_out = loop.results[1]
+            with ir.InsertionPoint.after(loop):
+                 # Step 17: Normalize the output: output_final = pv_out / l_i_out
+                # Need to broadcast l_i_out from [wg_rows] to [wg_rows, d_head]
+                l_i_out_bcasted_type = ir.VectorType.get([wg_rows, d_head], element_type)
+                l_i_out_bcasted = vector.broadcast(l_i_out_bcasted_type, l_i_out)
+                l_i_out_transposed_type = ir.VectorType.get([d_head, wg_rows], element_type)
+                l_i_out_transposed = vector.transpose(l_i_out_transposed_type, l_i_out_bcasted, [1, 0])
+                output_final = arith.divf(pv_out, l_i_out_transposed)
 
 
             # Replace all uses of the original output operation with the final loop result
-            output_op.results[0].replace_all_uses_with(final_output)
+            output_op.results[0].replace_all_uses_with(output_final)
 
             # Erase the original output operation
             rewriter.erase_op(output_op)
 
             # Return the final output handle
-            results.set_ops(op.new_output, [final_output.owner])
+            results.set_ops(op.new_output, [output_final.owner])
             return DiagnosedSilenceableFailure.Success
 
         @staticmethod
