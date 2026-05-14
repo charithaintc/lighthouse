@@ -1,7 +1,8 @@
 """Transform extension to generate fused attention computation."""
 
+import numpy as np
 from mlir import ir
-from mlir.dialects import ext, transform, arith, scf, linalg, tensor, math
+from mlir.dialects import ext, transform, arith, scf, linalg, tensor, math, vector
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from lighthouse.dialects.transform.transform_ext import TransformExtensionDialect
@@ -12,27 +13,27 @@ class GenerateFusedAttention(
 ):
     """Generate tiled fused attention computation (flash attention optimization).
 
-    Takes Q, K, V slices and output tensor, and generates an inner tiled loop
-    that computes fused attention with online softmax using running max and sum.
+    Takes Q, K, V loads and scale constant from bufferized IR, and generates an inner
+    tiled loop that computes fused attention with online softmax using running max and sum.
 
     This implements the flash attention algorithm where:
-    1. The computation is tiled along the inner K dimension (sequence length)
+    1. The computation is tiled along the reduction dimension (K/V sequence length)
     2. Online max and sum are maintained across tiles
     3. Output is incrementally updated with rescaled contributions
 
     Args:
-        q_slice: Handle to Q slice operation (tensor.extract_slice)
-        k_slice: Handle to K slice operation (tensor.extract_slice)
-        scale_slice: Handle to scaling factor slice operation (tensor.extract_slice)
-        v_slice: Handle to V slice operation (tensor.extract_slice)
-        output: Handle to the output operation to replace
-        tile_size: Size of inner dimension tiles (default: from attributes)
+        q_load: Handle to Q load operation (vector.transfer_read)
+        k_load: Handle to K load operation (vector.transfer_read)
+        v_load: Handle to V load operation (vector.transfer_read)
+        scale: Handle to scale constant operation (arith.constant)
+        output: Handle to the output operation to replace (vector.contract)
+        tile_size: Tile size for the reduction dimension tiling (K/V sequence length)
     """
 
-    q_slice: ext.Operand[transform.AnyOpType]
-    k_slice: ext.Operand[transform.AnyOpType]
-    scale_slice: ext.Operand[transform.AnyOpType]
-    v_slice: ext.Operand[transform.AnyOpType]
+    q_load: ext.Operand[transform.AnyOpType]
+    k_load: ext.Operand[transform.AnyOpType]
+    v_load: ext.Operand[transform.AnyOpType]
+    scale: ext.Operand[transform.AnyOpType]
     output: ext.Operand[transform.AnyOpType]
     tile_size: ir.IntegerAttr
     new_output: ext.Result[transform.AnyOpType[()]] = ext.infer_result()
@@ -51,355 +52,334 @@ class GenerateFusedAttention(
             state: transform.TransformState,
         ) -> DiagnosedSilenceableFailure:
             # Get payload operations
-            q_slice_ops = state.get_payload_ops(op.q_slice)
-            k_slice_ops = state.get_payload_ops(op.k_slice)
-            scale_slice_ops = state.get_payload_ops(op.scale_slice)
-            v_slice_ops = state.get_payload_ops(op.v_slice)
+            q_load_ops = state.get_payload_ops(op.q_load)
+            k_load_ops = state.get_payload_ops(op.k_load)
+            v_load_ops = state.get_payload_ops(op.v_load)
+            scale_ops = state.get_payload_ops(op.scale)
             output_ops = state.get_payload_ops(op.output)
 
             if (
-                len(q_slice_ops) != 1
-                or len(k_slice_ops) != 1
-                or len(scale_slice_ops) != 1
-                or len(v_slice_ops) != 1
+                len(q_load_ops) != 1
+                or len(k_load_ops) != 1
+                or len(v_load_ops) != 1
+                or len(scale_ops) != 1
                 or len(output_ops) != 1
             ):
                 return DiagnosedSilenceableFailure.emit_silenceable_error(
                     "Expected exactly one operation for each operand"
                 )
 
-            q_slice_op = q_slice_ops[0]
-            k_slice_op = k_slice_ops[0]
-            scale_slice_op = scale_slice_ops[0]
-            v_slice_op = v_slice_ops[0]
+            q_load_op = q_load_ops[0]
+            k_load_op = k_load_ops[0]
+            v_load_op = v_load_ops[0]
+            scale_op = scale_ops[0]
             output_op = output_ops[0]
+
+            # Extract the scale scalar value from scale_op (arith.constant)
+            scale_attr = scale_op.attributes["value"]
+            # Extract the scalar scale value from the scale_attr DenseElementsAttr
+            scale_dense_attr = ir.DenseElementsAttr(scale_attr)
+            # Get the first element as the scale value (all elements are the same in a splat)
+            scale_np_array = np.array(scale_dense_attr)
+            scale_value = float(scale_np_array.flat[0])
+
+            # Extract wg_rows and d_head from q_load result type
+            # q_load is vector.transfer_read that produces a vector
+            q_load_result = q_load_op.results[0]
+            q_vector_type = ir.VectorType(q_load_result.type)
+            wg_rows = q_vector_type.shape[0]
+            d_head = q_vector_type.shape[1]
 
             # Get tile size
             tile_size_value = ir.IntegerAttr(op.tile_size).value
 
-            # Get the result types and shapes
-            q_result = q_slice_op.results[0]
-            k_result = k_slice_op.results[0]
-            scale_result = scale_slice_op.results[0]
-            v_result = v_slice_op.results[0]
-            output_result = output_op.results[0]
-
-            # Extract shape information from the slice operations
-            q_type = ir.RankedTensorType(q_result.type)
-            k_type = ir.RankedTensorType(k_result.type)
-            scale_type = ir.RankedTensorType(scale_result.type)
-            v_type = ir.RankedTensorType(v_result.type)
-            output_type = ir.RankedTensorType(output_result.type)
-            # print(
-            #     f"Q type: {q_type}, K type: {k_type}, Scale type: {scale_type}, V type: {v_type}, Output type: {output_type}"
-            # )
-
-            element_type = q_type.element_type
-            index_type = ir.IndexType.get()
+            # Get element type from q_load result
+            element_type = q_vector_type.element_type
 
             # Build the fused attention computation
             with ir.InsertionPoint(output_op):
-                # Collapse the unit batch dimension to get 2D tensors
-                # Q: [1, seq_q, head_dim] -> [seq_q, head_dim]
-                # K: [1, seq_k, head_dim] -> [seq_k, head_dim]
-                # V: [1, seq_k, head_dim] -> [seq_k, head_dim]
-                # Scale: [1, seq_q, 1] -> [seq_q, 1]
-                q_2d_ty = ir.RankedTensorType.get(
-                    (q_type.shape[1], q_type.shape[2]), element_type
-                )
-                k_2d_ty = ir.RankedTensorType.get(
-                    (k_type.shape[1], k_type.shape[2]), element_type
-                )
-                v_2d_ty = ir.RankedTensorType.get(
-                    (v_type.shape[1], v_type.shape[2]), element_type
-                )
-                scale_2d_ty = ir.RankedTensorType.get(
-                    (scale_type.shape[1], scale_type.shape[2]), element_type
-                )
-                q_2d = tensor.collapse_shape(
-                    q_2d_ty, src=q_result, reassociation=[[0, 1], [2]]
-                )
-                k_2d = tensor.collapse_shape(
-                    k_2d_ty, src=k_result, reassociation=[[0, 1], [2]]
-                )
-                v_2d = tensor.collapse_shape(
-                    v_2d_ty, src=v_result, reassociation=[[0, 1], [2]]
-                )
-                scale_2d = tensor.collapse_shape(
-                    scale_2d_ty, src=scale_result, reassociation=[[0, 1], [2]]
-                )
+                # 1. Define m_i_init: vector of shape [wg_rows] with neg_inf values
+                m_i_vector_type = ir.VectorType.get([wg_rows], element_type)
+                neg_inf_value = 0xFC00  if element_type == ir.F16Type.get() else float("-inf")
+                m_i_values = np.full(wg_rows, neg_inf_value, dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
+                m_i_init_attr = ir.DenseElementsAttr.get(m_i_values, type=m_i_vector_type)
+                m_i_init = arith.constant(m_i_vector_type, m_i_init_attr)
 
-                # Get dimensions from 2D tensors
-                # Q: [seq_q, head_dim]
-                # K: [seq_k, head_dim]
-                # V: [seq_k, head_dim]
-                seq_q_dim = q_type.shape[1]
-                head_dim = q_type.shape[2]
-                seq_k_size = arith.constant(index_type, k_type.shape[1])
+                # 2. Define l_i_init: vector of shape [wg_rows] with zero values
+                l_i_vector_type = ir.VectorType.get([wg_rows], element_type)
+                l_i_values = np.zeros(wg_rows, dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
+                l_i_init_attr = ir.DenseElementsAttr.get(l_i_values, type=l_i_vector_type)
+                l_i_init = arith.constant(l_i_vector_type, l_i_init_attr)
 
-                # Initialize max to -inf
-                # Shape: [seq_q] (1D for 2D tensors)
-                neg_inf = arith.constant(
-                    element_type,
-                    float("-inf") if element_type == ir.F32Type.get() else -1e10,
-                )
-                max_shape = [seq_q_dim]
-                max_init = tensor.empty(max_shape, element_type)
-                running_max = linalg.fill(neg_inf, outs=[max_init])
+                # 3. Define acc_init: vector of shape [wg_rows, d_head] with zero values
+                acc_vector_type = ir.VectorType.get([wg_rows, d_head], element_type)
+                acc_values = np.zeros((wg_rows, d_head), dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
+                acc_init_attr = ir.DenseElementsAttr.get(acc_values, type=acc_vector_type)
+                acc_init = arith.constant(acc_vector_type, acc_init_attr)
 
-                # Initialize sum to 0
-                # Shape: [seq_q] (1D for 2D tensors)
-                zero = arith.constant(element_type, 0.0)
-                sum_init = tensor.empty(max_shape, element_type)
-                running_sum = linalg.fill(zero, outs=[sum_init])
+                # Get n_ctx from k_load result type (first dimension size)
+                k_load_result = k_load_op.results[0]
+                k_vector_type = ir.VectorType(k_load_result.type)
+                n_ctx = k_vector_type.shape[0]
 
-                # Initialize output accumulator to 0
-                # Shape: [seq_q, head_dim] (2D)
-                output_2d_shape = [seq_q_dim, head_dim]
-                output_2d_init = tensor.empty(output_2d_shape, element_type)
-                output_acc = linalg.fill(zero, outs=[output_2d_init])
 
-                # Create tiled loop over K dimension
+
+                scale_vector_type = ir.VectorType.get([wg_rows], element_type)
+                scale_values = np.full((wg_rows), scale_value, dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
+                scale_init_attr = ir.DenseElementsAttr.get(scale_values, type=scale_vector_type)
+                scale_vector = arith.constant(scale_vector_type, scale_init_attr)
+
+                # Create loop bounds
+                index_type = ir.IndexType.get()
                 c0 = arith.constant(index_type, 0)
-                tile_size_const = arith.constant(index_type, tile_size_value)
+                c_n_ctx = arith.constant(index_type, n_ctx)
+                c_tile_size = arith.constant(index_type, tile_size_value)
 
-                # Build the scf.for loop
-                loop_result = scf.ForOp(
-                    c0,
-                    seq_k_size,
-                    tile_size_const,
-                    [running_max, running_sum, output_acc],
-                )
+                # Create scf.for loop that iterates from 0 to n_ctx in steps of tile_size
+                loop = scf.ForOp(c0, c_n_ctx, c_tile_size, [m_i_init, l_i_init, acc_init])
 
-                with ir.InsertionPoint(loop_result.body):
-                    # Get loop iteration variable and current state
-                    k_idx = loop_result.induction_variable
-                    old_max = loop_result.inner_iter_args[0]
-                    old_sum = loop_result.inner_iter_args[1]
-                    old_output = loop_result.inner_iter_args[2]
+                with ir.InsertionPoint(loop.body):
+                    # Get the loop induction variable and iter_args
+                    loop_idx = loop.induction_variable
+                    m_i = loop.inner_iter_args[0]
+                    l_i = loop.inner_iter_args[1]
+                    acc = loop.inner_iter_args[2]
 
-                    # Slice K and V for this tile
-                    # K: [seq_k, head_dim] -> K_tile: [tile_size, head_dim]
-                    # V: [seq_k, head_dim] -> V_tile: [tile_size, head_dim]
-                    one = arith.constant(index_type, 1)
-                    k_tile_type = ir.RankedTensorType.get(
-                        [tile_size_value, head_dim], element_type
-                    )
-                    k_tile = tensor.extract_slice(
+                    # Load the current K tile: shape [tile_size, d_head]
+                    # Use the same memref and indices as k_load, but replace second-to-last index with loop_idx
+                    k_memref = k_load_op.operands[0]
+                    k_tile_type = ir.VectorType.get([tile_size_value, d_head], element_type)
+
+                    # Get the indices from original k_load (all operands except the first one which is the memref)
+                    # and the last one which is the padding value
+                    k_load_indices = list(k_load_op.operands[1:-1])
+
+                    # Replace the second-to-last index with loop_idx
+                    k_tile_indices = k_load_indices
+                    k_tile_indices[-2] = loop_idx  # Assuming the reduction dimension is the last index before padding
+
+                    # Get the padding value (last operand of k_load)
+                    padding = k_load_op.operands[-1]
+
+                    # Get in_bounds attribute if it exists
+                    in_bounds = k_load_op.attributes.get("in_bounds", None)
+
+                    k_perm_map = k_load_op.attributes.get("permutation_map", None)
+
+                    # Create vector.transfer_read for K tile
+                    k_tile = vector.TransferReadOp(
                         k_tile_type,
-                        source=k_2d,
-                        offsets=[k_idx],
-                        sizes=[],
-                        strides=[],
-                        static_offsets=[ir.ShapedType.get_dynamic_size(), 0],
-                        static_sizes=[tile_size_value, head_dim],
-                        static_strides=[1, 1],
+                        k_memref,
+                        k_load_indices,
+                        k_perm_map,
+                        padding,
+                        in_bounds=in_bounds
+                    ).result
+                    # print(f"k_tile: {k_tile}")
+
+                    # Step 1: Transpose K tile from [tile_size, d_head] to [d_head, tile_size]
+                    k_transpose_type = ir.VectorType.get([d_head, tile_size_value], element_type)
+                    # vector.transpose with permutation [1, 0] swaps the two dimensions
+                    k_transpose = vector.transpose(k_transpose_type, k_tile, [1, 0])
+                    # print(f"k_transpose: {k_transpose}")
+
+                    # Step 2: Compute Q * K_transpose using vector.contract
+                    # Q shape: [wg_rows, d_head]
+                    # K_transpose shape: [d_head, tile_size]
+                    # Output shape: [wg_rows, tile_size]
+                    # Contraction: Q[i, k] * K_transpose[k, j] -> QKT[i, j]
+                    # indexing_maps: affine_map<(i, j, k) -> (i, k)>, affine_map<(i, j, k) -> (k, j)>, affine_map<(i, j, k) -> (i, j)>
+                    # iterator_types: ["parallel", "parallel", "reduction"]
+
+                    q_value = q_load_op.results[0]
+                    qkt_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
+
+                    # Create zero-initialized accumulator for the contraction
+                    qkt_acc_values = np.zeros((wg_rows, tile_size_value), dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
+                    qkt_acc_attr = ir.DenseElementsAttr.get(qkt_acc_values, type=qkt_type)
+                    qkt_acc = arith.constant(qkt_type, qkt_acc_attr)
+
+                    # Create affine maps for the contraction
+                    affine_d0 = ir.AffineExpr.get_dim(0)
+                    affine_d1 = ir.AffineExpr.get_dim(1)
+                    affine_d2 = ir.AffineExpr.get_dim(2)
+
+                    # Map for Q: (i, j, k) -> (i, k)
+                    q_map = ir.AffineMap.get(3, 0, [affine_d0, affine_d2])
+                    # Map for K_transpose: (i, j, k) -> (k, j)
+                    k_map = ir.AffineMap.get(3, 0, [affine_d2, affine_d1])
+                    # Map for output QKT: (i, j, k) -> (i, j)
+                    out_map = ir.AffineMap.get(3, 0, [affine_d0, affine_d1])
+
+                    indexing_maps = ir.ArrayAttr.get([
+                        ir.AffineMapAttr.get(q_map),
+                        ir.AffineMapAttr.get(k_map),
+                        ir.AffineMapAttr.get(out_map)
+                    ])
+
+                    iterator_types = ir.ArrayAttr.get([
+                        ir.Attribute.parse("#vector.iterator_type<parallel>"),
+                        ir.Attribute.parse("#vector.iterator_type<parallel>"),
+                        ir.Attribute.parse("#vector.iterator_type<reduction>")
+                    ])
+
+                    qkt = vector.contract(
+                        qkt_type,
+                        q_value,
+                        k_transpose,
+                        qkt_acc,
+                        indexing_maps=indexing_maps,
+                        iterator_types=iterator_types
+                    )
+                    # print(f"qkt: {qkt}")
+
+                    # Step 3: Max reduction over the inner dimension of QKT
+                    # QKT shape: [wg_rows, tile_size]
+                    # Result shape: [wg_rows]
+                    # We need to compute max along dimension 1 (tile_size dimension)
+
+                    qkt_max = vector.multi_reduction(
+                        kind="maxnumf",
+                        source=qkt,
+                        acc=m_i_init,
+                        reduction_dims=[1]
                     )
 
-                    v_tile_type = ir.RankedTensorType.get(
-                        [tile_size_value, head_dim], element_type
+                    # Step 4: Scale the max: qkt_max_scaled = qkt_max * scale
+                    # Both have shape [wg_rows]
+                    qkt_max_scaled = arith.mulf(qkt_max, scale_vector)
+
+                    # Step 5: Compute m_ij = max(m_i, qkt_max_scaled)
+                    # Both have shape [wg_rows]
+                    m_ij = arith.maximumf(m_i, qkt_max_scaled)
+
+                    # Step 6: Scale QKT matrix: qkt_scaled = qkt * scale_2d
+                    # Need to broadcast scale from [wg_rows] to [wg_rows, tile_size]
+                    scale_2d_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
+                    scale_2d_values = np.full((wg_rows, tile_size_value), scale_value, dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
+                    scale_2d_attr = ir.DenseElementsAttr.get(scale_2d_values, type=scale_2d_type)
+                    scale_2d = arith.constant(scale_2d_type, scale_2d_attr)
+                    qkt_scaled = arith.mulf(qkt, scale_2d)
+
+                    # Step 7: Broadcast m_ij from [wg_rows] to [wg_rows, tile_size]
+                    m_ij_bcasted_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
+                    m_ij_bcasted = vector.broadcast(m_ij_bcasted_type, m_ij)
+
+                    # Step 8: Center the scores: qkt_centered = qkt_scaled - m_ij_bcasted
+                    qkt_centered = arith.subf(qkt_scaled, m_ij_bcasted)
+
+                    # Step 9: Compute exponential: qkt_exp = exp(qkt_centered)
+                    qkt_exp = math.exp(qkt_centered)
+
+                    # Step 10: Sum reduction along inner dimension: l_ij = sum(qkt_exp, dim=1)
+                    # Shape [wg_rows, tile_size] -> [wg_rows]
+                    l_ij = vector.multi_reduction(
+                        kind="add",
+                        source=qkt_exp,
+                        acc=l_i_init,
+                        reduction_dims=[1]
                     )
-                    v_tile = tensor.extract_slice(
+
+                    # Step 11: Compute alpha = exp(m_i - m_ij)
+                    m_diff = arith.subf(m_i, m_ij)
+                    alpha = math.exp(m_diff)
+
+                    # Step 12: Update l_i: l_i_updated = l_i * alpha + l_ij
+                    l_i_scaled = arith.mulf(l_i, alpha)
+                    l_i_updated = arith.addf(l_i_scaled, l_ij)
+
+                    # Step 13: Broadcast alpha from [wg_rows] to [wg_rows, d_head]
+                    alpha_bcasted_type = ir.VectorType.get([wg_rows, d_head], element_type)
+                    alpha_bcasted = vector.broadcast(alpha_bcasted_type, alpha)
+
+                    # Step 14: Update accumulator: acc_updated = acc * alpha_bcasted
+                    acc_updated = arith.mulf(acc, alpha_bcasted)
+
+                    # Step 15: Load the current V tile: shape [tile_size, d_head]
+                    # Use the same memref and indices as v_load, but replace second-to-last index with loop_idx
+                    v_memref = v_load_op.operands[0]
+                    v_tile_type = ir.VectorType.get([tile_size_value, d_head], element_type)
+
+                    # Get the indices from original v_load (all operands except the first one which is the memref)
+                    # and the last one which is the padding value
+                    v_load_indices = list(v_load_op.operands[1:-1])
+
+                    # Replace the second-to-last index with loop_idx
+                    v_tile_indices = v_load_indices
+                    v_tile_indices[-2] = loop_idx  # Assuming the reduction dimension is the second-to-last index
+
+                    # Get the padding value (last operand of v_load)
+                    v_padding = v_load_op.operands[-1]
+
+                    # Get in_bounds attribute if it exists
+                    v_in_bounds = v_load_op.attributes.get("in_bounds", None)
+
+                    v_perm_map = v_load_op.attributes.get("permutation_map", None)
+
+                    # Create vector.transfer_read for V tile
+                    v_tile = vector.TransferReadOp(
                         v_tile_type,
-                        source=v_2d,
-                        offsets=[k_idx],
-                        sizes=[],
-                        strides=[],
-                        static_offsets=[ir.ShapedType.get_dynamic_size(), 0],
-                        static_sizes=[tile_size_value, head_dim],
-                        static_strides=[1, 1],
-                    )
-                    # Transpose K_tile: [tile_size, head_dim] -> [head_dim, tile_size]
-                    k_tile_t_shape = [head_dim, tile_size_value]
-                    k_tile_t_init = tensor.empty(k_tile_t_shape, element_type)
-                    k_tile_t = linalg.transpose(
-                        k_tile, outs=[k_tile_t_init], permutation=[1, 0]
-                    )
+                        v_memref,
+                        v_load_indices,
+                        v_perm_map,
+                        v_padding,
+                        in_bounds=v_in_bounds
+                    ).result
 
-                    # Compute Q @ K^T for this tile
-                    # Q: [seq_q, head_dim]
-                    # K_tile_T: [head_dim, tile_size]
-                    # Result: [seq_q, tile_size]
-                    qk_shape = [seq_q_dim, tile_size_value]
-                    qk_init = tensor.empty(qk_shape, element_type)
-                    qk_filled = linalg.fill(zero, outs=[qk_init])
-                    qk = linalg.matmul(q_2d, k_tile_t, outs=[qk_filled])
+                    # Step 16: Compute attention-weighted values: pv_out = qkt_exp @ v_tile
+                    # qkt_exp shape: [wg_rows, tile_size]
+                    # v_tile shape: [tile_size, d_head]
+                    # Output shape: [wg_rows, d_head]
+                    # Contraction: qkt_exp[i, k] * v_tile[k, j] -> pv_out[i, j]
 
-                    # Compute row-wise max of qk
-                    # row_max: [seq_q] = max(qk, axis=1)
-                    row_max_init = tensor.empty([seq_q_dim], element_type)
-                    row_max_filled = linalg.fill(neg_inf, outs=[row_max_init])
-                    dims_attr = ir.DenseI64ArrayAttr.get([1])
-                    f16 = ir.F16Type.get()
+                    # Create affine maps for the contraction
+                    affine_d0 = ir.AffineExpr.get_dim(0)
+                    affine_d1 = ir.AffineExpr.get_dim(1)
+                    affine_d2 = ir.AffineExpr.get_dim(2)
 
-                    @linalg.reduce(
-                        result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
-                        inputs=[qk],
-                        inits=[row_max_filled],
-                        dimensions=dims_attr,
-                    )
-                    def row_max(elem: f16, acc: f16):
-                        return arith.maximumf(elem, acc)
+                    # Map for qkt_exp: (i, j, k) -> (i, k)
+                    qkt_exp_map = ir.AffineMap.get(3, 0, [affine_d0, affine_d2])
+                    # Map for v_tile: (i, j, k) -> (k, j)
+                    v_map = ir.AffineMap.get(3, 0, [affine_d2, affine_d1])
+                    # Map for output pv_out: (i, j, k) -> (i, j)
+                    pv_out_map = ir.AffineMap.get(3, 0, [affine_d0, affine_d1])
 
-                    # Compute new max across this tile
-                    # new_max: [seq_q] = max(old_max, row_max)
-                    new_max_init = tensor.empty([seq_q_dim], element_type)
-                    new_max = linalg.max(old_max, row_max, outs=[old_max])
+                    indexing_maps_pv = ir.ArrayAttr.get([
+                        ir.AffineMapAttr.get(qkt_exp_map),
+                        ir.AffineMapAttr.get(v_map),
+                        ir.AffineMapAttr.get(pv_out_map)
+                    ])
 
-                    # Compute exp(qk - new_max)
-                    # First broadcast new_max to [seq_q, 1] then to [seq_q, tile_size]
-                    new_max_2d_type = ir.RankedTensorType.get(
-                        [seq_q_dim, 1], element_type
-                    )
-                    new_max_2d_init = tensor.empty(
-                        [seq_q_dim, tile_size_value], element_type
-                    )
-                    new_max_2d = linalg.broadcast(
-                        new_max, outs=[new_max_2d_init], dimensions=[0]
+                    iterator_types_pv = ir.ArrayAttr.get([
+                        ir.Attribute.parse("#vector.iterator_type<parallel>"),
+                        ir.Attribute.parse("#vector.iterator_type<parallel>"),
+                        ir.Attribute.parse("#vector.iterator_type<reduction>")
+                    ])
+
+                    pv_out = vector.contract(
+                        acc_vector_type,
+                        qkt_exp,
+                        v_tile,
+                        acc_updated,
+                        indexing_maps=indexing_maps_pv,
+                        iterator_types=iterator_types_pv
                     )
 
-                    # exp_scores: [seq_q, tile_size] = exp(qk - new_max_2d)
-                    exp_scores_init = tensor.empty(qk_shape, element_type)
+                    # Yield the updated iter args
+                    scf.yield_([m_ij, l_i_updated, pv_out])
 
-                    @linalg.map(
-                        result=[ir.RankedTensorType.get(qk_shape, element_type)],
-                        inputs=[qk, new_max_2d],
-                        init=exp_scores_init,
-                    )
-                    def exp_scores(qk_val: f16, max_val: f16, _: f16):
-                        diff = arith.subf(qk_val, max_val)
-                        return math.exp(diff)
+            # Extract the final accumulator result (3rd output) from the loop
+            final_output = loop.results[2]
 
-                    # Compute row-wise sum of exp_scores
-                    # row_sum_exp: [seq_q] = sum(exp_scores, axis=1)
-                    row_sum_exp_init = tensor.empty([seq_q_dim], element_type)
-                    row_sum_exp_filled = linalg.fill(zero, outs=[row_sum_exp_init])
 
-                    @linalg.reduce(
-                        result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
-                        inputs=[exp_scores],
-                        inits=[row_sum_exp_filled],
-                        dimensions=dims_attr,
-                    )
-                    def row_sum_exp(elem: f16, acc: f16):
-                        return arith.addf(elem, acc)
+            # Replace all uses of the original output operation with the final loop result
+            output_op.results[0].replace_all_uses_with(final_output)
 
-                    # Compute correction factor for old values: exp(old_max - new_max)
-                    correction_init = tensor.empty([seq_q_dim], element_type)
+            # Erase the original output operation
+            rewriter.erase_op(output_op)
 
-                    @linalg.map(
-                        result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
-                        inputs=[old_max, new_max],
-                        init=correction_init,
-                    )
-                    def correction(old_val: f16, new_val: f16, _: f16):
-                        diff = arith.subf(old_val, new_val)
-                        return math.exp(diff)
-
-                    # Update running sum with rescaling
-                    # new_sum: [seq_q] = old_sum * correction + row_sum_exp
-                    # new_sum_init = tensor.empty([seq_q_dim], element_type)
-
-                    @linalg.map(
-                        result=[ir.RankedTensorType.get([seq_q_dim], element_type)],
-                        inputs=[old_sum, correction, row_sum_exp],
-                        init=old_sum,
-                    )
-                    def new_sum(old_s: f16, corr: f16, new_s: f16, _: f16):
-                        rescaled = arith.mulf(old_s, corr)
-                        return arith.addf(rescaled, new_s)
-
-                    # Compute exp_scores @ V_tile
-                    # exp_scores: [seq_q, tile_size]
-                    # V_tile: [tile_size, head_dim]
-                    # Result: [seq_q, head_dim]
-                    exp_v_init = tensor.empty([seq_q_dim, head_dim], element_type)
-                    exp_v_filled = linalg.fill(zero, outs=[exp_v_init])
-                    exp_v = linalg.matmul(exp_scores, v_tile, outs=[exp_v_filled])
-
-                    # Update output with rescaling
-                    # new_output: [seq_q, head_dim] = old_output * (correction * old_sum / new_sum) + (exp_v / new_sum)
-                    # First compute rescale factor: correction / new_sum (broadcasted to [seq_q, 1])
-                    rescale_factor_div_init = tensor.empty([seq_q_dim], element_type)
-                    rescale_factor_div = linalg.div(
-                        correction, new_sum, outs=[rescale_factor_div_init]
-                    )
-                    rescale_factor_mul_init = tensor.empty([seq_q_dim], element_type)
-                    rescale_factor_mul = linalg.mul(
-                        rescale_factor_div, old_sum, outs=[rescale_factor_mul_init]
-                    )
-                    rescale_factor_2d_init = tensor.empty(
-                        [seq_q_dim, tile_size_value], element_type
-                    )
-                    rescale_factor_2d = linalg.broadcast(
-                        rescale_factor_mul,
-                        outs=[rescale_factor_2d_init],
-                        dimensions=[0],
-                    )
-
-                    # Rescale old output
-                    # rescaled_old_init = tensor.empty(
-                    #     [seq_q_dim, head_dim], element_type
-                    # )
-                    rescaled_old = linalg.mul(
-                        old_output, rescale_factor_2d, outs=[old_output]
-                    )
-
-                    # Compute: exp_v / new_sum (broadcast new_sum to [seq_q, tile_size])
-                    norm_factor_2d_init = tensor.empty(
-                        [seq_q_dim, tile_size_value], element_type
-                    )
-                    norm_factor_2d = linalg.broadcast(
-                        new_sum, outs=[norm_factor_2d_init], dimensions=[0]
-                    )
-
-                    # Normalize new contribution
-                    normalized_exp_v_init = tensor.empty(
-                        [seq_q_dim, head_dim], element_type
-                    )
-                    normalized_exp_v = linalg.div(
-                        exp_v, norm_factor_2d, outs=[normalized_exp_v_init]
-                    )
-
-                    # Add both contributions
-                    # new_output_init = tensor.empty([seq_q_dim, head_dim], element_type)
-                    new_output = linalg.add(
-                        rescaled_old, normalized_exp_v, outs=[old_output]
-                    )
-
-                    scf.yield_([new_max, new_sum, new_output])
-
-                # Extract final result from loop
-                final_output_2d = loop_result.results[2]
-
-                # Expand the 2D output back to 3D to match the original output shape
-                # [seq_q, head_dim] -> [1, seq_q, head_dim]
-                final_output_3d = tensor.expand_shape(
-                    output_type,
-                    src=final_output_2d,
-                    reassociation=[[0, 1], [2]],
-                    output_shape=[],
-                    static_output_shape=output_type.shape,
-                )
-
-                # Create a dummy add operation to wrap the final output
-                # This is needed because replace_op requires an operation, not a value
-                zero_const = arith.constant(element_type, 0.0)
-                # Create a linalg.add that adds 0 (identity operation)
-                zero_tensor_shape = output_type.shape
-                zero_tensor_init = tensor.empty(zero_tensor_shape, element_type)
-                zero_tensor = linalg.fill(zero_const, outs=[zero_tensor_init])
-
-                # Create the add operation: final_output_3d + 0
-                output_init_for_add = tensor.empty(zero_tensor_shape, element_type)
-                dummy_add = linalg.add(
-                    final_output_3d, zero_tensor, outs=[output_init_for_add]
-                )
-
-                # Replace the original output operation with the dummy add
-                rewriter.replace_op(output_op, dummy_add.owner)
-
-            results.set_ops(op.new_output, [dummy_add.owner])
+            # Return the final output handle
+            results.set_ops(op.new_output, [final_output.owner])
             return DiagnosedSilenceableFailure.Success
 
         @staticmethod
@@ -420,22 +400,22 @@ class GenerateFusedAttention(
 
 
 def generate_fused_attention(
-    q_slice: ir.Value,
-    k_slice: ir.Value,
-    scale_slice: ir.Value,
-    v_slice: ir.Value,
+    q_load: ir.Value,
+    k_load: ir.Value,
+    v_load: ir.Value,
+    scale: ir.Value,
     output: ir.Value,
     tile_size: int | ir.IntegerAttr,
 ) -> ir.Value:
-    """Generate fused attention computation with inner tiling.
+    """Generate fused attention computation with inner tiling on bufferized IR.
 
     Args:
-        q_slice: Handle to Q slice operation
-        k_slice: Handle to K slice operation
-        scale_slice: Handle to scaling factor slice operation
-        v_slice: Handle to V slice operation
-        output: Handle to output operation to replace
-        tile_size: Size of tiles along the K dimension
+        q_load: Handle to Q load operation (vector.transfer_read)
+        k_load: Handle to K load operation (vector.transfer_read)
+        v_load: Handle to V load operation (vector.transfer_read)
+        scale: Handle to scale constant operation (arith.constant)
+        output: Handle to output operation to replace (vector.contract)
+        tile_size: Tile size for the reduction dimension tiling (K/V sequence length)
 
     Returns:
         Handle to the new output operation
@@ -444,5 +424,5 @@ def generate_fused_attention(
         tile_size = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), tile_size)
 
     return GenerateFusedAttention(
-        q_slice, k_slice, scale_slice, v_slice, output, tile_size=tile_size
+        q_load, k_load, v_load, scale, output, tile_size=tile_size
     ).new_output

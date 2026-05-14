@@ -226,17 +226,17 @@ def bundle_xegpu_fused_attention_schedule(
     # Generate fused attention computation with inner tiling (flash attention)
     # This replaces the current unfused computation with a tiled loop that
     # maintains online max and sum for efficient memory usage
-    tile_size = 64
-    new_output = generate_fused_attention(
-        q_slice=q_slice,
-        k_slice=k_slice,
-        scale_slice=scale_slice,
-        v_slice=v_slice,
-        output=last_matmul,
-        tile_size=tile_size,
-    )
-    transform.apply_cse(func)
-    canonicalize(func)
+    # tile_size = 64
+    # new_output = generate_fused_attention(
+    #     q_slice=q_slice,
+    #     k_slice=k_slice,
+    #     scale_slice=scale_slice,
+    #     v_slice=v_slice,
+    #     output=last_matmul,
+    #     tile_size=tile_size,
+    # )
+    # transform.apply_cse(func)
+    # canonicalize(func)
 
     if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()
@@ -282,6 +282,55 @@ def bundle_xegpu_fused_attention_schedule(
             "max-rank-of-allocated-memref": "2",
         },
     )
+
+    # Extract q, k, v memrefs from the bufferized IR
+    # Match vector.contract ops to find the q, k, v loads
+    for_all = match(mod, ops={"scf.forall"})
+    func = transform.get_parent_op(anytype, for_all, op_name="func.func")
+    contract_ops = match_and_split(func, ops={"vector.contract"}, nhandles=2)
+
+    # First vector.contract is Q @ K^T
+    # Its first operand is the q load (vector.transfer_read)
+    # Its second operand is the k load (vector.transfer_read)
+    first_contract = contract_ops[0]
+    q_load = transform.get_producer_of_operand(anytype, first_contract, operand_number=0)
+    k_load = transform.get_producer_of_operand(anytype, first_contract, operand_number=1)
+
+    # # Second vector.contract is attention_weights @ V
+    # # Its second operand is the v load (vector.transfer_read)
+    second_contract = contract_ops[1]
+    v_load = transform.get_producer_of_operand(anytype, second_contract, operand_number=1)
+
+    # Extract memrefs from the loads (first operand of vector.transfer_read)
+    # q_memref = transform.get_operand(anytype, q_load, [0])
+    # k_memref = transform.get_operand(anytype, k_load, [0])
+    # v_memref = transform.get_operand(anytype, v_load, [0])
+
+    # Match arith.mulf to get the scale parameter
+    # The scale is the second operand of arith.mulf (the constant)
+    mulf_op = match_and_split(func, ops={"arith.mulf"}, nhandles=1)[0]
+    scale = transform.get_producer_of_operand(anytype, mulf_op, operand_number=1)
+
+    # Debug prints to verify we got the right memrefs and scale
+    # transform.print_(target=q_load, name="q_memref")
+    # transform.print_(target=k_load, name="k_memref")
+    # transform.print_(target=v_load, name="v_memref")
+    # transform.print_(target=scale, name="scale")
+
+    # Generate fused attention computation with inner tiling
+    # This replaces the second vector.contract (attention_weights @ V) with a tiled
+    # loop that implements online softmax for efficient memory usage
+    tile_size = 64  # Tile size for reduction dimension (K/V sequence length)
+    new_output = generate_fused_attention(
+        q_load=q_load,
+        k_load=k_load,
+        v_load=v_load,
+        scale=scale,
+        output=second_contract,
+        tile_size=tile_size,
+    )
+    # transform.apply_cse(func)
+    # canonicalize(func)
 
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
@@ -336,10 +385,7 @@ def bundle_xegpu_fused_attention_schedule(
             update_address_space(alloca, address_space=3)
         gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
         transform.apply_cse(gpu_func)
-
-    # Cleanup.
-    transform.apply_cse(mod)
-    canonicalize(mod)
+        gpu_func = apply_registered_pass(gpu_func, "loop-invariant-code-motion")
 
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
@@ -349,13 +395,6 @@ def bundle_xegpu_fused_attention_schedule(
     out_sg_layout = [num_subgroups, 1]
     out_sg_data = [sg_rows, parameters["n_head"]]
     xegpu.set_anchor_layout(store_nd_op, sg_layout=out_sg_layout, sg_data=out_sg_data)
-
-    # Set layout attributes for xegpu.store_matrix ops. same as store_nd ops.
-    store_matrix_ops = match_and_split(gpu_func, ops={"xegpu.store_matrix"}, nhandles=2)
-    for store_matrix_op in store_matrix_ops:
-        xegpu.set_anchor_layout(
-            store_matrix_op, sg_layout=out_sg_layout, sg_data=out_sg_data
-        )
 
     # Set layout for xegpu.dpas ops
     dpas_ops = match_and_split(gpu_func, ops={"xegpu.dpas"}, nhandles=2)
