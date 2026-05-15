@@ -329,8 +329,8 @@ def bundle_xegpu_fused_attention_schedule(
         output=second_contract,
         tile_size=tile_size,
     )
-    # transform.apply_cse(func)
-    # canonicalize(func)
+    transform.apply_cse(func)
+    canonicalize(func)
 
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
@@ -390,42 +390,42 @@ def bundle_xegpu_fused_attention_schedule(
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
 
-    # Set layout attributes for xegpu.store_nd ops.
-    store_nd_op = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)[0]
-    out_sg_layout = [num_subgroups, 1]
-    out_sg_data = [sg_rows, parameters["n_head"]]
-    xegpu.set_anchor_layout(store_nd_op, sg_layout=out_sg_layout, sg_data=out_sg_data)
+    # # Set layout attributes for xegpu.store_nd ops.
+    # store_nd_op = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)[0]
+    # out_sg_layout = [num_subgroups, 1]
+    # out_sg_data = [sg_rows, parameters["n_head"]]
+    # xegpu.set_anchor_layout(store_nd_op, sg_layout=out_sg_layout, sg_data=out_sg_data)
 
-    # Set layout for xegpu.dpas ops
-    dpas_ops = match_and_split(gpu_func, ops={"xegpu.dpas"}, nhandles=2)
-    # layouts for the first dpas op (Q*K^T):
-    first_dpas_op = dpas_ops[0]
-    qk_a_sg_layout = out_sg_layout
-    qk_a_sg_data = out_sg_data
-    qk_b_sg_layout = [1, num_subgroups]
-    qk_b_sg_data = [parameters["n_head"], num_subgroups]
-    qk_cd_sg_layout = out_sg_layout
-    qk_cd_sg_data = [sg_rows, 16]
-    xegpu.set_anchor_layout(
-        first_dpas_op, sg_layout=qk_a_sg_layout, sg_data=qk_a_sg_data, index=0
-    )
-    xegpu.set_anchor_layout(
-        first_dpas_op, sg_layout=qk_b_sg_layout, sg_data=qk_b_sg_data, index=1
-    )
-    xegpu.set_anchor_layout(
-        first_dpas_op, sg_layout=qk_cd_sg_layout, sg_data=qk_cd_sg_data, index=2
-    )
-    # layouts for the second dpas op (attention_weights*V):
-    second_dpas_op = dpas_ops[1]
-    xegpu.set_anchor_layout(
-        second_dpas_op, sg_layout=qk_cd_sg_layout, sg_data=qk_cd_sg_data, index=0
-    )
-    xegpu.set_anchor_layout(
-        second_dpas_op, sg_layout=qk_b_sg_layout, sg_data=qk_b_sg_data, index=1
-    )
-    xegpu.set_anchor_layout(
-        second_dpas_op, sg_layout=out_sg_layout, sg_data=out_sg_data, index=2
-    )
+    # # Set layout for xegpu.dpas ops
+    # dpas_ops = match_and_split(gpu_func, ops={"xegpu.dpas"}, nhandles=2)
+    # # layouts for the first dpas op (Q*K^T):
+    # first_dpas_op = dpas_ops[0]
+    # qk_a_sg_layout = out_sg_layout
+    # qk_a_sg_data = out_sg_data
+    # qk_b_sg_layout = [1, num_subgroups]
+    # qk_b_sg_data = [parameters["n_head"], num_subgroups]
+    # qk_cd_sg_layout = out_sg_layout
+    # qk_cd_sg_data = [sg_rows, 16]
+    # xegpu.set_anchor_layout(
+    #     first_dpas_op, sg_layout=qk_a_sg_layout, sg_data=qk_a_sg_data, index=0
+    # )
+    # xegpu.set_anchor_layout(
+    #     first_dpas_op, sg_layout=qk_b_sg_layout, sg_data=[64, 64], order=[0, 1], index=1
+    # )
+    # xegpu.set_anchor_layout(
+    #     first_dpas_op, sg_layout=qk_cd_sg_layout, sg_data=qk_cd_sg_data, index=2
+    # )
+    # # layouts for the second dpas op (attention_weights*V):
+    # second_dpas_op = dpas_ops[1]
+    # xegpu.set_anchor_layout(
+    #     second_dpas_op, sg_layout=qk_cd_sg_layout, sg_data=qk_cd_sg_data, index=0
+    # )
+    # xegpu.set_anchor_layout(
+    #     second_dpas_op, sg_layout=[8, 1], sg_data=[64, 64], index=1
+    # )
+    # xegpu.set_anchor_layout(
+    #     second_dpas_op, sg_layout=out_sg_layout, sg_data=out_sg_data, index=2
+    # )
 
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()
