@@ -390,42 +390,129 @@ def bundle_xegpu_fused_attention_schedule(
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
 
-    # # Set layout attributes for xegpu.store_nd ops.
-    # store_nd_op = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)[0]
-    # out_sg_layout = [num_subgroups, 1]
-    # out_sg_data = [sg_rows, parameters["n_head"]]
-    # xegpu.set_anchor_layout(store_nd_op, sg_layout=out_sg_layout, sg_data=out_sg_data)
+    # Define XeGPU layout parameters
+    q_sg_layout = [8, 1]
+    q_sg_data = [16, 64]
+    q_inst_data = [8, 16]
 
-    # # Set layout for xegpu.dpas ops
-    # dpas_ops = match_and_split(gpu_func, ops={"xegpu.dpas"}, nhandles=2)
-    # # layouts for the first dpas op (Q*K^T):
-    # first_dpas_op = dpas_ops[0]
-    # qk_a_sg_layout = out_sg_layout
-    # qk_a_sg_data = out_sg_data
-    # qk_b_sg_layout = [1, num_subgroups]
-    # qk_b_sg_data = [parameters["n_head"], num_subgroups]
-    # qk_cd_sg_layout = out_sg_layout
-    # qk_cd_sg_data = [sg_rows, 16]
-    # xegpu.set_anchor_layout(
-    #     first_dpas_op, sg_layout=qk_a_sg_layout, sg_data=qk_a_sg_data, index=0
-    # )
-    # xegpu.set_anchor_layout(
-    #     first_dpas_op, sg_layout=qk_b_sg_layout, sg_data=[64, 64], order=[0, 1], index=1
-    # )
-    # xegpu.set_anchor_layout(
-    #     first_dpas_op, sg_layout=qk_cd_sg_layout, sg_data=qk_cd_sg_data, index=2
-    # )
-    # # layouts for the second dpas op (attention_weights*V):
-    # second_dpas_op = dpas_ops[1]
-    # xegpu.set_anchor_layout(
-    #     second_dpas_op, sg_layout=qk_cd_sg_layout, sg_data=qk_cd_sg_data, index=0
-    # )
-    # xegpu.set_anchor_layout(
-    #     second_dpas_op, sg_layout=[8, 1], sg_data=[64, 64], index=1
-    # )
-    # xegpu.set_anchor_layout(
-    #     second_dpas_op, sg_layout=out_sg_layout, sg_data=out_sg_data, index=2
-    # )
+    k_sg_layout = [8, 1]
+    k_sg_data = [16, 64]
+    k_inst_data = [16, 16]
+
+    v_sg_layout = k_sg_layout
+    v_sg_data = k_sg_data
+    v_inst_data = k_inst_data
+
+    kt_sg_layout = [1, 8]
+    kt_sg_data = [64, 16]
+    kt_inst_data = [16, 16]
+    kt_order = [0, 1]
+
+    out_sg_layout = q_sg_layout
+    out_sg_data = q_sg_data
+    out_inst_data = q_inst_data
+
+
+    layout_128x16_sg_layout = [8, 1]
+    layout_128x16_sg_data = [16, 16]
+    layout_128x16_inst_data = [8, 16]
+
+    qk_sg_layout = layout_128x16_sg_layout
+    qk_sg_data = layout_128x16_sg_data
+    qk_inst_data = layout_128x16_inst_data
+
+    # Set layout attributes for xegpu.store_nd ops.
+    store_nd_op = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)[0]
+    xegpu.set_anchor_layout(store_nd_op, sg_layout=out_sg_layout, sg_data=out_sg_data, inst_data=out_inst_data)
+
+    # Set layout for xegpu.load_nd ops (9 total: 1 Q, 4 K, 4 V)
+    load_nd_ops = match_and_split(gpu_func, ops={"xegpu.load_nd"}, nhandles=9)
+
+    # First load_nd: Q layout
+    xegpu.set_anchor_layout(
+        load_nd_ops[0],
+        sg_layout=q_sg_layout,
+        sg_data=q_sg_data,
+        inst_data=q_inst_data
+    )
+
+    # Next 4 load_nd ops: K layout
+    for i in range(1, 5):
+        xegpu.set_anchor_layout(
+            load_nd_ops[i],
+            sg_layout=k_sg_layout,
+            sg_data=k_sg_data,
+            inst_data=k_inst_data
+        )
+
+    # Last 4 load_nd ops: V layout
+    for i in range(5, 9):
+        xegpu.set_anchor_layout(
+            load_nd_ops[i],
+            sg_layout=v_sg_layout,
+            sg_data=v_sg_data,
+            inst_data=v_inst_data
+        )
+
+    # Set layout for xegpu.dpas ops (8 total: 4 for Q@K, 4 for P@V)
+    dpas_ops = match_and_split(gpu_func, ops={"xegpu.dpas"}, nhandles=8)
+
+    # Layouts for first 4 dpas ops (Q@K^T):
+    for i in range(4):
+        qk_dpas_op = dpas_ops[i]
+        # Index 0: Q layout
+        xegpu.set_anchor_layout(
+            qk_dpas_op,
+            sg_layout=q_sg_layout,
+            sg_data=q_sg_data,
+            inst_data=q_inst_data,
+            index=0
+        )
+        # Index 1: K^T layout
+        xegpu.set_anchor_layout(
+            qk_dpas_op,
+            sg_layout=kt_sg_layout,
+            sg_data=kt_sg_data,
+            inst_data=kt_inst_data,
+            order=kt_order,
+            index=1
+        )
+        # Index 2: QK output layout (128x16)
+        xegpu.set_anchor_layout(
+            qk_dpas_op,
+            sg_layout=layout_128x16_sg_layout,
+            sg_data=layout_128x16_sg_data,
+            inst_data=layout_128x16_inst_data,
+            index=2
+        )
+
+    # Layouts for second 4 dpas ops (P@V):
+    for i in range(4, 8):
+        pv_dpas_op = dpas_ops[i]
+        # Index 0: QK (attention weights) layout
+        xegpu.set_anchor_layout(
+            pv_dpas_op,
+            sg_layout=qk_sg_layout,
+            sg_data=qk_sg_data,
+            inst_data=qk_inst_data,
+            index=0
+        )
+        # Index 1: V layout
+        xegpu.set_anchor_layout(
+            pv_dpas_op,
+            sg_layout=v_sg_layout,
+            sg_data=v_sg_data,
+            inst_data=v_inst_data,
+            index=1
+        )
+        # Index 2: Output layout
+        xegpu.set_anchor_layout(
+            pv_dpas_op,
+            sg_layout=out_sg_layout,
+            sg_data=out_sg_data,
+            inst_data=out_inst_data,
+            index=2
+        )
 
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()
