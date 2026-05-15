@@ -212,7 +212,7 @@ def parse_cli():
     parser.add_argument(
         "--n-ctx",
         type=int,
-        default=1024,
+        default=4096,
         help="Context length (sequence length)",
     )
     parser.add_argument(
@@ -224,13 +224,13 @@ def parse_cli():
     parser.add_argument(
         "--wg-rows",
         type=int,
-        default=64,
+        default=128,
         help="Number of Q*K^T*V rows computed by each work group",
     )
     parser.add_argument(
         "--sg-rows",
         type=int,
-        default=8,
+        default=16,
         help="Number of Q*K^T*V rows computed by each subgroup",
     )
     parser.add_argument(

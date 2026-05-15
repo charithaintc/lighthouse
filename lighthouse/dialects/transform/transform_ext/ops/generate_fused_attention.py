@@ -262,9 +262,9 @@ class GenerateFusedAttention(
                     qkt_scaled = arith.mulf(qkt, scale_2d)
 
                     # Step 7: Broadcast m_ij from [wg_rows] to [wg_rows, tile_size]
-                    m_ij_bcasted_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
+                    m_ij_bcasted_type = ir.VectorType.get([tile_size_value, wg_rows], element_type)
                     m_ij_bcasted = vector.broadcast(m_ij_bcasted_type, m_ij)
-                    m_ij_transposed_type = ir.VectorType.get([tile_size_value, wg_rows], element_type)
+                    m_ij_transposed_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
                     m_ij_transposed = vector.transpose(m_ij_transposed_type, m_ij_bcasted, [1, 0])
 
                     # Step 8: Center the scores: qkt_centered = qkt_scaled - m_ij_transposed
@@ -291,9 +291,9 @@ class GenerateFusedAttention(
                     l_i_updated = arith.addf(l_i_scaled, l_ij)
 
                     # Step 13: Broadcast alpha from [wg_rows] to [wg_rows, d_head]
-                    alpha_bcasted_type = ir.VectorType.get([wg_rows, d_head], element_type)
+                    alpha_bcasted_type = ir.VectorType.get([d_head, wg_rows], element_type)
                     alpha_bcasted = vector.broadcast(alpha_bcasted_type, alpha)
-                    alpha_transposed_type = ir.VectorType.get([d_head, wg_rows], element_type)
+                    alpha_transposed_type = ir.VectorType.get([wg_rows, d_head], element_type)
                     alpha_transposed = vector.transpose(alpha_transposed_type, alpha_bcasted, [1, 0])
 
                     # Step 14: Update accumulator: acc_updated = acc * alpha_bcasted
@@ -378,9 +378,9 @@ class GenerateFusedAttention(
             with ir.InsertionPoint.after(loop):
                  # Step 17: Normalize the output: output_final = pv_out / l_i_out
                 # Need to broadcast l_i_out from [wg_rows] to [wg_rows, d_head]
-                l_i_out_bcasted_type = ir.VectorType.get([wg_rows, d_head], element_type)
+                l_i_out_bcasted_type = ir.VectorType.get([d_head, wg_rows], element_type)
                 l_i_out_bcasted = vector.broadcast(l_i_out_bcasted_type, l_i_out)
-                l_i_out_transposed_type = ir.VectorType.get([d_head, wg_rows], element_type)
+                l_i_out_transposed_type = ir.VectorType.get([wg_rows, d_head], element_type)
                 l_i_out_transposed = vector.transpose(l_i_out_transposed_type, l_i_out_bcasted, [1, 0])
                 output_final = arith.divf(pv_out, l_i_out_transposed)
 
