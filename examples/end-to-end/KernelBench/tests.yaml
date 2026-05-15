@@ -289,3 +289,269 @@
   output_shape: 16x64x256x256
   dtypes: [f32, bf16]
   warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level1/97_ScaledDotProductAttention.py
+  input_shapes: [32x32x512x1024, 32x32x512x1024, 32x32x512x1024]
+  initializations: [rnd, rnd, rnd]
+  output_shape: 32x32x512x1024
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/9_Matmul_Subtract_Multiply_ReLU.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/12_Gemm_Multiply_LeakyReLU.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/14_Gemm_Divide_Sum_Scaling.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x1
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x1
+  dtypes: [f32, bf16]
+  warning: '''ERROR: torch_mlir.compiler_utils.TorchMlirCompilerError:
+              Lowering TorchFX IR -> Torch Backend IR failed with the following diagnostics:
+              python exception: Failure while executing pass pipeline'''
+
+- kernel: level2/22_Matmul_Scale_ResidualAdd_Clamp_LogSumExp_Mish.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x1
+  dtypes: [f32, bf16]
+  warning: '''ERROR: torch_mlir.compiler_utils.TorchMlirCompilerError:
+              failed to legalize operation torch.constant.bool'''
+
+- kernel: level2/29_Matmul_Mish_Mish.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/30_Gemm_GroupNorm_Hardtanh.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/33_Gemm_Scale_BatchNorm.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/37_Matmul_Swish_Sum_GroupNorm.py
+  input_shapes: [32768x1024]
+  initializations: [rnd]
+  output_shape: 32768x4096
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/39_Gemm_Scale_BatchNorm.py
+  input_shapes: [16384x4096]
+  initializations: [rnd]
+  output_shape: 16384x4096
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/40_Matmul_Scaling_ResidualAdd.py
+  input_shapes: [16384x4096]
+  initializations: [rnd]
+  output_shape: 16384x4096
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/41_Gemm_BatchNorm_GELU_ReLU.py
+  input_shapes: [16384x4096]
+  initializations: [rnd]
+  output_shape: 16384x4096
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/45_Gemm_Sigmoid_LogSumExp.py
+  input_shapes: [16384x2048]
+  initializations: [rnd]
+  output_shape: 16384
+  dtypes: [f32, bf16]
+  warning: '''ERROR: torch_mlir.compiler_utils.TorchMlirCompilerError:
+              failed to legalize operation torch.constant.bool'''
+
+- kernel: level2/51_Gemm_Subtract_GlobalAvgPool_LogSumExp_GELU_ResidualAdd.py
+  input_shapes: [2048x8192]
+  initializations: [rnd]
+  output_shape: 2048x8192
+  dtypes: [f32, bf16]
+  warning: '''ERROR: torch_mlir.compiler_utils.TorchMlirCompilerError:
+              Lowering TorchFX IR -> Torch Backend IR failed with the following diagnostics:
+              python exception: Failure while executing pass pipeline'''
+
+- kernel: level2/53_Gemm_Scaling_Hardtanh_GELU.py
+  input_shapes: [2048x8192]
+  initializations: [rnd]
+  output_shape: 2048x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/55_Matmul_MaxPool_Sum_Scale.py
+  input_shapes: [128x32768]
+  initializations: [rnd]
+  output_shape: 128
+  dtypes: [f32, bf16]
+  warning: "Execution just fails, return code -9, no errors reported."
+
+- kernel: level2/56_Matmul_Sigmoid_Sum.py
+  input_shapes: [128x32768]
+  initializations: [rnd]
+  output_shape: 128x1
+  dtypes: [f32, bf16]
+  warning: "Execution just fails, return code -9, no errors reported."
+
+- kernel: level2/59_Matmul_Swish_Scaling.py
+  input_shapes: [128x32768]
+  initializations: [rnd]
+  output_shape: 128x32768
+  dtypes: [f32, bf16]
+  warning: "Execution just fails, return code -9, no errors reported."
+
+- kernel: level2/62_Matmul_GroupNorm_LeakyReLU_Sum.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/63_Gemm_ReLU_Divide.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/64_Gemm_LogSumExp_LeakyReLU_LeakyReLU_GELU_GELU.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x1
+  dtypes: [f32, bf16]
+  warning: '''ERROR: torch_mlir.compiler_utils.TorchMlirCompilerError:
+              failed to legalize operation torch.constant.bool'''
+
+- kernel: level2/66_Matmul_Dropout_Softmax.py
+  input_shapes: [128x16384]
+  initializations: [rnd]
+  output_shape: 128x16384
+  dtypes: [f32, bf16]
+  warning: "Compiles, but doesn't seem to terminate"
+
+- kernel: level2/68_Matmul_Min_Subtract.py
+  input_shapes: [128x16384]
+  initializations: [rnd]
+  output_shape: 128x16384
+  dtypes: [f32, bf16]
+  warning: "Compiles, but doesn't seem to terminate"
+
+- kernel: level2/70_Gemm_Sigmoid_Scaling_ResidualAdd.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/75_Gemm_GroupNorm_Min_BiasAdd.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1x8192x1024x1
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/76_Gemm_Add_ReLU.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/80_Gemm_Max_Subtract_GELU.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x1
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/81_Gemm_Swish_Divide_Clamp_Tanh_Clamp.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/84_Gemm_BatchNorm_Scaling_Softmax.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/86_Matmul_Divide_GELU.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/88_Gemm_GroupNorm_Swish_Multiply_Swish.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/97_Matmul_BatchNorm_BiasAdd_Divide_Swish.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/98_Matmul_AvgPool_GELU_Scale_Max.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
+
+- kernel: level2/99_Matmul_GELU_Softmax.py
+  input_shapes: [1024x8192]
+  initializations: [rnd]
+  output_shape: 1024x8192
+  dtypes: [f32, bf16]
+  warning: "LLVM ERROR: operation destroyed but still has uses"
