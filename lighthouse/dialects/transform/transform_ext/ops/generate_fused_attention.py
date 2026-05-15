@@ -145,70 +145,35 @@ class GenerateFusedAttention(
                     l_i = loop.inner_iter_args[1]
                     acc = loop.inner_iter_args[2]
 
-                    # Load the current K tile: shape [tile_size, d_head]
-                    # Use the same memref and indices as k_load, but replace second-to-last index with loop_idx
+                    # Get common values for K/V tiling
                     k_memref = k_load_op.operands[0]
-                    k_tile_type = ir.VectorType.get([tile_size_value, d_head], element_type)
-
-                    # Get the indices from original k_load (all operands except the first one which is the memref)
-                    # and the last one which is the padding value
                     k_load_indices = list(k_load_op.operands[1:-1])
-
-                    # Replace the second-to-last index with loop_idx
-                    k_tile_indices = k_load_indices
-                    k_tile_indices[-2] = loop_idx  # Assuming the reduction dimension is the last index before padding
-
-                    # Get the padding value (last operand of k_load)
                     padding = k_load_op.operands[-1]
-
-                    # Get in_bounds attribute if it exists
                     in_bounds = k_load_op.attributes.get("in_bounds", None)
-
                     k_perm_map = k_load_op.attributes.get("permutation_map", None)
-
-                    # Create vector.transfer_read for K tile
-                    k_tile = vector.TransferReadOp(
-                        k_tile_type,
-                        k_memref,
-                        k_load_indices,
-                        k_perm_map,
-                        padding,
-                        in_bounds=in_bounds
-                    ).result
-                    # print(f"k_tile: {k_tile}")
-
-                    # Step 1: Transpose K tile from [tile_size, d_head] to [d_head, tile_size]
-                    k_transpose_type = ir.VectorType.get([d_head, tile_size_value], element_type)
-                    # vector.transpose with permutation [1, 0] swaps the two dimensions
-                    k_transpose = vector.transpose(k_transpose_type, k_tile, [1, 0])
-                    # print(f"k_transpose: {k_transpose}")
-
-                    # Step 2: Compute Q * K_transpose using vector.contract
-                    # Q shape: [wg_rows, d_head]
-                    # K_transpose shape: [d_head, tile_size]
-                    # Output shape: [wg_rows, tile_size]
-                    # Contraction: Q[i, k] * K_transpose[k, j] -> QKT[i, j]
-                    # indexing_maps: affine_map<(i, j, k) -> (i, k)>, affine_map<(i, j, k) -> (k, j)>, affine_map<(i, j, k) -> (i, j)>
-                    # iterator_types: ["parallel", "parallel", "reduction"]
-
                     q_value = q_load_op.results[0]
-                    qkt_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
 
-                    # Create zero-initialized accumulator for the contraction
-                    qkt_acc_values = np.zeros((wg_rows, tile_size_value), dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
-                    qkt_acc_attr = ir.DenseElementsAttr.get(qkt_acc_values, type=qkt_type)
-                    qkt_acc = arith.constant(qkt_type, qkt_acc_attr)
+                    # Constants for K/V tiling (tile into chunks of 16)
+                    k_subtile_size = 16
+                    num_k_tiles = tile_size_value // k_subtile_size
 
-                    # Create affine maps for the contraction
+                    # Create offset constants for each K tile
+                    k_tile_offsets = []
+                    for i in range(num_k_tiles):
+                        offset = arith.constant(index_type, i * k_subtile_size)
+                        k_tile_offsets.append(offset)
+
+                    # Step 1: Load and process K tiles (unrolled)
+                    # Each K tile is [16, d_head], transposed to [d_head, 16], contracted to [wg_rows, 16]
+                    qkt_chunks = []
+
+                    # Create affine maps for Q@K contraction (used for all tiles)
                     affine_d0 = ir.AffineExpr.get_dim(0)
                     affine_d1 = ir.AffineExpr.get_dim(1)
                     affine_d2 = ir.AffineExpr.get_dim(2)
 
-                    # Map for Q: (i, j, k) -> (i, k)
                     q_map = ir.AffineMap.get(3, 0, [affine_d0, affine_d2])
-                    # Map for K_transpose: (i, j, k) -> (k, j)
                     k_map = ir.AffineMap.get(3, 0, [affine_d2, affine_d1])
-                    # Map for output QKT: (i, j, k) -> (i, j)
                     out_map = ir.AffineMap.get(3, 0, [affine_d0, affine_d1])
 
                     indexing_maps = ir.ArrayAttr.get([
@@ -223,24 +188,56 @@ class GenerateFusedAttention(
                         ir.Attribute.parse("#vector.iterator_type<reduction>")
                     ])
 
-                    qkt = vector.contract(
-                        qkt_type,
-                        q_value,
-                        k_transpose,
-                        qkt_acc,
-                        indexing_maps=indexing_maps,
-                        iterator_types=iterator_types
-                    )
-                    # print(f"qkt: {qkt}")
+                    # Accumulator for Q@K chunks
+                    qkt_chunk_type = ir.VectorType.get([wg_rows, k_subtile_size], element_type)
+                    qkt_chunk_acc_values = np.zeros((wg_rows, k_subtile_size), dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
+                    qkt_chunk_acc_attr = ir.DenseElementsAttr.get(qkt_chunk_acc_values, type=qkt_chunk_type)
+                    qkt_chunk_acc = arith.constant(qkt_chunk_type, qkt_chunk_acc_attr)
 
-                    # Step 3: Max reduction over the inner dimension of QKT
-                    # QKT shape: [wg_rows, tile_size]
-                    # Result shape: [wg_rows]
-                    # We need to compute max along dimension 1 (tile_size dimension)
+                    for tile_idx in range(num_k_tiles):
+                        # Compute the offset index for this tile
+                        k_tile_offset = arith.addi(loop_idx, k_tile_offsets[tile_idx])
 
+                        # Update indices for this K tile
+                        k_tile_indices = k_load_indices.copy()
+                        k_tile_indices[-2] = k_tile_offset
+
+                        # Load K tile: [16, d_head]
+                        k_tile_type = ir.VectorType.get([k_subtile_size, d_head], element_type)
+                        k_tile = vector.TransferReadOp(
+                            k_tile_type,
+                            k_memref,
+                            k_tile_indices,
+                            k_perm_map,
+                            padding,
+                            in_bounds=in_bounds
+                        ).result
+
+                        # Transpose K tile: [16, d_head] -> [d_head, 16]
+                        k_transpose_type = ir.VectorType.get([d_head, k_subtile_size], element_type)
+                        k_transpose = vector.transpose(k_transpose_type, k_tile, [1, 0])
+
+                        # Contract Q @ K_transpose: [wg_rows, d_head] @ [d_head, 16] -> [wg_rows, 16]
+                        qkt_chunk = vector.contract(
+                            qkt_chunk_type,
+                            q_value,
+                            k_transpose,
+                            qkt_chunk_acc,
+                            indexing_maps=indexing_maps,
+                            iterator_types=iterator_types
+                        )
+                        qkt_chunks.append(qkt_chunk)
+
+                    # Step 2: Elementwise maximum across all Q@K chunks
+                    # Build tree of maximumf operations
+                    qkt_max_combined = qkt_chunks[0]
+                    for i in range(1, num_k_tiles):
+                        qkt_max_combined = arith.maximumf(qkt_max_combined, qkt_chunks[i])
+
+                    # Step 3: Final multi_reduction to get row-wise max: [wg_rows, 16] -> [wg_rows]
                     qkt_max = vector.multi_reduction(
                         kind="maxnumf",
-                        source=qkt,
+                        source=qkt_max_combined,
                         acc=m_i_init,
                         reduction_dims=[1]
                     )
@@ -253,31 +250,41 @@ class GenerateFusedAttention(
                     # Both have shape [wg_rows]
                     m_ij = arith.maximumf(m_i, qkt_max_scaled)
 
-                    # Step 6: Scale QKT matrix: qkt_scaled = qkt * scale_2d
-                    # Need to broadcast scale from [wg_rows] to [wg_rows, tile_size]
-                    scale_2d_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
-                    scale_2d_values = np.full((wg_rows, tile_size_value), scale_value, dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
-                    scale_2d_attr = ir.DenseElementsAttr.get(scale_2d_values, type=scale_2d_type)
-                    scale_2d = arith.constant(scale_2d_type, scale_2d_attr)
-                    qkt_scaled = arith.mulf(qkt, scale_2d)
+                    # Step 6-9: Apply softmax to each Q@K chunk
+                    # Scale constant for chunks: [wg_rows, 16]
+                    scale_chunk_type = ir.VectorType.get([wg_rows, k_subtile_size], element_type)
+                    scale_chunk_values = np.full((wg_rows, k_subtile_size), scale_value, dtype=np.float16 if element_type == ir.F16Type.get() else np.float32)
+                    scale_chunk_attr = ir.DenseElementsAttr.get(scale_chunk_values, type=scale_chunk_type)
+                    scale_chunk = arith.constant(scale_chunk_type, scale_chunk_attr)
 
-                    # Step 7: Broadcast m_ij from [wg_rows] to [wg_rows, tile_size]
-                    m_ij_bcasted_type = ir.VectorType.get([tile_size_value, wg_rows], element_type)
+                    # Broadcast m_ij from [wg_rows] to [wg_rows, 16]
+                    m_ij_bcasted_type = ir.VectorType.get([k_subtile_size, wg_rows], element_type)
                     m_ij_bcasted = vector.broadcast(m_ij_bcasted_type, m_ij)
-                    m_ij_transposed_type = ir.VectorType.get([wg_rows, tile_size_value], element_type)
+                    m_ij_transposed_type = ir.VectorType.get([wg_rows, k_subtile_size], element_type)
                     m_ij_transposed = vector.transpose(m_ij_transposed_type, m_ij_bcasted, [1, 0])
 
-                    # Step 8: Center the scores: qkt_centered = qkt_scaled - m_ij_transposed
-                    qkt_centered = arith.subf(qkt_scaled, m_ij_transposed)
+                    # Apply softmax to each chunk
+                    qkt_exp_chunks = []
+                    for qkt_chunk in qkt_chunks:
+                        # Scale: qkt_scaled = qkt_chunk * scale
+                        qkt_scaled = arith.mulf(qkt_chunk, scale_chunk)
 
-                    # Step 9: Compute exponential: qkt_exp = exp(qkt_centered)
-                    qkt_exp = math.exp(qkt_centered)
+                        # Center: qkt_centered = qkt_scaled - m_ij_transposed
+                        qkt_centered = arith.subf(qkt_scaled, m_ij_transposed)
 
-                    # Step 10: Sum reduction along inner dimension: l_ij = sum(qkt_exp, dim=1)
-                    # Shape [wg_rows, tile_size] -> [wg_rows]
+                        # Exponential: qkt_exp = exp(qkt_centered)
+                        qkt_exp = math.exp(qkt_centered)
+                        qkt_exp_chunks.append(qkt_exp)
+
+                    # Step 10: Elementwise sum across all exp chunks
+                    qkt_exp_combined = qkt_exp_chunks[0]
+                    for i in range(1, num_k_tiles):
+                        qkt_exp_combined = arith.addf(qkt_exp_combined, qkt_exp_chunks[i])
+
+                    # Final multi_reduction to get row-wise sum: [wg_rows, 16] -> [wg_rows]
                     l_ij = vector.multi_reduction(
                         kind="add",
-                        source=qkt_exp,
+                        source=qkt_exp_combined,
                         acc=l_i_init,
                         reduction_dims=[1]
                     )
@@ -299,53 +306,17 @@ class GenerateFusedAttention(
                     # Step 14: Update accumulator: acc_updated = acc * alpha_bcasted
                     acc_updated = arith.mulf(acc, alpha_transposed)
 
-                    # Step 15: Load the current V tile: shape [tile_size, d_head]
-                    # Use the same memref and indices as v_load, but replace second-to-last index with loop_idx
+                    # Step 15-16: Load V tiles and compute attention-weighted values
+                    # Get V load parameters
                     v_memref = v_load_op.operands[0]
-                    v_tile_type = ir.VectorType.get([tile_size_value, d_head], element_type)
-
-                    # Get the indices from original v_load (all operands except the first one which is the memref)
-                    # and the last one which is the padding value
                     v_load_indices = list(v_load_op.operands[1:-1])
-
-                    # Replace the second-to-last index with loop_idx
-                    v_tile_indices = v_load_indices
-                    v_tile_indices[-2] = loop_idx  # Assuming the reduction dimension is the second-to-last index
-
-                    # Get the padding value (last operand of v_load)
                     v_padding = v_load_op.operands[-1]
-
-                    # Get in_bounds attribute if it exists
                     v_in_bounds = v_load_op.attributes.get("in_bounds", None)
-
                     v_perm_map = v_load_op.attributes.get("permutation_map", None)
 
-                    # Create vector.transfer_read for V tile
-                    v_tile = vector.TransferReadOp(
-                        v_tile_type,
-                        v_memref,
-                        v_load_indices,
-                        v_perm_map,
-                        v_padding,
-                        in_bounds=v_in_bounds
-                    ).result
-
-                    # Step 16: Compute attention-weighted values: pv_out = qkt_exp @ v_tile
-                    # qkt_exp shape: [wg_rows, tile_size]
-                    # v_tile shape: [tile_size, d_head]
-                    # Output shape: [wg_rows, d_head]
-                    # Contraction: qkt_exp[i, k] * v_tile[k, j] -> pv_out[i, j]
-
-                    # Create affine maps for the contraction
-                    affine_d0 = ir.AffineExpr.get_dim(0)
-                    affine_d1 = ir.AffineExpr.get_dim(1)
-                    affine_d2 = ir.AffineExpr.get_dim(2)
-
-                    # Map for qkt_exp: (i, j, k) -> (i, k)
+                    # Create affine maps for P@V contraction
                     qkt_exp_map = ir.AffineMap.get(3, 0, [affine_d0, affine_d2])
-                    # Map for v_tile: (i, j, k) -> (k, j)
                     v_map = ir.AffineMap.get(3, 0, [affine_d2, affine_d1])
-                    # Map for output pv_out: (i, j, k) -> (i, j)
                     pv_out_map = ir.AffineMap.get(3, 0, [affine_d0, affine_d1])
 
                     indexing_maps_pv = ir.ArrayAttr.get([
@@ -360,14 +331,37 @@ class GenerateFusedAttention(
                         ir.Attribute.parse("#vector.iterator_type<reduction>")
                     ])
 
-                    pv_out = vector.contract(
-                        acc_vector_type,
-                        qkt_exp,
-                        v_tile,
-                        acc_updated,
-                        indexing_maps=indexing_maps_pv,
-                        iterator_types=iterator_types_pv
-                    )
+                    # Load and process V tiles (unrolled), accumulating results
+                    pv_out = acc_updated
+                    for tile_idx in range(num_k_tiles):
+                        # Compute the offset index for this V tile
+                        v_tile_offset = arith.addi(loop_idx, k_tile_offsets[tile_idx])
+
+                        # Update indices for this V tile
+                        v_tile_indices = v_load_indices.copy()
+                        v_tile_indices[-2] = v_tile_offset
+
+                        # Load V tile: [16, d_head]
+                        v_tile_type = ir.VectorType.get([k_subtile_size, d_head], element_type)
+                        v_tile = vector.TransferReadOp(
+                            v_tile_type,
+                            v_memref,
+                            v_tile_indices,
+                            v_perm_map,
+                            v_padding,
+                            in_bounds=v_in_bounds
+                        ).result
+
+                        # Contract qkt_exp_chunk @ v_tile: [wg_rows, 16] @ [16, d_head] -> [wg_rows, d_head]
+                        # Accumulate into pv_out
+                        pv_out = vector.contract(
+                            acc_vector_type,
+                            qkt_exp_chunks[tile_idx],
+                            v_tile,
+                            pv_out,
+                            indexing_maps=indexing_maps_pv,
+                            iterator_types=iterator_types_pv
+                        )
 
                     # Yield the updated iter args
                     scf.yield_([m_ij, l_i_updated, pv_out])
