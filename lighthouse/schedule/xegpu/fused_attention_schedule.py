@@ -197,50 +197,6 @@ def bundle_xegpu_fused_attention_schedule(
     if stop_at_stage == "outer-tiled":
         raise PipelineInterrupt()
 
-    # Match Q, K, V slices inside the forall loop
-    # K slice is the first operand of the transpose op
-    transpose_op = match_and_split(forall_loop, ops={"linalg.transpose"}, nhandles=1)[0]
-    k_slice = transform.get_producer_of_operand(anytype, transpose_op, operand_number=0)
-    # Q slice is the first operand of the first batch matmul
-    batch_matmuls = match_and_split(
-        forall_loop, ops={"linalg.batch_matmul"}, nhandles=2
-    )
-    q_slice = transform.get_producer_of_operand(
-        anytype, batch_matmuls[0], operand_number=0
-    )
-    # V slice is the second operand of the last batch matmul (inside the forall loop)
-    # Need to match the tiled version of the last matmul inside the loop
-    last_matmul = batch_matmuls[1]
-    v_slice = transform.get_producer_of_operand(anytype, last_matmul, operand_number=1)
-
-    # Match the scaling operation (linalg.mul) to get the scaling factor
-    # The QK output is scaled before softmax: QK * scale
-    mul_op = match_and_split(forall_loop, ops={"linalg.mul"}, nhandles=1)[0]
-    scale_slice = transform.get_producer_of_operand(anytype, mul_op, operand_number=1)
-    # transform.print_(target=k_slice, name="k_slice")
-    # transform.print_(target=q_slice, name="q_slice")
-    # transform.print_(target=v_slice, name="v_slice")
-    # transform.print_(target=scale_slice, name="scale_slice")
-    # transform.print_(target=last_matmul, name="tiled_attention_weights_v_matmul")
-
-    # Generate fused attention computation with inner tiling (flash attention)
-    # This replaces the current unfused computation with a tiled loop that
-    # maintains online max and sum for efficient memory usage
-    # tile_size = 64
-    # new_output = generate_fused_attention(
-    #     q_slice=q_slice,
-    #     k_slice=k_slice,
-    #     scale_slice=scale_slice,
-    #     v_slice=v_slice,
-    #     output=last_matmul,
-    #     tile_size=tile_size,
-    # )
-    # transform.apply_cse(func)
-    # canonicalize(func)
-
-    if stop_at_stage == "inner-tiled":
-        raise PipelineInterrupt()
-
     # vectorize
     func = structured.VectorizeChildrenAndApplyPatternsOp(
         func,
@@ -293,35 +249,33 @@ def bundle_xegpu_fused_attention_schedule(
     # Its first operand is the q load (vector.transfer_read)
     # Its second operand is the k load (vector.transfer_read)
     first_contract = contract_ops[0]
-    q_load = transform.get_producer_of_operand(anytype, first_contract, operand_number=0)
-    k_load = transform.get_producer_of_operand(anytype, first_contract, operand_number=1)
+    q_load = transform.get_producer_of_operand(
+        anytype, first_contract, operand_number=0
+    )
+    k_load = transform.get_producer_of_operand(
+        anytype, first_contract, operand_number=1
+    )
 
     # # Second vector.contract is attention_weights @ V
     # # Its second operand is the v load (vector.transfer_read)
     second_contract = contract_ops[1]
-    v_load = transform.get_producer_of_operand(anytype, second_contract, operand_number=1)
-
-    # Extract memrefs from the loads (first operand of vector.transfer_read)
-    # q_memref = transform.get_operand(anytype, q_load, [0])
-    # k_memref = transform.get_operand(anytype, k_load, [0])
-    # v_memref = transform.get_operand(anytype, v_load, [0])
+    v_load = transform.get_producer_of_operand(
+        anytype, second_contract, operand_number=1
+    )
 
     # Match arith.mulf to get the scale parameter
     # The scale is the second operand of arith.mulf (the constant)
     mulf_op = match_and_split(func, ops={"arith.mulf"}, nhandles=1)[0]
     scale = transform.get_producer_of_operand(anytype, mulf_op, operand_number=1)
 
-    # Debug prints to verify we got the right memrefs and scale
-    # transform.print_(target=q_load, name="q_memref")
-    # transform.print_(target=k_load, name="k_memref")
-    # transform.print_(target=v_load, name="v_memref")
-    # transform.print_(target=scale, name="scale")
+    if stop_at_stage == "bufferized":
+        raise PipelineInterrupt()
 
     # Generate fused attention computation with inner tiling
     # This replaces the second vector.contract (attention_weights @ V) with a tiled
     # loop that implements online softmax for efficient memory usage
     tile_size = 64  # Tile size for reduction dimension (K/V sequence length)
-    new_output = generate_fused_attention(
+    generate_fused_attention(
         q_load=q_load,
         k_load=k_load,
         v_load=v_load,
@@ -332,7 +286,7 @@ def bundle_xegpu_fused_attention_schedule(
     transform.apply_cse(func)
     canonicalize(func)
 
-    if stop_at_stage == "bufferized":
+    if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()
 
     # convert forall to parallel
@@ -412,7 +366,6 @@ def bundle_xegpu_fused_attention_schedule(
     out_sg_data = q_sg_data
     out_inst_data = q_inst_data
 
-
     layout_128x16_sg_layout = [8, 1]
     layout_128x16_sg_data = [16, 16]
     layout_128x16_inst_data = [8, 16]
@@ -423,17 +376,19 @@ def bundle_xegpu_fused_attention_schedule(
 
     # Set layout attributes for xegpu.store_nd ops.
     store_nd_op = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)[0]
-    xegpu.set_anchor_layout(store_nd_op, sg_layout=out_sg_layout, sg_data=out_sg_data, inst_data=out_inst_data)
+    xegpu.set_anchor_layout(
+        store_nd_op,
+        sg_layout=out_sg_layout,
+        sg_data=out_sg_data,
+        inst_data=out_inst_data,
+    )
 
     # Set layout for xegpu.load_nd ops (9 total: 1 Q, 4 K, 4 V)
     load_nd_ops = match_and_split(gpu_func, ops={"xegpu.load_nd"}, nhandles=9)
 
     # First load_nd: Q layout
     xegpu.set_anchor_layout(
-        load_nd_ops[0],
-        sg_layout=q_sg_layout,
-        sg_data=q_sg_data,
-        inst_data=q_inst_data
+        load_nd_ops[0], sg_layout=q_sg_layout, sg_data=q_sg_data, inst_data=q_inst_data
     )
 
     # Next 4 load_nd ops: K layout
@@ -442,7 +397,7 @@ def bundle_xegpu_fused_attention_schedule(
             load_nd_ops[i],
             sg_layout=k_sg_layout,
             sg_data=k_sg_data,
-            inst_data=k_inst_data
+            inst_data=k_inst_data,
         )
 
     # Last 4 load_nd ops: V layout
@@ -451,7 +406,7 @@ def bundle_xegpu_fused_attention_schedule(
             load_nd_ops[i],
             sg_layout=v_sg_layout,
             sg_data=v_sg_data,
-            inst_data=v_inst_data
+            inst_data=v_inst_data,
         )
 
     # Set layout for xegpu.dpas ops (8 total: 4 for Q@K, 4 for P@V)
@@ -466,7 +421,7 @@ def bundle_xegpu_fused_attention_schedule(
             sg_layout=q_sg_layout,
             sg_data=q_sg_data,
             inst_data=q_inst_data,
-            index=0
+            index=0,
         )
         # Index 1: K^T layout
         xegpu.set_anchor_layout(
@@ -475,7 +430,7 @@ def bundle_xegpu_fused_attention_schedule(
             sg_data=kt_sg_data,
             inst_data=kt_inst_data,
             order=kt_order,
-            index=1
+            index=1,
         )
         # Index 2: QK output layout (128x16)
         xegpu.set_anchor_layout(
@@ -483,7 +438,7 @@ def bundle_xegpu_fused_attention_schedule(
             sg_layout=layout_128x16_sg_layout,
             sg_data=layout_128x16_sg_data,
             inst_data=layout_128x16_inst_data,
-            index=2
+            index=2,
         )
 
     # Layouts for second 4 dpas ops (P@V):
@@ -495,7 +450,7 @@ def bundle_xegpu_fused_attention_schedule(
             sg_layout=qk_sg_layout,
             sg_data=qk_sg_data,
             inst_data=qk_inst_data,
-            index=0
+            index=0,
         )
         # Index 1: V layout
         xegpu.set_anchor_layout(
@@ -503,7 +458,7 @@ def bundle_xegpu_fused_attention_schedule(
             sg_layout=v_sg_layout,
             sg_data=v_sg_data,
             inst_data=v_inst_data,
-            index=1
+            index=1,
         )
         # Index 2: Output layout
         xegpu.set_anchor_layout(
@@ -511,7 +466,7 @@ def bundle_xegpu_fused_attention_schedule(
             sg_layout=out_sg_layout,
             sg_data=out_sg_data,
             inst_data=out_inst_data,
-            index=2
+            index=2,
         )
 
     if stop_at_stage == "xegpu-wg":
