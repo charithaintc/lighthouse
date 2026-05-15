@@ -274,7 +274,9 @@ def bundle_xegpu_fused_attention_schedule(
     # Generate fused attention computation with inner tiling
     # This replaces the second vector.contract (attention_weights @ V) with a tiled
     # loop that implements online softmax for efficient memory usage
-    tile_size = 64  # Tile size for reduction dimension (K/V sequence length)
+    tile_size = parameters.get(
+        "inner_loop_tile_size", 64
+    )  # Tile size for reduction dimension (K/V sequence length)
     generate_fused_attention(
         q_load=q_load,
         k_load=k_load,

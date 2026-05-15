@@ -240,6 +240,12 @@ def parse_cli():
         help="Subgroup size",
     )
     parser.add_argument(
+        "--inner-loop-tile-size",
+        type=int,
+        default=64,
+        help="Tile size for the inner reduction dimension (K/V sequence length)",
+    )
+    parser.add_argument(
         "--nruns",
         type=int,
         default=1000,
@@ -300,6 +306,7 @@ if __name__ == "__main__":
         "wg_rows": args.wg_rows,
         "sg_rows": args.sg_rows,
         "subgroup_size": args.subgroup_size,
+        "inner_loop_tile_size": args.inner_loop_tile_size,
     }
 
     Z = args.batch_size
