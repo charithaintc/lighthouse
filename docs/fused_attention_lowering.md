@@ -310,8 +310,6 @@ func.func @payload(%arg_output: memref<2x8x4096x64xf16>,
 
 ## Stage 6: Inner Tiling for Fused Attention (Online Softmax)
 
-This is the **Flash Attention** optimization.
-
 1. Implements "online" softmax to avoid materializing the full attention matrix.
 2. Tile the K and V loads into `16 x d_head` and interleave with DPAS for lower register preassure.
 
