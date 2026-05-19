@@ -48,10 +48,12 @@ This document describes the multi-stage lowering process for standard attention 
 ### Softmax Decomposition
 The atomic `linalg.softmax` is decomposed into explicit operations:
 
-**Why decompose so early? :** Softmax operation did not work well tile and fuse.
+**Why decompose so early? :**
+Softmax operation did not work well with tile and fuse.
 If last matmul is tiled and then if we try to fuse softmax into the `scf.forall`
 It does not **bubble-up** the `tensor.extract_slice`. instead entire softmax is
-done first (including parallel dims) and the extracted from the softmax result.
+done first (including parallel dims) and then extractions are done from the result to
+feed into the last matmul.
 
 ```mlir
 // 1. Find max value per row (for numerical stability)
