@@ -88,6 +88,8 @@ def bundle_xegpu_fused_attention_schedule(
 ) -> ir.Value[transform.AnyOpType]:
     """Schedule for lowering fused attention payload to xegpu wg level."""
 
+    transform.print_(target=mod, name="Initial standard attention:")
+
     if stop_at_stage == "initial":
         raise PipelineInterrupt()
 
@@ -136,6 +138,11 @@ def bundle_xegpu_fused_attention_schedule(
     structured.structured_decompose_interface(anytype, softmax_op)
     transform.apply_cse(func)
     canonicalize(func)
+
+    transform.print_(
+        target=func,
+        name="After tiling and fusing batch dimension, and softmax decomposition:",
+    )
 
     # Fuse all linalg.generic ops from softmax decomposition (4 ops: max, sub+exp, sum, div)
     # Match and fuse in reverse order (from consumer to producer)
@@ -194,6 +201,10 @@ def bundle_xegpu_fused_attention_schedule(
     transform.apply_cse(func)
     canonicalize(func)
 
+    transform.print_(
+        target=func, name="After tiling and fustion of batch and head dimensions:"
+    )
+
     if stop_at_stage == "outer-tiled":
         raise PipelineInterrupt()
 
@@ -209,6 +220,8 @@ def bundle_xegpu_fused_attention_schedule(
         apply_patterns_vector_cast_away_vector_leading_one_dim()
         apply_patterns_vector_drop_unit_dims_with_shape_cast()
 
+    transform.print_(target=func, name="After vectorization:")
+
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
 
@@ -223,6 +236,10 @@ def bundle_xegpu_fused_attention_schedule(
     ).result
     transform.apply_cse(mod)
     canonicalize(mod)
+
+    transform.print_(target=mod, name="After bufferization:")
+    if stop_at_stage == "bufferized":
+        raise PipelineInterrupt()
     # fold memref.subviews into vector.transfer_read/write ops
     mod = apply_registered_pass(mod, "fold-memref-alias-ops")
     transform.apply_cse(mod)
@@ -268,9 +285,6 @@ def bundle_xegpu_fused_attention_schedule(
     mulf_op = match_and_split(func, ops={"arith.mulf"}, nhandles=1)[0]
     scale = transform.get_producer_of_operand(anytype, mulf_op, operand_number=1)
 
-    if stop_at_stage == "bufferized":
-        raise PipelineInterrupt()
-
     # Generate fused attention computation with inner tiling
     # This replaces the second vector.contract (attention_weights @ V) with a tiled
     # loop that implements online softmax for efficient memory usage
@@ -287,6 +301,9 @@ def bundle_xegpu_fused_attention_schedule(
     )
     transform.apply_cse(func)
     canonicalize(func)
+    transform.print_(
+        target=func, name="After generating fused attention with inner tiling:"
+    )
 
     if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()
@@ -320,6 +337,8 @@ def bundle_xegpu_fused_attention_schedule(
     mod = apply_registered_pass(mod, "gpu-kernel-outlining")
     transform.apply_cse(mod)
 
+    transform.print_(target=mod, name="After GPU outlining:")
+
     if stop_at_stage == "gpu-outlining":
         raise PipelineInterrupt()
 
@@ -342,6 +361,8 @@ def bundle_xegpu_fused_attention_schedule(
         gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
         transform.apply_cse(gpu_func)
         gpu_func = apply_registered_pass(gpu_func, "loop-invariant-code-motion")
+
+    transform.print_(target=gpu_func, name="After converting vector to xegpu:")
 
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
@@ -471,7 +492,7 @@ def bundle_xegpu_fused_attention_schedule(
             inst_data=out_inst_data,
             index=2,
         )
-
+    transform.print_(target=gpu_func, name="After setting xegpu layouts:")
     if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()
 
