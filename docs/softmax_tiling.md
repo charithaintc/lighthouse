@@ -178,14 +178,33 @@ func.func @softmax_v0(%arg0: memref<64x1024xf32>, %arg1: memref<64x1024xf32>) {
 
 **What happens:** The max reduction and sum reduction are fused into a single pass over the data using the "online softmax" algorithm. This algorithm maintains running max and running sum values, applying a correction factor when the max changes.
 
-**Algorithm:**
-```
-For each element x in the row:
-  new_max = max(current_max, x)
-  correction = exp(old_max - new_max)
-  corrected_sum = current_sum * correction
-  new_sum = corrected_sum + exp(x - new_max)
-```
+**Why this works?**
+
+Consider the reduction loop at an arbitrary stage $i$. We have access to:
+
+$$m_{i-1} = \max(x_0, x_1, \ldots, x_{i-1})$$
+
+$$s_{i-1} = \sum_{j=0}^{i-1} \exp(x_j - m_{i-1})$$
+
+When we process element $x_i$, we first compute the updated max:
+
+$$m_i = \max(m_{i-1}, x_i)$$
+
+Now we need to compute the updated sum. The challenge is that $s_{i-1}$ was computed with respect to $m_{i-1}$, but we need the sum with respect to the new max $m_i$.
+
+Using the property $\exp(a - b) = \frac{\exp(a)}{\exp(b)} = \exp(a) \cdot \exp(-b)$, we can rewrite each term:
+
+$$\exp(x_j - m_i) = \exp(x_j - m_{i-1} - (m_i - m_{i-1})) = \exp(x_j - m_{i-1}) \cdot \exp(m_{i-1} - m_i)$$
+
+Since multiplication distributes over addition, we can factor out the correction term from the entire sum:
+
+$$\sum_{j=0}^{i-1} \exp(x_j - m_i) = \exp(m_{i-1} - m_i) \cdot \sum_{j=0}^{i-1} \exp(x_j - m_{i-1}) = \exp(m_{i-1} - m_i) \cdot s_{i-1}$$
+
+Therefore, the corrected sum at stage $i$ is:
+
+$$s_i = \exp(m_{i-1} - m_i) \cdot s_{i-1} + \exp(x_i - m_i)$$
+
+This shows that we can maintain running max and sum values in a single pass, applying a multiplicative correction factor $\exp(m_{i-1} - m_i)$ whenever the max changes.
 
 ```mlir
 #map = affine_map<(d0, d1) -> (d0, d1)>
