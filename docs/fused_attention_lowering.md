@@ -705,15 +705,6 @@ xegpu.store_nd %output_normalized, %output_tdesc[%row_offset, 0] <{
 }> : vector<128x64xf16>, !xegpu.tensor_desc<128x64xf16, ...>
 ```
 
-### GPU Target Attribute
-
-```mlir
-gpu.module @payload_kernel [#xevm.target<O = 3>] {
-  // O = 3 specifies optimization level 3
-  gpu.func @payload_kernel(...) kernel { ... }
-}
-```
-
 ---
 
 ## Conclusion
