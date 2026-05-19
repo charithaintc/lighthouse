@@ -258,3 +258,62 @@ func.func @softmax_v2(%arg0: memref<64x1024xf32>, %arg1: memref<64x1024xf32>) {
     return
 }
 ```
+
+---
+
+## Does This Always Work?
+
+**Short answer:** No. The online correction technique only works when the correction can be applied distributively over the aggregation operation.
+
+### Why Softmax Works
+
+The key to the online softmax algorithm is that **multiplication distributes over addition**:
+
+$$c \cdot (a + b) = c \cdot a + c \cdot b$$
+
+Combined with the exponential property $\exp(a - b) = \exp(a) \cdot \exp(-b)$, this allows us to apply a multiplicative correction factor to the entire accumulated sum.
+
+### A Counter-Example: What If There Was No Exp?
+
+Consider a hypothetical variant where we want to compute:
+
+$$\text{result}_j = \frac{x_j - m}{s}$$
+
+where $m = \max_k x_k$ and $s = \sum_k (x_k - m)$.
+
+Can we fuse the max and sum reductions using online correction? Let's try:
+
+At stage $i$, we have:
+- $m_{i-1} = \max(x_0, x_1, \ldots, x_{i-1})$
+- $s_{i-1} = \sum_{j=0}^{i-1} (x_j - m_{i-1})$
+
+When processing $x_i$:
+- $m_i = \max(m_{i-1}, x_i)$
+
+To correct $s_{i-1}$ for the new max $m_i$, we need:
+
+$$s_i = \sum_{j=0}^{i-1} (x_j - m_i) + (x_i - m_i)$$
+
+Expanding the first term:
+
+$$\sum_{j=0}^{i-1} (x_j - m_i) = \sum_{j=0}^{i-1} (x_j - m_{i-1} - (m_i - m_{i-1}))$$
+
+$$= \sum_{j=0}^{i-1} (x_j - m_{i-1}) - \sum_{j=0}^{i-1} (m_i - m_{i-1})$$
+
+$$= s_{i-1} - i \cdot (m_i - m_{i-1})$$
+
+**The problem:** To correct $s_{i-1}$, we need to subtract $(m_i - m_{i-1})$ from each of the $i$ terms we've seen so far. This requires knowing the count $i$ and performing $i$ subtractions worth of correction. **This is not possibel at linalg level** (maybe its possible when we materialize the loops?)
+
+**Why subtraction doesn't work:** Subtraction is **not distributive** over addition in the way we need:
+
+$(a + b) - c \neq (a - c) + (b - c)$ when we want a single correction
+
+We would need to track both the sum and the count of elements, and the correction becomes additive rather than multiplicative: $s_i = s_{i-1} - i \cdot \Delta m$, where the correction depends on how many elements we've processed.
+
+### General Principle
+
+The online correction technique works when:
+
+1. **The operation allows factoring out corrections**: The transformation applied to each element (like $\exp(x - m)$) can be rewritten to separate the correction term
+2. **The correction is distributive over the reduction**: The correction can be applied to the accumulated result as a whole, not element-by-element
+3. **The correction is independent of cardinality**: We don't need to know how many elements contributed to the partial result
