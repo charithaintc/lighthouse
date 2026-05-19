@@ -48,7 +48,7 @@ This document describes the multi-stage lowering process for standard attention 
 ### Softmax Decomposition
 The atomic `linalg.softmax` is decomposed into explicit operations:
 
-**Why decompose so early? :**
+#### **Why decompose so early? :**
 Softmax operation did not work well with tile and fuse.
 If last matmul is tiled and then if we try to fuse softmax into the `scf.forall`
 It does not **bubble-up** the `tensor.extract_slice`. instead entire softmax is
