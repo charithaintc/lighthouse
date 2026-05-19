@@ -24,7 +24,7 @@ This document describes the multi-stage lowering process for standard attention 
   outs(%empty_kt : tensor<16x64x4096xf16>) permutation = [0, 2, 1]
 
 // Q @ K^T: [16, 4096, 64] @ [16, 64, 4096] -> [16, 4096, 4096]
-%qk_scores = linalg.batch_matmul ins(%q_3d, %k_transposed : ...) 
+%qk_scores = linalg.batch_matmul ins(%q_3d, %k_transposed : ...)
   outs(%qk_init : tensor<16x4096x4096xf16>) -> tensor<16x4096x4096xf16>
 
 // Scale by 1/sqrt(d_k) = 0.125
@@ -36,22 +36,16 @@ This document describes the multi-stage lowering process for standard attention 
   -> tensor<16x4096x4096xf16>
 
 // Attention @ V: [16, 4096, 4096] @ [16, 4096, 64] -> [16, 4096, 64]
-%output = linalg.batch_matmul ins(%attention_weights, %v_3d : ...) 
+%output = linalg.batch_matmul ins(%attention_weights, %v_3d : ...)
   outs(%output_init : tensor<16x4096x64xf16>) -> tensor<16x4096x64xf16>
 ```
-
-**Characteristics**:
-- Materializes full attention matrix `[16, 4096, 4096]` in memory
-- Sequential operations with clear dependencies
-- Single monolithic softmax operation
 
 ---
 
 ## Stage 2: Tiling and Softmax Decomposition
 
-### Major Changes
 
-#### Softmax Decomposition
+### Softmax Decomposition
 The atomic `linalg.softmax` is decomposed into explicit operations:
 
 ```mlir
@@ -93,17 +87,17 @@ The atomic `linalg.softmax` is decomposed into explicit operations:
 } -> tensor<16x4096x4096xf16>
 ```
 
-#### Tiling the Output Dimension
+### Tiling the Output Dimension
 
 The second matmul (attention @ V) is tiled into 32 tiles of size 128:
 
 ```mlir
-%output = scf.forall (%batch_head_idx, %tile_idx) in (16, 32) 
+%output = scf.forall (%batch_head_idx, %tile_idx) in (16, 32)
     shared_outs(%out_accumulator = %output_init) -> (tensor<16x4096x64xf16>) {
   %row_offset = affine.apply affine_map<(d0) -> (d0 * 128)>(%tile_idx)
 
   // Extract 128 rows of attention weights: [1, 128, 4096]
-  %attention_tile = tensor.extract_slice %attention_weights[%batch_head_idx, %row_offset, 0] 
+  %attention_tile = tensor.extract_slice %attention_weights[%batch_head_idx, %row_offset, 0]
     [1, 128, 4096] [1, 1, 1] : tensor<16x4096x4096xf16> to tensor<1x128x4096xf16>
 
   // Extract all of V: [1, 4096, 64]
@@ -115,13 +109,11 @@ The second matmul (attention @ V) is tiled into 32 tiles of size 128:
     outs(%partial_init : tensor<1x128x64xf16>) -> tensor<1x128x64xf16>
 
   scf.forall.in_parallel {
-    tensor.parallel_insert_slice %partial_output into %out_accumulator[%batch_head_idx, %row_offset, 0] 
+    tensor.parallel_insert_slice %partial_output into %out_accumulator[%batch_head_idx, %row_offset, 0]
       [1, 128, 64] [1, 1, 1] : tensor<1x128x64xf16> into tensor<16x4096x64xf16>
   }
 }
 ```
-
-**Key Insight**: Still computes the full `4096×4096` attention matrix before the tiled second matmul.
 
 ---
 
@@ -132,7 +124,7 @@ The second matmul (attention @ V) is tiled into 32 tiles of size 128:
 The entire attention computation is now fused into a single parallel loop:
 
 ```mlir
-%output = scf.forall (%batch_head_idx, %tile_idx) in (16, 32) 
+%output = scf.forall (%batch_head_idx, %tile_idx) in (16, 32)
     shared_outs(%out_accumulator = %output_init) -> (tensor<16x4096x64xf16>) {
   %row_offset = affine.apply affine_map<(d0) -> (d0 * 128)>(%tile_idx)
 
@@ -145,7 +137,7 @@ The entire attention computation is now fused into a single parallel loop:
     : tensor<16x4096x64xf16> to tensor<1x4096x64xf16>
 
   // Transpose K within tile
-  %k_tile_transposed = linalg.transpose ins(%k_tile : tensor<1x4096x64xf16>) 
+  %k_tile_transposed = linalg.transpose ins(%k_tile : tensor<1x4096x64xf16>)
     outs(%kt_init : tensor<1x64x4096xf16>) permutation = [0, 2, 1]
 
   // Q @ K^T: [1, 128, 64] @ [1, 64, 4096] -> [1, 128, 4096]
@@ -171,18 +163,18 @@ The entire attention computation is now fused into a single parallel loop:
     outs(%partial_init : tensor<1x128x64xf16>) -> tensor<1x128x64xf16>
 
   scf.forall.in_parallel {
-    tensor.parallel_insert_slice %partial_output into %out_accumulator[%batch_head_idx, %row_offset, 0] 
+    tensor.parallel_insert_slice %partial_output into %out_accumulator[%batch_head_idx, %row_offset, 0]
       [1, 128, 64] [1, 1, 1] : tensor<1x128x64xf16> into tensor<16x4096x64xf16>
   }
 }
 ```
 
-**Key Change**: Each workgroup now processes:
+Each workgroup now processes:
 - 128 rows of Q
 - All of K and V (still materializes `128×4096` attention matrix)
 - Produces 128 rows of output
 
-**Parallelism**: 16 × 32 = 512 independent workgroups
+16 × 32 = 512 independent workgroups
 
 ---
 
@@ -265,11 +257,9 @@ Linalg operations are converted to vector operations for SIMD execution.
   ],
   iterator_types = ["parallel", "parallel", "reduction"],
   kind = #vector.kind<add>
-} %attention_weights_vec, %v_vec, %zero_output_init : 
+} %attention_weights_vec, %v_vec, %zero_output_init :
   vector<128x4096xf16>, vector<4096x64xf16> into vector<128x64xf16>
 ```
-
-**Result**: All operations now use vector types, ready for SIMD hardware.
 
 ---
 
@@ -278,7 +268,7 @@ Linalg operations are converted to vector operations for SIMD execution.
 Tensors are converted to memrefs (in-place memory buffers):
 
 ```mlir
-func.func @payload(%arg_output: memref<2x8x4096x64xf16>, 
+func.func @payload(%arg_output: memref<2x8x4096x64xf16>,
                    %arg_q: memref<2x8x4096x64xf16>,
                    %arg_k: memref<2x8x4096x64xf16>,
                    %arg_v: memref<2x8x4096x64xf16>) {
@@ -298,7 +288,7 @@ func.func @payload(%arg_output: memref<2x8x4096x64xf16>,
 
   scf.forall (%batch_head_idx, %tile_idx) in (16, 32) {
     %row_offset = affine.apply affine_map<(d0) -> (d0 * 128)>(%tile_idx)
-    
+
     // Direct reads from memrefs
     %k_vec = vector.transfer_read %k_3d[%batch_head_idx, %c0, %c0], %poison
       : memref<16x4096x64xf16>, vector<4096x64xf16>
@@ -316,13 +306,14 @@ func.func @payload(%arg_output: memref<2x8x4096x64xf16>,
 }
 ```
 
-**Key Change**: No more tensor abstractions; direct memory operations.
-
 ---
 
 ## Stage 6: Inner Tiling for Fused Attention (Online Softmax)
 
-**This is the critical optimization** - implements "online" softmax to avoid materializing the full attention matrix.
+This is the **Flash Attention** optimization.
+
+1. Implements "online" softmax to avoid materializing the full attention matrix.
+2. Tile the K and V loads into `16 x d_head` and interleave with DPAS for lower register preassure.
 
 ### The Online Softmax Algorithm
 
@@ -347,7 +338,7 @@ Instead of computing the full `128×4096` attention matrix, we process K/V in ch
   %k_chunk_0 = vector.transfer_read %k_4d[%batch_idx, %head_idx, %kv_chunk_idx, %c0], %poison
     : memref<2x8x4096x64xf16>, vector<16x64xf16>
   %k_chunk_0_t = vector.transpose %k_chunk_0, [1, 0] : vector<16x64xf16> to vector<64x16xf16>
-  %qk_chunk_0 = vector.contract { ... } %q_vec, %k_chunk_0_t, %zero_init : 
+  %qk_chunk_0 = vector.contract { ... } %q_vec, %k_chunk_0_t, %zero_init :
     vector<128x64xf16>, vector<64x16xf16> -> vector<128x16xf16>
 
   // Chunk 1: columns [16:32] of K
@@ -376,7 +367,7 @@ Instead of computing the full `128×4096` attention matrix, we process K/V in ch
   %max_01 = arith.maximumf %qk_chunk_0, %qk_chunk_1 : vector<128x16xf16>
   %max_012 = arith.maximumf %max_01, %qk_chunk_2 : vector<128x16xf16>
   %max_0123 = arith.maximumf %max_012, %qk_chunk_3 : vector<128x16xf16>
-  %max_chunk_per_row = vector.multi_reduction <maxnumf>, %max_0123, %neg_inf_init [1] : 
+  %max_chunk_per_row = vector.multi_reduction <maxnumf>, %max_0123, %neg_inf_init [1] :
     vector<128x16xf16> -> vector<128xf16>
 
   // Scale and update running maximum
@@ -419,7 +410,7 @@ Instead of computing the full `128×4096` attention matrix, we process K/V in ch
   %sum_01 = arith.addf %exp_chunk_0, %exp_chunk_1 : vector<128x16xf16>
   %sum_012 = arith.addf %sum_01, %exp_chunk_2 : vector<128x16xf16>
   %sum_0123 = arith.addf %sum_012, %exp_chunk_3 : vector<128x16xf16>
-  %l_chunk = vector.multi_reduction <add>, %sum_0123, %zero_init [1] : 
+  %l_chunk = vector.multi_reduction <add>, %sum_0123, %zero_init [1] :
     vector<128x16xf16> -> vector<128xf16>
 
   // Correction factor for previous chunks: exp(m_old - m_new)
@@ -444,22 +435,22 @@ Instead of computing the full `128×4096` attention matrix, we process K/V in ch
     : memref<2x8x4096x64xf16>, vector<16x64xf16>
 
   // Accumulate: O += exp_chunk_0 @ V[0:16, :]
-  %O_partial_0 = vector.contract { ... } %exp_chunk_0, %v_chunk_0, %O_old_corrected : 
+  %O_partial_0 = vector.contract { ... } %exp_chunk_0, %v_chunk_0, %O_old_corrected :
     vector<128x16xf16>, vector<16x64xf16> -> vector<128x64xf16>
 
   // Accumulate: O += exp_chunk_1 @ V[16:32, :]
   %v_chunk_1 = vector.transfer_read %v_4d[%batch_idx, %head_idx, %k_offset_16, %c0], %poison
-  %O_partial_1 = vector.contract { ... } %exp_chunk_1, %v_chunk_1, %O_partial_0 : 
+  %O_partial_1 = vector.contract { ... } %exp_chunk_1, %v_chunk_1, %O_partial_0 :
     vector<128x16xf16>, vector<16x64xf16> -> vector<128x64xf16>
 
   // Accumulate: O += exp_chunk_2 @ V[32:48, :]
   %v_chunk_2 = vector.transfer_read %v_4d[%batch_idx, %head_idx, %k_offset_32, %c0], %poison
-  %O_partial_2 = vector.contract { ... } %exp_chunk_2, %v_chunk_2, %O_partial_1 : 
+  %O_partial_2 = vector.contract { ... } %exp_chunk_2, %v_chunk_2, %O_partial_1 :
     vector<128x16xf16>, vector<16x64xf16> -> vector<128x64xf16>
 
   // Accumulate: O += exp_chunk_3 @ V[48:64, :]
   %v_chunk_3 = vector.transfer_read %v_4d[%batch_idx, %head_idx, %k_offset_48, %c0], %poison
-  %O_new = vector.contract { ... } %exp_chunk_3, %v_chunk_3, %O_partial_2 : 
+  %O_new = vector.contract { ... } %exp_chunk_3, %v_chunk_3, %O_partial_2 :
     vector<128x16xf16>, vector<16x64xf16> -> vector<128x64xf16>
 
   scf.yield %m_new, %l_new, %O_new : vector<128xf16>, vector<128xf16>, vector<128x64xf16>
@@ -482,30 +473,19 @@ Instead of computing the full `128×4096` attention matrix, we process K/V in ch
 %output_normalized = arith.divf %O_accumulated, %l_final_broadcast : vector<128x64xf16>
 
 // Write result back to output buffer
-vector.transfer_write %output_normalized, %output_4d[%batch_idx, %head_idx, %row_offset, %c0] 
+vector.transfer_write %output_normalized, %output_4d[%batch_idx, %head_idx, %row_offset, %c0]
   {in_bounds = [true, true]} : vector<128x64xf16>, memref<2x8x4096x64xf16>
 ```
-
-### Memory Savings
-
-**Before**: `128 × 4096 × 2 bytes = 1 MB` per workgroup
-
-**After**:
-- `128 × 64 × 2 bytes = 16 KB` for partial QK^T (8 chunks of 128×16)
-- `128 × 64 × 2 bytes = 16 KB` for partial output
-- **Total: 32 KB** per workgroup
-
-**Reduction: 96.875%** — this enables processing much longer sequences!
 
 ---
 
 ## Stage 7: GPU Outlining
 
-The computation is extracted into a separate GPU kernel module:
+`scf.forall` loop is distirbuted to workgroups.
 
 ```mlir
 module attributes {gpu.container_module} {
-  func.func @payload(%arg_output: memref<2x8x4096x64xf16>, 
+  func.func @payload(%arg_output: memref<2x8x4096x64xf16>,
                      %arg_q: memref<2x8x4096x64xf16>,
                      %arg_k: memref<2x8x4096x64xf16>,
                      %arg_v: memref<2x8x4096x64xf16>) {
@@ -518,7 +498,7 @@ module attributes {gpu.container_module} {
     gpu.launch_func @payload_kernel::@payload_kernel
       blocks in (%c16, %c32, %c1)    // Grid: 16 × 32 × 1 (batch×head, seq_tiles, 1)
       threads in (%c128, %c1, %c1)   // Block: 128 × 1 × 1
-      args(%arg_q : memref<2x8x4096x64xf16>, 
+      args(%arg_q : memref<2x8x4096x64xf16>,
            %arg_k : memref<2x8x4096x64xf16>,
            %arg_v : memref<2x8x4096x64xf16>,
            %arg_output : memref<2x8x4096x64xf16>)
@@ -526,7 +506,7 @@ module attributes {gpu.container_module} {
   }
 
   gpu.module @payload_kernel {
-    gpu.func @payload_kernel(%q: memref<2x8x4096x64xf16>, 
+    gpu.func @payload_kernel(%q: memref<2x8x4096x64xf16>,
                              %k: memref<2x8x4096x64xf16>,
                              %v: memref<2x8x4096x64xf16>,
                              %output: memref<2x8x4096x64xf16>) kernel
@@ -554,7 +534,7 @@ module attributes {gpu.container_module} {
 **Grid Configuration**:
 - 16 blocks in X (2 batches × 8 heads)
 - 32 blocks in Y (4096 / 128 = 32 tiles)
-- Each block has 128 threads
+- Each block has 128 threads (8 subgroups)
 
 ---
 
@@ -612,11 +592,6 @@ The key hardware instruction for matrix multiplication:
   -> vector<128x16xf16>
 ```
 
-**DPAS Operation**:
-- Performs `C = A @ B + C` in hardware
-- Optimized for f16 on Intel GPUs
-- Systolic array execution
-
 ### XeGPU Store Operations
 
 ```mlir
@@ -635,14 +610,7 @@ xegpu.store_nd %output_normalized, %output_tdesc[%row_offset, 0]
 
 ## Stage 9: Setting XeGPU Layouts
 
-The final stage adds hardware-specific layout information for optimal data distribution across subgroups.
-
-### Layout Specification
-
-Layouts describe how data is distributed across:
-- **Subgroups (SG)**: Groups of threads that execute together
-- **SG Data**: Data assigned to each subgroup
-- **Inst Data**: Data processed by a single instruction
+Assign layouts for distributing to subgroups.
 
 ### Load Layout for Q (128×64)
 
@@ -733,55 +701,6 @@ gpu.module @payload_kernel [#xevm.target<O = 3>] {
   gpu.func @payload_kernel(...) kernel { ... }
 }
 ```
-
----
-
-## Summary of Optimizations
-
-### Memory Efficiency
-1. **Dimension collapse**: `2×8×4096×64` → `16×4096×64` (eliminate indexing overhead)
-2. **Online softmax**: Avoid materializing `128×4096` attention matrix (96.9% memory reduction)
-3. **Tiled computation**: Process K/V in chunks of 64
-
-### Parallelism
-1. **Batch/head parallelism**: 16 independent blocks (2 batches × 8 heads)
-2. **Sequence parallelism**: 32 blocks for 4096 / 128
-3. **Thread parallelism**: 128 threads per block
-4. **Total**: 16 × 32 × 128 = 65,536 concurrent threads
-
-### Hardware Utilization
-1. **Vectorization**: SIMD operations on vectors
-2. **XeGPU DPAS**: Hardware-accelerated matrix multiply
-3. **Tensor descriptors**: Efficient 2D block loads/stores
-4. **Layout optimization**: Data distribution matches hardware subgroup structure
-
-### Numerical Stability
-1. **Max subtraction**: Prevent overflow in exp()
-2. **Online updates**: Incrementally correct max/sum as new data arrives
-3. **Final normalization**: Divide by accumulated sum
-
----
-
-## Performance Considerations
-
-### What Fits in Register File
-Per workgroup (128 threads, 8 subgroups):
-- Q tile: `128×64×2B = 16 KB` ✓
-- Partial attention scores: `128×16×2B = 4 KB` (4 chunks) ✓
-- Partial output: `128×64×2B = 16 KB` ✓
-- Statistics: `128×2×2B = 512 B` (max + sum) ✓
-- **Total: ~36 KB** — fits in GPU register file
-
-### Memory Access Pattern
-1. **Q**: Load once, reuse for all 64 chunks of K
-2. **K**: Stream through in chunks of 64×64
-3. **V**: Stream through in chunks of 64×64
-4. **Output**: Accumulate in registers, write once
-
-### Compute Intensity
-- **FLOPs**: ~2 × 128 × 64 × 4096 × 2 (two matmuls) ≈ 134 MFLOP per workgroup
-- **Memory**: ~128 × 64 × 2 (Q) + 4096 × 64 × 2 × 2 (K+V) ≈ 1 MB
-- **Arithmetic intensity**: 134 MFLOP / 1 MB ≈ **134 FLOP/byte** — excellent!
 
 ---
 
