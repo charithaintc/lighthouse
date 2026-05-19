@@ -189,6 +189,7 @@ I tried to do this. This materializes the partial max and sum vectors in the fus
 attention algorithm as SLM memory buffers. There is no way to promote these to
 registers. At this point, vector to xegpu does not support 1D SLM access also.
 Because of these resons delayed the introduction of fused loop until after bufferization.
+
 ---
 
 ## Stage 4: Vectorization
