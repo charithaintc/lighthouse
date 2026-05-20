@@ -317,6 +317,11 @@ func.func @attention(%arg0: memref<128x64xf16>, %arg1: memref<4096x64xf16>,
 
 The previous stage still computes max and sum in two separate passes over the attention scores. We can fuse these into a single pass using the **online softmax algorithm**.
 
+### Chanages we need in upstream?
+
+This require improve the **GenericOp Fusion** to support complex reductions that are **Fusible** (reduction error can be corrected i.e. first reduction can be factored out from each term in the second reduction and corrected.)
+
+
 ```mlir
 func.func @attention_max_sum_fused(%arg0: memref<128x64xf16>, %arg1: memref<4096x64xf16>,
                                     %arg2: memref<4096x64xf16>, %arg3: memref<128x64xf16>) {
