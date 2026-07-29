@@ -3,7 +3,7 @@ name = "lighthouse"
 dynamic = ["version"]
 requires-python = ">=3.10,<3.13"  # Bounds are due to torch-mlir's packaging
 dependencies = [
-    "mlir-python-bindings==20260618+b2ffc0d9c",
+    "mlir-python-bindings==20260728+5e91f5d57",
     "pyyaml>=6.0",
 ]
 
@@ -89,6 +89,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["lighthouse*"]
 
+[tool.setuptools.package-data]
+"lighthouse" = ["**/*.yaml"]
+
 [tool.setuptools.dynamic]
 version = {attr = "lighthouse.__version__"}
 
@@ -109,11 +112,14 @@ select = [
   "E", # Error
   "F", # Pyflakes
   "PERF", # Perflint
+  "RUF013", # ban implicit optional
+  "RUF018", # assignment in assert
   "RUF022", # __all__ is not sorted
   "RUF030", # print() call in assert
   "RUF034", # useless if-else
   "RUF047", # empty else
   "RUF200", # invalid pyproject.toml
+  "UP", # upgrade syntax to target version
   "W", # Warning
 ]
 ignore = [

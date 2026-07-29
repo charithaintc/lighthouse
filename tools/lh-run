@@ -7,7 +7,7 @@ import numpy as np
 from lighthouse.execution.runner import Runner
 from lighthouse.execution.init import KernelArgumentParser
 from lighthouse.pipeline.descriptor import Descriptor
-from lighthouse.pipeline.driver import CompilerDriver, make_function_callable
+from lighthouse.pipeline.driver import CompilerDriver
 from lighthouse import dialects as lh_dialects
 
 
@@ -94,14 +94,14 @@ if __name__ == "__main__":
             driver.add_module_stage(bench_wrapper)
     else:
         # Calling the entry point directly, so set the attribute on the entry point function.
-        make_function_callable(driver.module, args.entry_point)
+        Runner.make_function_callable(driver.module, args.entry_point)
 
     # Add the remaining stages defined by the user.
     driver.add_stages(args.stage)
 
     # Add the necessary LLVM lowering stages to ensure the module can be executed by the ExecutionEngine.
     driver.add_stage(Descriptor("convert-linalg-to-loops"))
-    driver.add_stage(Descriptor("llvm_lowering.yaml"))
+    driver.add_stage(Descriptor("llvm-lowering.yaml"))
 
     # Run the pipeline to get the optimized module.
     optimized_module = driver.run(print_after_all=args.print_mlir_after_all)

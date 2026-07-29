@@ -1,7 +1,5 @@
 """Generate MLIR transform schedule for XeGPU fused attention operation."""
 
-from typing import Optional
-
 from mlir import ir
 from mlir.dialects import transform
 from mlir.dialects.transform import structured, loop, xegpu
@@ -23,8 +21,8 @@ from lighthouse.schedule import schedule_boilerplate
 
 
 def fused_attention_schedule(
-    stop_at_stage: Optional[str] = None,
-    parameters: Optional[dict] = None,
+    stop_at_stage: str | None = None,
+    parameters: dict | None = None,
 ) -> ir.Module:
     """
     Generate transform schedule for attention kernel.

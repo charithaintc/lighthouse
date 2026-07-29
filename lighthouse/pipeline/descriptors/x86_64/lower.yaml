@@ -2,7 +2,7 @@
 Pipeline:
   ## Bufferization
   - include: bufferization.yaml
-  - include: bufferization_cleanup.yaml
+  - include: bufferization-cleanup.yaml
   - schedule: "omp.py[gen=parallelize]"
 
   ## Buffer vectorization (gets rid of all the rest)
@@ -12,4 +12,4 @@ Pipeline:
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
 
   ## Lower to LLVM
-  - include: llvm_lowering.yaml
+  - include: llvm-lowering.yaml

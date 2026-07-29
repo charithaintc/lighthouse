@@ -8,7 +8,7 @@ import ctypes
 import os
 from contextlib import contextmanager
 from functools import partial
-from typing import Optional, Callable
+from collections.abc import Callable
 
 from mlir import ir
 from mlir.dialects import transform
@@ -16,6 +16,8 @@ from mlir.dialects.transform import structured
 from mlir.execution_engine import ExecutionEngine
 from mlir.runtime.np_to_memref import get_ranked_memref_descriptor
 
+from lighthouse.execution.target import TargetInfo
+from lighthouse.utils.sys_config import enable_amx
 from lighthouse.dialects.transform import transform_ext
 from lighthouse.schedule import schedule_boilerplate
 from lighthouse.utils.memref import to_packed_args
@@ -33,7 +35,7 @@ class RunnerCallable(typing.Protocol):
         self,
         inputs: list[ctypes.Structure],
         execution_engine: ExecutionEngine,
-        memory_manager: Optional[MemoryManager],
+        memory_manager: MemoryManager | None,
     ) -> None: ...
 
 
@@ -47,11 +49,13 @@ class Runner:
     def __init__(
         self,
         module: ir.Module,
-        mem_manager_cls: type = None,
-        shared_libs: list[str] = None,
+        mem_manager_cls: type | None = None,
+        shared_libs: list[str] | None = None,
         opt_level: int = 3,
+        target: TargetInfo = None,
     ):
         self.payload = module
+        self.target = target if target else TargetInfo()
         self.mem_manager_cls = mem_manager_cls
         if shared_libs is None:
             shared_libs = []
@@ -65,6 +69,15 @@ class Runner:
         self.shared_libs = list(dict.fromkeys(shared_libs))
         self.opt_level = opt_level
         self.engine = self._get_engine()
+        self._configure_system()
+
+    def _configure_system(self):
+        """
+        Apply target-specific configurations.
+        """
+        # Enable AMX register support.
+        if self.target.is_supported("amx"):
+            enable_amx()
 
     def _uses_openmp(self) -> bool:
         """
@@ -134,9 +147,10 @@ class Runner:
         self,
         host_input_buffers: list,
         payload_function_name: str = "",
-        argument_access_callback: Optional[
-            Callable[[list[ctypes.Structure], ExecutionEngine, MemoryManager], None]
-        ] = None,
+        argument_access_callback: Callable[
+            [list[ctypes.Structure], ExecutionEngine, MemoryManager], None
+        ]
+        | None = None,
         nruns: int = 100,
         nwarmup: int = 10,
         benchmark: bool = True,
@@ -300,3 +314,17 @@ class Runner:
             memory_manager.copy(inputs[arg_index], host_buffer)
 
         return argument_access_callback
+
+    @staticmethod
+    def make_function_callable(module: ir.Module, func_name: str) -> None:
+        """
+        Set the 'llvm.emit_c_interface' attribute of the given function in the module.
+        This is required to make the function callable from the execution engine.
+        It has to be called on a @func.func (not an @llvm.func), so should be called
+        before the LLVM lowering stages are added to the pipeline.
+        """
+        with module.context:
+            for func in module.body.operations:
+                if func.sym_name.value == func_name:
+                    func.attributes["llvm.emit_c_interface"] = ir.UnitAttr.get()
+                    break
