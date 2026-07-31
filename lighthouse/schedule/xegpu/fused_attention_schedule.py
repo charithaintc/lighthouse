@@ -193,16 +193,44 @@ def tile_and_fuse_reduction_dim(
     ).results
     transform.annotate(max_loop, "__reduction_loop__")
 
-    # Step 4: Fuse the dependant sum reduction into the tiled max loop.
-    fused_loop = structured.structured_tile_and_fuse_dependant_reduction_ops(
-        anytype, max_loop, sum_reduction
+    # Step 4: Fuse the first dependant consumer into the tiled max loop. Note the
+    # handles: `sum_reduction`/`pv_matmul` above are named for the payload order
+    # in the comment, but positions 2 and 3 are actually the P*V matmul and the
+    # row sum respectively, so this call fuses the P*V and returns it as the
+    # in-loop reduction handle.
+    fused_loop, fused_pv = (
+        structured.structured_tile_and_fuse_dependant_reduction_ops(
+            anytype, anytype, max_loop, sum_reduction
+        )
     )
     transform.annotate(fused_loop, "__reduction_loop__")
 
-    # Step 5: Fuse the dependant P*V matmul into the fused loop.
-    fused_loop = structured.structured_tile_and_fuse_dependant_reduction_ops(
-        anytype, fused_loop, pv_matmul
+    # Step 5: Fuse the remaining dependant consumer (the row sum) into the loop.
+    # Both fusions have to complete before any unfusion: the unfusion interposes a
+    # new value between a fused reduction and the loop's yield, and the fusion
+    # pattern requires every input of the tiled producer to also be an input of
+    # the consumer, which that new value breaks.
+    fused_loop, _ = structured.structured_tile_and_fuse_dependant_reduction_ops(
+        anytype, anytype, fused_loop, pv_matmul
     )
+
+    # Step 5b: Hoist the softmax epilogue out of the fused P*V reduction, leaving
+    # it with just the contraction `mulf` and its `addf` combiner. Only the
+    # `subf`/`exp` prologue moves out -- the contraction multiply spans more
+    # iteration dims than any of its operands, so it stays fused and no
+    # rank-increasing intermediate is materialized. The row sum is left fused on
+    # purpose.
+    #
+    # The `fused_pv` handle from step 4 was invalidated by the step 5 fusion
+    # (which consumes the loop the P*V now lives in), so re-match inside the final
+    # loop. It holds 7 generics at this point: #0 the row max, #1/#2 and #4/#5 the
+    # all-parallel online-correction ops, #3 the P*V contraction (the only 4-loop
+    # reduction, carrying the softmax chain) and #6 the row sum.
+    loop_generics = match_and_split(fused_loop, ops={"linalg.generic"}, nhandles=7)
+    structured.structured_unfuse_elementwise_from(
+        anytype, anytype, loop_generics[3]
+    )
+
     transform.apply_cse(func)
     canonicalize(func)
 
@@ -261,7 +289,7 @@ def bundle_xegpu_fused_attention_schedule(
         op_name="func.func",
         deduplicate=True,
     )
-    transform.print_(target=func, name="initial payload function")
+    # transform.print_(target=func, name="initial payload function")
 
     # Step 1: Generalize both matmuls (QK^T and P*V) into linalg.generic ops so
     # the reduction-fusion machinery can operate on them uniformly.
@@ -280,7 +308,7 @@ def bundle_xegpu_fused_attention_schedule(
     # Outer tiling: partition the whole computation along the parallel batch
     # dimension so each workgroup computes attention for its own batch slice.
     tile_and_fuse_parallel_dim(func, anytype, parameters)
-    transform.print_(target=func, name="after outer tiling and fusion")
+    # transform.print_(target=func, name="after outer tiling and fusion")
 
     if stop_at_stage == "outer-tiled":
         raise PipelineInterrupt()
@@ -308,14 +336,14 @@ def bundle_xegpu_fused_attention_schedule(
     )
     transform.apply_cse(func)
     canonicalize(func)
-    transform.print_(target=func, name="after generalizing")
+    # transform.print_(target=func, name="after generalizing")
 
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
         structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
         structured.apply_patterns_linalg_fold_unit_extent_dims_via_reshapes()
     transform.apply_cse(func)
     canonicalize(func)
-    transform.print_(target=func, name="after inner tiling and fusion")
+    # transform.print_(target=func, name="after inner tiling and fusion")
 
     if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()
@@ -334,7 +362,7 @@ def bundle_xegpu_fused_attention_schedule(
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
         apply_patterns_vector_cast_away_vector_leading_one_dim()
 
-    transform.print_(target=func, name="after vectorization")
+    # transform.print_(target=func, name="after vectorization")
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
 
@@ -365,7 +393,7 @@ def bundle_xegpu_fused_attention_schedule(
         },
     )
 
-    transform.print_(target=func, name="after bufferization")
+    # transform.print_(target=func, name="after bufferization")
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
 
@@ -398,7 +426,7 @@ def bundle_xegpu_fused_attention_schedule(
     mod = apply_registered_pass(mod, "gpu-kernel-outlining")
     transform.apply_cse(mod)
 
-    transform.print_(target=mod, name="after gpu kernel outlining")
+    # transform.print_(target=mod, name="after gpu kernel outlining")
     if stop_at_stage == "gpu-outlining":
         raise PipelineInterrupt()
 
@@ -420,6 +448,131 @@ def bundle_xegpu_fused_attention_schedule(
         gpu_func = apply_registered_pass(gpu_func, "loop-invariant-code-motion")
 
     if stop_at_stage == "xegpu-initial":
+        raise PipelineInterrupt()
+
+    # Define XeGPU layout parameters
+    n_head = parameters["n_head"]
+    q_sg_layout = [num_subgroups, 1]
+    q_sg_data = [16, n_head]
+    q_inst_data = [8, 16]
+
+    k_sg_layout = [num_subgroups, 1]
+    k_sg_data = [64, n_head]
+    k_inst_data = [16, 16]
+
+    v_sg_layout = k_sg_layout
+    v_sg_data = k_sg_data
+    v_inst_data = k_inst_data
+
+    kt_sg_layout = [1, num_subgroups]
+    kt_sg_data = [n_head, 64]
+    kt_inst_data = [16, 16]
+    kt_order = [0, 1]
+
+    out_sg_layout = q_sg_layout
+    out_sg_data = q_sg_data
+    out_inst_data = q_inst_data
+
+    layout_128x64_sg_layout = [num_subgroups, 1]
+    layout_128x64_sg_data = [128, 64]
+    layout_128x64_inst_data = [8, 16]
+
+    qk_sg_layout = layout_128x64_sg_layout
+    qk_sg_data = layout_128x64_sg_data
+    qk_inst_data = layout_128x64_inst_data
+
+    # Set layout attributes for xegpu.store_nd ops.
+    store_nd_op = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)[0]
+    xegpu.set_anchor_layout(
+        store_nd_op,
+        sg_layout=out_sg_layout,
+        sg_data=out_sg_data,
+        inst_data=out_inst_data,
+    )
+
+    # Set layout for xegpu.load_nd ops (9 total: 1 Q, 4 K, 4 V)
+    load_nd_ops = match_and_split(gpu_func, ops={"xegpu.load_nd"}, nhandles=3)
+
+    # First load_nd: Q layout
+    xegpu.set_anchor_layout(
+        load_nd_ops[0], sg_layout=q_sg_layout, sg_data=q_sg_data, inst_data=q_inst_data
+    )
+
+    # Next load is K load
+    xegpu.set_anchor_layout(
+            load_nd_ops[1],
+            sg_layout=k_sg_layout,
+            sg_data=k_sg_data,
+            inst_data=k_inst_data,
+        )
+
+    # Last load is V load
+    xegpu.set_anchor_layout(
+            load_nd_ops[2],
+            sg_layout=v_sg_layout,
+            sg_data=v_sg_data,
+            inst_data=v_inst_data,
+        )
+
+    # Set layout for xegpu.dpas ops (2 total: 1 for Q@K, 1 for P@V)
+    dpas_ops = match_and_split(gpu_func, ops={"xegpu.dpas"}, nhandles=2)
+    qk_dpas_op = dpas_ops[0]
+    pv_dpas_op = dpas_ops[1]
+
+    # Layouts for first dpas (Q@K^T):
+    # Index 0: Q layout
+    xegpu.set_anchor_layout(
+        qk_dpas_op,
+        sg_layout=q_sg_layout,
+        sg_data=q_sg_data,
+        inst_data=q_inst_data,
+        index=0,
+    )
+    # Index 1: K^T layout
+    xegpu.set_anchor_layout(
+        qk_dpas_op,
+        sg_layout=kt_sg_layout,
+        sg_data=kt_sg_data,
+        inst_data=kt_inst_data,
+        order=kt_order,
+        index=1,
+    )
+    # Index 2: QK output layout (128x16)
+    xegpu.set_anchor_layout(
+        qk_dpas_op,
+        sg_layout=layout_128x64_sg_layout,
+        sg_data=layout_128x64_sg_data,
+        inst_data=layout_128x64_inst_data,
+        index=2,
+    )
+
+    # Layouts for second dpas op (P@V):
+    # Index 0: QK (attention weights) layout
+    xegpu.set_anchor_layout(
+        pv_dpas_op,
+        sg_layout=qk_sg_layout,
+        sg_data=qk_sg_data,
+        inst_data=qk_inst_data,
+        index=0,
+    )
+    # Index 1: V layout
+    xegpu.set_anchor_layout(
+        pv_dpas_op,
+        sg_layout=v_sg_layout,
+        sg_data=v_sg_data,
+        inst_data=v_inst_data,
+        index=1,
+    )
+    # Index 2: Output layout
+    xegpu.set_anchor_layout(
+        pv_dpas_op,
+        sg_layout=out_sg_layout,
+        sg_data=out_sg_data,
+        inst_data=out_inst_data,
+        index=2,
+    )
+
+    if stop_at_stage == "xegpu-wg":
         raise PipelineInterrupt()
 
     return mod

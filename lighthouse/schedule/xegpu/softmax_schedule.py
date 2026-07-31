@@ -129,10 +129,17 @@ def bundle_xegpu_softmax_schedule(
     ).results
     transform.annotate(max_loop, "__reduction_loop__")
 
-    # Fuse the consumer reduction (sum) into the tiled max reduction loop.
-    structured.structured_tile_and_fuse_dependant_reduction_ops(
-        anytype, max_loop, sum_reduction
+    # Fuse the consumer reduction (sum) into the tiled max reduction loop. This
+    # returns the fused loop and the sum reduction as it now exists inside it
+    # (the fusion clones it into the loop and erases the original).
+    _, fused_sum = structured.structured_tile_and_fuse_dependant_reduction_ops(
+        anytype, anytype, max_loop, sum_reduction
     )
+
+    # The fused sum still carries the center-and-exp elementwise chain inlined in
+    # its reduction body. Split it back out into a separate all-parallel op so the
+    # reduction keeps only its `addf` combiner.
+    structured.structured_unfuse_elementwise_from(anytype, anytype, fused_sum)
 
     # Tile the division op.
     structured.TileUsingForOp(div_op, sizes=[0, reduction_step_size])
