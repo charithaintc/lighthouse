@@ -474,7 +474,7 @@ def bundle_xegpu_fused_attention_schedule(
     out_inst_data = q_inst_data
 
     layout_128x64_sg_layout = [num_subgroups, 1]
-    layout_128x64_sg_data = [128, 64]
+    layout_128x64_sg_data = [16, 64]
     layout_128x64_inst_data = [8, 16]
 
     qk_sg_layout = layout_128x64_sg_layout
