@@ -198,10 +198,8 @@ def tile_and_fuse_reduction_dim(
     # in the comment, but positions 2 and 3 are actually the P*V matmul and the
     # row sum respectively, so this call fuses the P*V and returns it as the
     # in-loop reduction handle.
-    fused_loop, fused_pv = (
-        structured.structured_tile_and_fuse_dependant_reduction_ops(
-            anytype, anytype, max_loop, sum_reduction
-        )
+    fused_loop, fused_pv = structured.structured_tile_and_fuse_dependant_reduction_ops(
+        anytype, anytype, max_loop, sum_reduction
     )
     transform.annotate(fused_loop, "__reduction_loop__")
 
@@ -227,9 +225,7 @@ def tile_and_fuse_reduction_dim(
     # all-parallel online-correction ops, #3 the P*V contraction (the only 4-loop
     # reduction, carrying the softmax chain) and #6 the row sum.
     loop_generics = match_and_split(fused_loop, ops={"linalg.generic"}, nhandles=7)
-    structured.structured_unfuse_elementwise_from(
-        anytype, anytype, loop_generics[3]
-    )
+    structured.structured_unfuse_elementwise_from(anytype, anytype, loop_generics[3])
 
     transform.apply_cse(func)
     canonicalize(func)
@@ -500,19 +496,19 @@ def bundle_xegpu_fused_attention_schedule(
 
     # Next load is K load
     xegpu.set_anchor_layout(
-            load_nd_ops[1],
-            sg_layout=k_sg_layout,
-            sg_data=k_sg_data,
-            inst_data=k_inst_data,
-        )
+        load_nd_ops[1],
+        sg_layout=k_sg_layout,
+        sg_data=k_sg_data,
+        inst_data=k_inst_data,
+    )
 
     # Last load is V load
     xegpu.set_anchor_layout(
-            load_nd_ops[2],
-            sg_layout=v_sg_layout,
-            sg_data=v_sg_data,
-            inst_data=v_inst_data,
-        )
+        load_nd_ops[2],
+        sg_layout=v_sg_layout,
+        sg_data=v_sg_data,
+        inst_data=v_inst_data,
+    )
 
     # Set layout for xegpu.dpas ops (2 total: 1 for Q@K, 1 for P@V)
     dpas_ops = match_and_split(gpu_func, ops={"xegpu.dpas"}, nhandles=2)
