@@ -5,11 +5,8 @@ from mlir.dialects import transform
 from mlir.dialects.transform import structured, loop, xegpu
 from mlir.dialects.transform import bufferization as transform_bufferization
 from mlir.dialects.bufferization import LayoutMapOption
-from mlir.dialects.transform.vector import (
-    apply_patterns_vector_cast_away_vector_leading_one_dim,
-)
 
-from lighthouse.dialects.transform import transform_ext
+import lighthouse.transform as lh_transform
 from lighthouse.pipeline.helper import (
     canonicalize,
     match,
@@ -18,11 +15,13 @@ from lighthouse.pipeline.helper import (
     apply_registered_pass,
 )
 from lighthouse.schedule import schedule_boilerplate
+from .lowering_common import get_named_func, vectorize
 
 
 def fused_attention_schedule(
     stop_at_stage: str | None = None,
     parameters: dict | None = None,
+    payload_func_name: str = "payload",
 ) -> ir.Module:
     """
     Generate transform schedule for attention kernel.
@@ -45,6 +44,7 @@ def fused_attention_schedule(
             - wg_rows: Number of Q*K^T*V rows computed by each work group
             - sg_rows: Number of Q*K^T*V rows computed by each subgroup
             - subgroup_size: Size of subgroup
+        payload_func_name: Name of the payload function to transform
 
     Returns:
         MLIR module containing the transform schedule
@@ -67,6 +67,7 @@ def fused_attention_schedule(
                 payload_mod,
                 parameters=parameters,
                 stop_at_stage=stop_at_stage or "",
+                payload_func_name=payload_func_name,
             )
         except PipelineInterrupt:
             pass
@@ -253,6 +254,7 @@ def bundle_xegpu_fused_attention_schedule(
     mod: ir.Value[transform.AnyOpType],
     parameters: dict,
     stop_at_stage: str = "",
+    payload_func_name: str = "payload",
 ) -> ir.Value[transform.AnyOpType]:
     """Schedule for lowering attention payload to xegpu wg level."""
 
@@ -346,17 +348,25 @@ def bundle_xegpu_fused_attention_schedule(
 
     # Vectorize the fused loop nest: rewrite the remaining linalg ops (the tiled
     # matmuls, reductions and elementwise ops inside the scf.for) into vector
-    # ops.
-    func = structured.VectorizeChildrenAndApplyPatternsOp(
-        func,
-        fold_type_extensions_into_contract=True,
-    ).result
-    transform.apply_cse(func)
-    canonicalize(func)
+    # ops. The shared helper also runs loop hoisting (LICM plus
+    # hoist_loop_invariant_subsets) on the scf.for loops, which pulls the
+    # loop-invariant vector transfers -- notably the Q tile read, invariant
+    # across the K/V reduction loop -- out of the reduction loop.
+    func = vectorize(mod, payload_func_name)
 
     # Try to remove any unit dimensions that may have been introduced due to tiling (e.g. batch dim of 1)
-    with ir.InsertionPoint(transform.apply_patterns(func).patterns):
-        apply_patterns_vector_cast_away_vector_leading_one_dim()
+    lh_transform.simplify_vector_ops(func)
+
+    # Hoist again after the unit-dim cleanup. The row-max accumulator is carried
+    # as a tensor<1x128xf16> through the reduction loop and read/written by a
+    # transfer_read/transfer_write pair per iteration; those transfers only
+    # become a hoistable matching subset pair once the leading unit dim is gone.
+    # Hoisting them turns the accumulator into a plain vector<128xf16> iter_arg,
+    # which also lets the `tensor.empty` backing it (and its per-workgroup slice)
+    # fold away entirely.
+    reduction_loops = match(func, ops={"scf.for"})
+    lh_transform.loop_hoisting(reduction_loops)
+    lh_transform.cleanup(func)
 
     # transform.print_(target=func, name="after vectorization")
     if stop_at_stage == "vectorized":
@@ -378,16 +388,27 @@ def bundle_xegpu_fused_attention_schedule(
     canonicalize(mod)
 
     # Promote small memref.allocs (the per-workgroup scratch buffers) to the
-    # stack in the payload function.
-    func = match(mod, ops={"func.func"})
-    func = apply_registered_pass(
-        func,
-        "promote-buffers-to-stack",
-        options={
-            "max-alloc-size-in-bytes": "16384",
-            "max-rank-of-allocated-memref": "3",
-        },
-    )
+    # stack in the payload function. Not needed while the loop hoisting above
+    # keeps all accumulators in registers -- the bufferized payload has no
+    # memref.allocs left at all.
+    # func = match(mod, ops={"func.func"})
+    # func = apply_registered_pass(
+    #     func,
+    #     "promote-buffers-to-stack",
+    #     options={
+    #         "max-alloc-size-in-bytes": "16384",
+    #         "max-rank-of-allocated-memref": "3",
+    #     },
+    # )
+
+    # Bufferization replaced the payload module, so re-match the payload function
+    # instead of reusing the pre-bufferization handle. Hoist what became loop
+    # invariant once tensors turned into memrefs: the per-iteration subview and
+    # index computations feeding the vector transfers.
+    func = get_named_func(mod, payload_func_name)
+    func = apply_registered_pass(func, "loop-invariant-code-motion")
+    transform.apply_cse(func)
+    canonicalize(func)
 
     # transform.print_(target=func, name="after bufferization")
     if stop_at_stage == "bufferized":
@@ -437,8 +458,8 @@ def bundle_xegpu_fused_attention_schedule(
     gpu_mod_ops = match_and_split(mod, ops={"gpu.module"})
     for gpu_mod in gpu_mod_ops:
         gpu_func = match(gpu_mod, ops={"gpu.func"})
-        allocas = match(gpu_func, ops={"memref.alloca"})
-        transform_ext.update_address_space(allocas, address_space=3)
+        # allocas = match(gpu_func, ops={"memref.alloca"})
+        # transform_ext.update_address_space(allocas, address_space=3)
         gpu_func = apply_registered_pass(gpu_func, "convert-vector-to-xegpu")
         transform.apply_cse(gpu_func)
         gpu_func = apply_registered_pass(gpu_func, "loop-invariant-code-motion")
