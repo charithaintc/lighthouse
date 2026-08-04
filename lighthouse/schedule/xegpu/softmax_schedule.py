@@ -110,68 +110,39 @@ def bundle_xegpu_softmax_schedule(
     )
     structured.structured_decompose_interface(anytype, softmax_ops)
 
-    linalg_ops = match_and_split(
-        func, ops={"linalg.generic", "linalg.fill"}, nhandles=6
-    )
-    max_reduction = linalg_ops[1]
-    max_center_and_exp_op = linalg_ops[2]
-    sum_reduction = linalg_ops[4]
-    div_op = linalg_ops[5]
+    # Fuse the elementwise center-and-exp op into its consumers so that only
+    # the three reductions/division generics remain: max reduction, sum
+    # reduction and the final division.
+    func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
 
     reduction_step_size = parameters["reduction_step_size"]
 
-    # Tile the division op first.
-    _, div_loop = structured.TileUsingForOp(
-        div_op, sizes=[0, reduction_step_size]
+    # Match the three remaining linalg.generic ops.
+    max_reduction, sum_reduction, div_op = match_and_split(
+        func, ops={"linalg.generic"}, nhandles=3
+    )
+
+    # Tile the producer reduction (max) along its reduction dim and annotate the
+    # resulting loop so the fusion op can recognise it as a tiled reduction.
+    _, max_loop = structured.TileUsingForOp(
+        max_reduction, sizes=[0, reduction_step_size]
     ).results
+    transform.annotate(max_loop, "__reduction_loop__")
 
-    # Fuse max_center_and_exp_op into the div loop
-    _, fused_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=max_center_and_exp_op,
-        containing_op=div_loop,
+    # Fuse the consumer reduction (sum) into the tiled max reduction loop. This
+    # returns the fused loop and the sum reduction as it now exists inside it
+    # (the fusion clones it into the loop and erases the original).
+    _, fused_sum = structured.structured_tile_and_fuse_dependant_reduction_ops(
+        anytype, anytype, max_loop, sum_reduction
     )
 
-    # Tile the sum reduction.
-    _, _, _, sum_loop = structured.structured_tile_reduction_using_for(
-        [anytype],
-        anytype,
-        anytype,
-        anytype,
-        target=sum_reduction,
-        tile_sizes=[0, reduction_step_size],
-    )
+    # The fused sum still carries the center-and-exp elementwise chain inlined in
+    # its reduction body. Split it back out into a separate all-parallel op so the
+    # reduction keeps only its `addf` combiner.
+    structured.structured_unfuse_elementwise_from(anytype, anytype, fused_sum)
 
-    func = transform.get_parent_op(
-        anytype,
-        fused_loop,
-        op_name="func.func",
-        deduplicate=True,
-    )
-
-    # Re-match and split linalg generic ops, there are 5 at this point
-    linalg_ops = match_and_split(func, ops={"linalg.generic"}, nhandles=5)
-    max_center_and_exp_op = linalg_ops[1]
-
-    # Fuse max_center_and_exp_op into the sum reduction loop
-    _, fused_sum_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=max_center_and_exp_op,
-        containing_op=sum_loop,
-    )
-
-    # Tile the max reduction.
-    max_reduction = linalg_ops[0]
-    structured.structured_tile_reduction_using_for(
-        [anytype],
-        anytype,
-        anytype,
-        anytype,
-        target=max_reduction,
-        tile_sizes=[0, reduction_step_size],
-    )
+    # Tile the division op.
+    structured.TileUsingForOp(div_op, sizes=[0, reduction_step_size])
 
     # Cleanup after tiling and fusion
     transform.apply_cse(func)
@@ -196,7 +167,7 @@ def bundle_xegpu_softmax_schedule(
     identity_layout = LayoutMapOption.IdentityLayoutMap
     mod = transform_bufferization.OneShotBufferizeOp(
         mod,
-        allow_return_allocs_from_loops=True,
+        allow_return_allocs_from_loops=False,
         bufferize_function_boundaries=True,
         function_boundary_type_conversion=identity_layout,
     ).result
@@ -274,12 +245,9 @@ def bundle_xegpu_softmax_schedule(
 
     # Set layout attributes for xegpu.store_nd and xegpu.store_matrix ops.
     store_nd_ops = match_and_split(gpu_func, ops={"xegpu.store_nd"}, nhandles=1)
-    store_matrix_ops = match_and_split(gpu_func, ops={"xegpu.store_matrix"}, nhandles=4)
     sg_layout = [parameters["sg_rows"], 1]
     sg_data = [parameters["sg_rows"], parameters["reduction_step_size"]]
     for store_op in store_nd_ops:
-        xegpu.set_anchor_layout(store_op, sg_layout=sg_layout, sg_data=sg_data)
-    for store_op in store_matrix_ops:
         xegpu.set_anchor_layout(store_op, sg_layout=sg_layout, sg_data=sg_data)
 
     if stop_at_stage == "xegpu-wg":
