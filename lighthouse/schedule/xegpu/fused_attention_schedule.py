@@ -3,11 +3,13 @@
 from mlir import ir
 from mlir.dialects import transform
 from mlir.dialects.transform import structured, loop, xegpu
-from mlir.dialects.transform import bufferization as transform_bufferization
-from mlir.dialects.bufferization import LayoutMapOption
-from mlir.dialects.transform.vector import (
-    apply_patterns_vector_cast_away_vector_leading_one_dim,
-    apply_patterns_vector_drop_unit_dims_with_shape_cast,
+from mlir.dialects.transform.structured import (
+    apply_patterns_linalg_fold_unit_extent_dims_via_slices,
+)
+from mlir.dialects.transform.tensor import (
+    apply_patterns_tensor_drop_redundant_insert_slice_rank_expansion,
+    apply_patterns_tensor_fold_tensor_subset_ops,
+    apply_patterns_tensor_merge_consecutive_insert_extract_slice,
 )
 
 from lighthouse.pipeline.helper import (
@@ -18,9 +20,7 @@ from lighthouse.pipeline.helper import (
     apply_registered_pass,
 )
 from lighthouse.schedule import schedule_boilerplate
-from lighthouse.dialects.transform.transform_ext import (
-    replace_with_fused_attention,
-)
+from lighthouse.schedule.xegpu.lowering_common import bufferize
 
 
 def fused_attention_schedule(
@@ -90,191 +90,257 @@ def bundle_xegpu_fused_attention_schedule(
         raise PipelineInterrupt()
 
     anytype = transform.AnyOpType.get()
-    # Match all matmul operations - there should be 2:
-    # 1. Q @ K^T
-    # 2. attention_weights @ V
-    matmul_ops = match_and_split(mod, ops={"linalg.batch_matmul"}, nhandles=2)
 
-    # Get the last matmul (attention_weights @ V)
-    last_matmul = matmul_ops[1]
+    # The payload spells the softmax out as linalg.generic ops and defers the
+    # normalizing divide past the P@V contraction (see
+    # generate_gpu_attention_payload):
+    #   S = (Q @ K^T) * scale ;  m = max_j S ;  p = exp(S - m) ;  l = sum_j p
+    #   O = p @ V             ;  out = O / l
+    # The divide -- not the contraction -- is therefore the last op of the chain
+    # and the root of the work-group level tiling.
+    max_op, p_op, sum_op, div_op = match_and_split(
+        mod, ops={"linalg.generic"}, nhandles=4
+    )
     func = transform.get_parent_op(
         anytype,
-        last_matmul,
+        div_op,
         op_name="func.func",
         deduplicate=True,
     )
+    qk_matmul, pv_matmul = match_and_split(
+        func, ops={"linalg.batch_matmul"}, nhandles=2
+    )
+    scale_mul_op = match_and_split(func, ops={"linalg.mul"}, nhandles=1)[0]
 
-    # Tile the last matmul in both batch and M dimensions.
+    # The reductions and both matmuls initialize their output with a linalg.fill,
+    # and Q @ K^T reads a transposed K; reach all of them through their consumer.
+    transpose_op = transform.get_producer_of_operand(
+        anytype, qk_matmul, operand_number=1
+    )
+    qk_fill_op = transform.get_producer_of_operand(anytype, qk_matmul, operand_number=2)
+    scale_fill_op = transform.get_producer_of_operand(
+        anytype, scale_mul_op, operand_number=1
+    )
+    max_fill_op = transform.get_producer_of_operand(anytype, max_op, operand_number=1)
+    sum_fill_op = transform.get_producer_of_operand(anytype, sum_op, operand_number=1)
+    pv_fill_op = transform.get_producer_of_operand(anytype, pv_matmul, operand_number=2)
+
+    # Tile the divide in both batch and M dimensions. Its destination is a bare
+    # tensor.empty, which stays outside as the loop's shared_out; every other op
+    # of the chain is fused in below.
     wg_rows = parameters["wg_rows"]
-
-    tiled_matmul, forall_loop = structured.structured_tile_using_forall(
+    tiled_div, forall_loop = structured.structured_tile_using_forall(
         anytype,
         anytype,
-        last_matmul,
+        div_op,
         num_threads=[],
         tile_sizes=[],
-        static_tile_sizes=(1, wg_rows, 0, 0),
+        static_tile_sizes=(1, wg_rows, 0),
     )
-    # Fuse the zero initialization of the output of the last matmul (tensor.empty) into the forall loop.
-    tiled_matmul_init = transform.get_producer_of_operand(
-        anytype, forall_loop, operand_number=0
-    )
-    _, forall_loop = structured.structured_fuse_into_containing_op(
-        anytype,
-        anytype,
-        producer_op=tiled_matmul_init,
-        containing_op=forall_loop,
-    )
-    transform.apply_cse(func)
-    canonicalize(func)
 
-    # Decompose softmax into generic ops
-    softmax_ops = match_and_split(func, ops={"linalg.softmax"}, nhandles=1)
-    softmax_op = softmax_ops[0]
-    structured.structured_decompose_interface(anytype, softmax_op)
-    transform.apply_cse(func)
-    canonicalize(func)
-
-    # Fuse all linalg.generic ops from softmax decomposition (4 ops: max, sub+exp, sum, div)
-    # Match and fuse in reverse order (from consumer to producer)
-    generic_ops = match_and_split(func, ops={"linalg.generic"}, nhandles=4)
-    for generic_op in reversed(generic_ops):
-        _, forall_loop = structured.structured_fuse_into_containing_op(
-            anytype,
-            anytype,
-            producer_op=generic_op,
-            containing_op=forall_loop,
-        )
-    transform.apply_cse(func)
-    canonicalize(func)
-
-    # Max and add reductions use linalg.fill to intialize the reduction output. Fuse these fill ops as well.
-    fill_ops = match_and_split(func, ops={"linalg.fill"}, nhandles=5)
-    # Max fill is the third fill op and add fill is the fourth fill op (based on the pattern of decomposition)
-    max_fill_op = fill_ops[2]
-    add_fill_op = fill_ops[3]
-    for fill_op in [max_fill_op, add_fill_op]:
-        _, forall_loop = structured.structured_fuse_into_containing_op(
-            anytype,
-            anytype,
-            producer_op=fill_op,
-            containing_op=forall_loop,
-        )
-    transform.apply_cse(func)
-    canonicalize(func)
-
-    # Fuse the remaining operations into the scf.forall loop.
-    linalg_mul_op = match_and_split(func, ops={"linalg.mul"}, nhandles=1)[0]
-    first_matmul = transform.get_producer_of_operand(
-        anytype, linalg_mul_op, operand_number=0
-    )
-    scale_fill_op = transform.get_producer_of_operand(
-        anytype, linalg_mul_op, operand_number=1
-    )
-    transpose_op = transform.get_producer_of_operand(
-        anytype, first_matmul, operand_number=1
-    )
-    matmul_fill_op = transform.get_producer_of_operand(
-        anytype, first_matmul, operand_number=2
-    )
-    for op in [
-        linalg_mul_op,
+    # Sink the whole chain into the forall loop, walking from the consumer end to
+    # the producer end so that each op is fused only once all of its consumers
+    # are already inside the loop.
+    for producer_op in [
+        pv_matmul,
+        pv_fill_op,
+        sum_op,
+        sum_fill_op,
+        p_op,
+        max_op,
+        max_fill_op,
+        scale_mul_op,
         scale_fill_op,
-        first_matmul,
-        matmul_fill_op,
+        qk_matmul,
+        qk_fill_op,
         transpose_op,
     ]:
         _, forall_loop = structured.structured_fuse_into_containing_op(
             anytype,
             anytype,
-            producer_op=op,
+            producer_op=producer_op,
             containing_op=forall_loop,
         )
+    # CSE is what collapses the redundant tile slices the fusion leaves behind;
+    # without it `fuse_into_containing_op` clones each producer once per slice use
+    # and the whole score computation, row max included, gets duplicated.
     transform.apply_cse(func)
     canonicalize(func)
 
     if stop_at_stage == "outer-tiled":
         raise PipelineInterrupt()
 
-    # Vectorize
-    func = structured.VectorizeChildrenAndApplyPatternsOp(
-        func,
-        fold_type_extensions_into_contract=True,
-    ).result
+    # Fold the whole softmax-and-contract chain into a single loop over the
+    # key/value axis -- the fused (flash) attention inner loop -- while still at
+    # linalg level. `fuse_dependant_reduction_ops` does the work: it moves the
+    # elementwise term and one consumer reduction into an already-tiled producer
+    # reduction loop and inserts the online correction that rescales that
+    # reduction's running accumulator whenever the running max changes.
+    tile_size = parameters.get("inner_loop_tile_size", 64)
+
+    max_op, p_op, sum_op, _ = match_and_split(func, ops={"linalg.generic"}, nhandles=4)
+    _, pv_matmul = match_and_split(func, ops={"linalg.batch_matmul"}, nhandles=2)
+    # The fusion op wants both the elementwise term and the consumer reduction as
+    # linalg.generic ops, so generalize the contraction.
+    pv_op = structured.structured_generalize(anytype, pv_matmul)
+
+    # Tile the row max along the key/value axis. This is the producer reduction
+    # loop the rest of the chain gets folded into; the marker attribute is what
+    # the fusion op recognizes it by.
+    _, reduction_loop = structured.structured_tile_using_for(
+        anytype,
+        [anytype],
+        max_op,
+        dynamic_sizes=[],
+        interchange=[],
+        static_sizes=[0, 0, tile_size],
+        scalable_sizes=[False, False, False],
+    )
+    transform.annotate(reduction_loop, "__reduction_loop__")
+
+    # First chain: max -> p -> row sum. `p` also feeds the contraction, so the op
+    # fuses a clone of it and leaves the original in place for the second chain.
+    reduction_loop = structured.structured_fuse_dependant_reduction_ops(
+        anytype, reduction_loop, p_op, sum_op
+    )
+    # Fusing replaces the loop, so re-mark the new one as the producer reduction.
+    transform.annotate(reduction_loop, "__reduction_loop__")
+
+    # Second chain: max -> p -> P@V, into that same loop. The first fusion
+    # consumed the handle to `p`; the original is still the contraction's operand.
+    p_op = transform.get_producer_of_operand(anytype, pv_op, operand_number=0)
+    reduction_loop = structured.structured_fuse_dependant_reduction_ops(
+        anytype, reduction_loop, p_op, pv_op
+    )
+    transform.apply_cse(func)
+
+    # Sink the score computation into the reduction loop as well, so only one
+    # [wg_rows, tile_size] score tile -- rather than the full [wg_rows, n_ctx]
+    # matrix -- is ever live.
+    for producer_name in ["linalg.mul", "linalg.batch_matmul", "linalg.transpose"]:
+        producer_op = match_and_split(func, ops={producer_name}, nhandles=1)[0]
+        _, reduction_loop = structured.structured_fuse_into_containing_op(
+            anytype,
+            anytype,
+            producer_op=producer_op,
+            containing_op=reduction_loop,
+        )
+
+    # The Q @ K^T zero accumulator and the scale tensor are still filled at full
+    # [wg_rows, n_ctx] extent outside the loop, even though the ops now inside it
+    # only ever read a [wg_rows, tile_size] slice. Sink those two fills as well so
+    # neither tensor is materialized whole. Reach them through the in-loop consumer
+    # they initialize -- one hop for the slice the fusion left behind, one more for
+    # the fill itself. The three remaining fills initialize the loop's running
+    # accumulators and must stay outside.
+    scale_mul_op = match_and_split(reduction_loop, ops={"linalg.mul"}, nhandles=1)[0]
+    qk_matmul = match_and_split(
+        reduction_loop, ops={"linalg.batch_matmul"}, nhandles=1
+    )[0]
+    for consumer_op, operand_number in [(scale_mul_op, 1), (qk_matmul, 2)]:
+        fill_slice = transform.get_producer_of_operand(
+            anytype, consumer_op, operand_number=operand_number
+        )
+        fill_op = transform.get_producer_of_operand(
+            anytype, fill_slice, operand_number=0
+        )
+        _, reduction_loop = structured.structured_fuse_into_containing_op(
+            anytype,
+            anytype,
+            producer_op=fill_op,
+            containing_op=reduction_loop,
+        )
+
     transform.apply_cse(func)
     canonicalize(func)
-    # Try to remove any unit dimensions that may have been introduced due to tiling (e.g. batch dim of 1)
+
+    # Strip the batch dim, which the work-group tiling cut down to 1. Everything
+    # downstream -- the XeGPU layouts below and the blocking/distribution passes in
+    # `xegpu_to_binary` -- is built for rank-2 tiles, and the vector-level
+    # `cast_away_leading_one_dim` patterns cannot finish the job: they have no
+    # pattern for multi_reduction, broadcast or transpose, so the softmax row
+    # reductions and the correction's broadcasts would keep a unit dim and drag
+    # shape_casts (and rank-3 XeGPU layouts) along with them.
+    #
+    # Done here, after the reduction fusion rather than before it, for two reasons:
+    # `fuse_dependant_reduction_ops` gets to run on the shape it already handles,
+    # and every op above is still matched by name -- generalizing first would turn
+    # the whole chain into linalg.generic.
+    #
+    # `fold_unit_extent_dims` only rewrites linalg.generic, hence the generalize;
+    # and it leaves two-step slice chains behind (16x4096x64 -> 1x128x64 ->
+    # 128x64), which plain canonicalization does not compose, hence the tensor
+    # patterns. The scf.for's own iter_args keep their unit dim -- no pattern
+    # retypes a loop signature -- but that no longer matters: with every op inside
+    # rank 2, vectorization reads through them rank-reducing and the accumulators
+    # come out as rank-1/2 vectors.
+    named_ops = match(
+        func,
+        ops={
+            "linalg.batch_matmul",
+            "linalg.mul",
+            "linalg.transpose",
+            "linalg.fill",
+            "linalg.elementwise",
+        },
+    )
+    structured.structured_generalize(anytype, named_ops)
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
-        apply_patterns_vector_cast_away_vector_leading_one_dim()
-        apply_patterns_vector_drop_unit_dims_with_shape_cast()
+        apply_patterns_linalg_fold_unit_extent_dims_via_slices()
+        transform.apply_patterns_canonicalization()
+    transform.apply_cse(func)
+    with ir.InsertionPoint(transform.apply_patterns(func).patterns):
+        apply_patterns_tensor_merge_consecutive_insert_extract_slice()
+        apply_patterns_tensor_drop_redundant_insert_slice_rank_expansion()
+        apply_patterns_tensor_fold_tensor_subset_ops()
+        transform.apply_patterns_canonicalization()
+    transform.apply_cse(func)
+
+    if stop_at_stage == "inner-tiled":
+        raise PipelineInterrupt()
+
+    # Vectorize. The shared helper also hoists the loop-invariant vector
+    # transfers and subsets out of the reduction loop, which is what keeps the
+    # running accumulators loop-carried rather than re-read every iteration.
+    func = structured.structured_vectorize_children_and_apply_patterns(
+        anytype,
+        func,
+        fold_type_extensions_into_contract=True,
+    )
+
+    # Hoist the loop-invariant vector transfers out of the reduction loop so the
+    # running accumulators stay loop-carried instead of being re-read and
+    # re-written every iteration. CSE first: vectorization emits one transfer_read
+    # per linalg op that reads a given iter_arg -- the running max is read three
+    # times, once by its own reduction and once by each chain's correction -- and
+    # subset hoisting refuses to hoist a read/write pair while any other subset op
+    # on the same iter_arg overlaps it. Merging the duplicate reads is what lets
+    # that accumulator stay in registers.
+    transform.apply_cse(func)
+    kv_loop = match(func, ops={"scf.for"})
+    transform.apply_licm(kv_loop)
+    loop.loop_hoist_loop_invariant_subsets(kv_loop)
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    # `p` is fused into the reduction loop once per consumer reduction, and each
+    # copy still writes its tile back into the full [wg_rows, n_ctx] iter_arg it
+    # was carved out of -- two loop results that nothing outside the loop reads.
+    # Neither DCE nor canonicalization can see that: the writes feed the loop's
+    # yield, so the chain is only dead once the loop *results* are known dead, and
+    # scf.for only folds away an iter_arg whose region argument is unused too.
+    # `remove-dead-values` runs a liveness analysis across the loop and unwinds
+    # the whole chain. It has to happen before bufferization -- the pass only
+    # drops ops that do not affect memory, so once these are memref.alloc plus
+    # vector.transfer_write nothing upstream will remove them.
+    func = apply_registered_pass(func, "remove-dead-values")
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
 
-    # Bufferize
-    mod = apply_registered_pass(mod, "eliminate-empty-tensors")
-    identity_layout = LayoutMapOption.IdentityLayoutMap
-    mod = transform_bufferization.OneShotBufferizeOp(
-        mod,
-        allow_return_allocs_from_loops=True,
-        bufferize_function_boundaries=True,
-        function_boundary_type_conversion=identity_layout,
-    ).result
-    # fold memref.subviews into vector.transfer_read/write ops
-    mod = apply_registered_pass(mod, "fold-memref-alias-ops")
-    transform.apply_cse(mod)
-    canonicalize(mod)
+    mod = bufferize(mod)
 
     if stop_at_stage == "bufferized":
-        raise PipelineInterrupt()
-
-    # Extract q, k, v memrefs from the bufferized IR
-    # Match vector.contract ops to find the q, k, v loads
-    for_all = match(mod, ops={"scf.forall"})
-    func = transform.get_parent_op(anytype, for_all, op_name="func.func")
-    contract_ops = match_and_split(func, ops={"vector.contract"}, nhandles=2)
-
-    # First vector.contract is Q @ K^T
-    # Its first operand is the q load (vector.transfer_read)
-    # Its second operand is the k load (vector.transfer_read)
-    first_contract = contract_ops[0]
-    q_load = transform.get_producer_of_operand(
-        anytype, first_contract, operand_number=0
-    )
-    k_load = transform.get_producer_of_operand(
-        anytype, first_contract, operand_number=1
-    )
-
-    # Second vector.contract is attention_weights @ V
-    # Its second operand is the v load (vector.transfer_read)
-    second_contract = contract_ops[1]
-    v_load = transform.get_producer_of_operand(
-        anytype, second_contract, operand_number=1
-    )
-
-    # Match arith.mulf to get the scale parameter
-    # The scale is the second operand of arith.mulf (the constant)
-    mulf_op = match_and_split(func, ops={"arith.mulf"}, nhandles=1)[0]
-    scale = transform.get_producer_of_operand(anytype, mulf_op, operand_number=1)
-
-    # Apply the fused attention optimization. This replaces the second vector.contract
-    # (attention_weights @ V) with a tiled loop that implements online softmax for
-    # efficient memory usage
-    tile_size = parameters.get(
-        "inner_loop_tile_size", 64
-    )  # Tile size for reduction dimension (K/V sequence length)
-    replace_with_fused_attention(
-        q_load=q_load,
-        k_load=k_load,
-        v_load=v_load,
-        scale=scale,
-        output=second_contract,
-        tile_size=tile_size,
-    )
-    transform.apply_cse(func)
-    canonicalize(func)
-
-    if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()
 
     # Convert forall to parallel
@@ -346,6 +412,9 @@ def bundle_xegpu_fused_attention_schedule(
     n_head = parameters["n_head"]
     sg_rows = parameters["sg_rows"]
 
+    # Every tile is rank 2 here: the batch dim the work-group tiling cut down to 1
+    # was dropped during vectorization, so these layouts describe [rows, cols].
+    #
     # Q, the attention weights and the output are all [wg_rows, n_head] tiles that
     # are split by rows over the subgroups. Only the memory ops carry inst_data,
     # the DPAS operands are left to the default DPAS blocking.
@@ -364,7 +433,9 @@ def bundle_xegpu_fused_attention_schedule(
     kv_sg_layout = [1, 1]
     kv_load_sg_data = [tile_size, n_head]
     v_load_inst_data = [32, 32]
-    # Load K column-major so that the transpose feeding the DPAS is a no-op.
+    # Load K column-major so that the transpose feeding the DPAS is a no-op. The
+    # first entry of `order` is the fastest-changing dim, so [0, 1] makes the rows
+    # innermost (the row-major default would be [1, 0]).
     k_load_order = [0, 1]
 
     # K^T operand of the Q@K^T DPAS: [n_head, tile_size]
@@ -373,10 +444,9 @@ def bundle_xegpu_fused_attention_schedule(
     v_sg_data = [tile_size, n_head]
 
     # The K/V prefetches cover the same [tile_size, n_head] tile as the loads, but
-    # are distributed over the subgroups. [4, 2] layout is used to maximize
-    # prefetch bandwidth.
-    prefetch_sg_layout = [4, 2]
-    prefetch_sg_data = [tile_size // 4, n_head // 2]
+    # are distributed over the subgroups to maximize prefetch bandwidth.
+    prefetch_sg_layout = [2, 4]
+    prefetch_sg_data = [tile_size // 2, n_head // 4]
     prefetch_inst_data = list(prefetch_sg_data)
 
     # Set layout attributes for xegpu.store_nd ops.
