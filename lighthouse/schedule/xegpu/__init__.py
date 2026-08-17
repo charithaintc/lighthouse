@@ -3,6 +3,7 @@ from .mlp_schedule import mlp_schedule, matmul_schedule
 from .elemwise_schedule import elemwise_schedule
 from .reduction_schedule import reduction_schedule
 from .fused_attention_schedule import fused_attention_schedule
+from .attention_upstream_schedule import attention_upstream_schedule
 from .xegpu_parameter_selector import XeGPUParameterSelector
 from .matmul_constraints import check_constraints
 from .xegpu_specs import XeGPUSpecs
@@ -18,6 +19,7 @@ from .lowering_common import (
 __all__ = [
     "XeGPUParameterSelector",
     "XeGPUSpecs",
+    "attention_upstream_schedule",
     "bufferize",
     "check_constraints",
     "convert_to_gpu_launch",
