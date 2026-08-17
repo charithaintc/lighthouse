@@ -20,6 +20,7 @@ from lighthouse.pipeline.helper import (
     apply_registered_pass,
 )
 from lighthouse.schedule import schedule_boilerplate
+from lighthouse.dialects.transform.transform_ext import fold_exp_div, set_fastmath
 from lighthouse.schedule.xegpu.lowering_common import bufferize
 
 
@@ -320,6 +321,22 @@ def bundle_xegpu_fused_attention_schedule(
     kv_loop = match(func, ops={"scf.for"})
     transform.apply_licm(kv_loop)
     loop.loop_hoist_loop_invariant_subsets(kv_loop)
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    # The online rescale factor comes out of `fuse_dependant_reduction_ops` as
+    # `exp(-m_new) / exp(-m_old)`; rewrite it to the single `exp(m_old - m_new)` a
+    # hand-written flash-attention kernel uses. That drops a transcendental and a
+    # divide per iteration, and with them the row temporaries that were the only
+    # values IGC had to spill.
+    #
+    # Run here rather than at linalg level: the two exponentials and the divide
+    # live in three separate linalg.generics before vectorization, so there is no
+    # single op to match. `set_fastmath` first because the divide originates from a
+    # `linalg.elementwise`, which has no `fastmath` attribute for it to inherit --
+    # the exps do inherit theirs from the payload.
+    set_fastmath(func)
+    fold_exp_div(func)
     transform.apply_cse(func)
     canonicalize(func)
 

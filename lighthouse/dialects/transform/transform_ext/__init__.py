@@ -21,10 +21,12 @@ from .ops.filter_by_name import filter_by_name
 from .ops.filter_reduction_ops import filter_reduction_ops
 from .ops.get_leading_unit_tile_sizes import get_leading_unit_tile_sizes
 from .ops.move_offsets_to_subview import move_offsets_to_subview
+from .ops.fold_exp_div import fold_exp_div
 from .ops.fold_singleton_extract_slice import fold_singleton_extract_slice
 from .ops.clear_tile_and_fuse_annotations import clear_tile_and_fuse_annotations
 from .ops.get_fusion_roots import get_fusion_roots
 from .ops.propagate_tile_sizes import propagate_tile_sizes
+from .ops.set_fastmath import set_fastmath
 
 __all__ = [
     "TransformExtensionDialect",
@@ -36,6 +38,7 @@ __all__ = [
     "filter_elementwise",
     "filter_num_loops",
     "filter_reduction_ops",
+    "fold_exp_div",
     "fold_singleton_extract_slice",
     "get_fusion_roots",
     "get_leading_unit_tile_sizes",
@@ -51,6 +54,7 @@ __all__ = [
     "replace",
     "replace_with_fused_attention",
     "reverse_handles",
+    "set_fastmath",
     "trace_producers",
     "update_address_space",
     "wrap_in_benching_func",

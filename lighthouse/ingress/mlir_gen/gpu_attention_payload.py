@@ -14,6 +14,13 @@ from lighthouse.ingress.mlir_gen.utils import (
     reduction,
 )
 
+# The softmax is numerically stable by construction -- `exp` only ever sees
+# non-positive arguments -- so the strict IEEE guarantees are not needed here.
+# `fast` lets the backend contract, reassociate and use the fast transcendental
+# unit. Only the ops written out below carry it; the arith ops inside the two
+# linalg.batch_matmuls come from the named op's region and are not reachable here.
+FASTMATH = arith.FastMathFlags.fast
+
 
 def generate_gpu_attention_payload(
     func_name: str,
@@ -154,7 +161,7 @@ def generate_gpu_attention_payload(
                 [parallel, parallel, reduction],
             )
             def row_max(s, acc):
-                return arith.MaximumFOp(s, acc)
+                return arith.MaximumFOp(s, acc, fastmath=FASTMATH)
 
             # 4b) Shifted exponential: p[b, i, j] = exp(S[b, i, j] - m[b, i])
             #
@@ -169,7 +176,8 @@ def generate_gpu_attention_payload(
                 [parallel, parallel, parallel],
             )
             def attention_weights(s, m, _out):
-                return math_dialect.ExpOp(arith.SubFOp(s, m).result)
+                shifted = arith.SubFOp(s, m, fastmath=FASTMATH).result
+                return math_dialect.ExpOp(shifted, fastmath=FASTMATH)
 
             # 4c) Normalizer: l[b, i] = sum_j p[b, i, j]
             sum_init = linalg.fill(zero, outs=[tensor.empty(row_shape_2d, dtype)])
@@ -181,7 +189,7 @@ def generate_gpu_attention_payload(
                 [parallel, parallel, reduction],
             )
             def row_sum(p, acc):
-                return arith.AddFOp(p, acc)
+                return arith.AddFOp(p, acc, fastmath=FASTMATH)
 
             # Step 5: Contract the (unnormalized) weights with V using batch_matmul
             # p: (batch_dim, n_ctx, n_ctx) @ V: (batch_dim, n_ctx, n_head)
@@ -201,7 +209,7 @@ def generate_gpu_attention_payload(
                 [parallel, parallel, parallel],
             )
             def result_3d(o, norm, _out):
-                return arith.DivFOp(o, norm)
+                return arith.DivFOp(o, norm, fastmath=FASTMATH)
 
             # Materialize 3D result back to 3D output memref
             bufferization.materialize_in_destination(
