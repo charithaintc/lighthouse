@@ -422,6 +422,21 @@ def bundle_xegpu_fused_attention_schedule(
         transform.apply_cse(gpu_func)
         canonicalize(gpu_func)
 
+    # Insert prefetches for the K and V tiles of the reduction loop. Each inserts
+    # nb_prefetch prefetches ahead of the loop plus one per iteration, at
+    # induction_var + nb_prefetch * step. This must run before the wg-level layouts
+    # are set below, since the prefetch descriptor is cloned from the load's
+    # descriptor. The layouts of the emitted prefetch_nd ops are set together with
+    # the other wg-level layouts.
+    nb_prefetch = parameters.get("nb_prefetch", 1)
+    if nb_prefetch > 0:
+        reduction_loop = match(gpu_func, ops={"scf.for"})
+        kv_load_ops = match_and_split(reduction_loop, ops={"xegpu.load_nd"}, nhandles=2)
+        for load_op in kv_load_ops:
+            xegpu.insert_prefetch(load_op, nb_prefetch=nb_prefetch)
+        transform.apply_cse(gpu_func)
+        canonicalize(gpu_func)
+
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
 
@@ -436,6 +451,8 @@ def bundle_xegpu_fused_attention_schedule(
     # are split by rows over the subgroups. Only the memory ops carry inst_data,
     # the DPAS operands are left to the default DPAS blocking.
     q_sg_layout = [num_subgroups, 1]
+    q_sg_data = [sg_rows, n_head]
+    q_load_inst_data = [16, 32]
     q_sg_data = [sg_rows, n_head]
     q_load_inst_data = [16, 32]
 
