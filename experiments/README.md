@@ -47,29 +47,9 @@ git cat-file -e $(sed -n 's/.*mlir-python-bindings==[0-9]*+\([0-9a-f]*\).*/\1/p'
     <lighthouse>/pyproject.toml)^{commit}              # pinned commit reachable
 ```
 
-**A configured LLVM ninja build directory.** SPIR-V, the Level Zero runner and
-the python bindings are all required -- without SPIR-V the kernel cannot be
-serialized, and the pip-installed `mlir-python-bindings` package is not a
-substitute:
-
-```bash
-cd <llvm-project> && mkdir -p build && cd build
-cmake ../llvm -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=$(which clang) \
-  -DCMAKE_CXX_COMPILER=$(which clang++) \
-  -DLLVM_ENABLE_PROJECTS=mlir \
-  -DLLVM_TARGETS_TO_BUILD="host" \
-  -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD="SPIRV" \
-  -DLLVM_ENABLE_ASSERTIONS=ON \
-  -DLLVM_BUILD_EXAMPLES=OFF \
-  -DLLVM_INSTALL_UTILS=ON \
-  -DLLVM_INSTALL_GTEST=ON \
-  -DMLIR_ENABLE_LEVELZERO_RUNNER=1 \
-  -DMLIR_ENABLE_BINDINGS_PYTHON=1 \
-  -DPython3_EXECUTABLE=$(which python3) \
-  -DBUILD_SHARED_LIBS=ON
-```
+**An LLVM source tree only** -- the script configures and builds it itself. You do
+not need to run CMake by hand; `--llvm-dir` points at the source, and the build
+trees are created under `--build-root`.
 
 **Python 3.10-3.12 with lighthouse's runtime dependencies** (`numpy`, `pyyaml`).
 The script imports lighthouse from the repository via `PYTHONPATH`, so lighthouse
@@ -89,8 +69,7 @@ cd <lighthouse>
 experiments/run_attention_perf_comparison.py --llvm-dir <llvm-project>
 ```
 
-`--lighthouse-dir` defaults to the repository containing the script;
-`--build-dir` defaults to `<llvm-dir>/build`.
+`--lighthouse-dir` defaults to the repository containing the script.
 
 Useful flags:
 
@@ -99,15 +78,40 @@ Useful flags:
 | `--n-ctx 1024 4096` | Subset of context lengths (default 1024 4096 8192 16384) |
 | `--nruns` / `--nwarmup` | Iteration counts (default 50 / 20) |
 | `--jobs N` | `ninja -j` (default: cores - 8) |
-| `--no-build` | Skip the rebuilds. Only safe if the build directory already matches the revision being benchmarked; a stale build silently produces wrong numbers |
+| `--build-root DIR` | Where the per-revision build trees live (default `experiments/llvm-builds`) |
+| `--cmake-arg ARG` | Extra CMake argument for a *fresh* build tree (repeatable) |
+| `--no-build` | Skip the rebuilds entirely. Only safe if every build tree is already up to date for its revision; a stale tree silently produces wrong numbers |
 | `--fusion-llvm-rev REV` | Override the LLVM revision for version 2 |
 | `--output PATH` | Where to write the report |
 | `--no-check` | Skip the numpy correctness check at the smallest size |
 
-Budget roughly 12-15 minutes per LLVM rebuild plus a couple of minutes per
-benchmark point. A first run on a cold build directory takes considerably longer.
+## Build trees
 
-Start with a cheap smoke test before committing to the full sweep:
+The script keeps **one LLVM build tree per revision** under `--build-root`, named
+after the revision:
+
+```
+experiments/llvm-builds/002905df0/                      # versions 1 and 3
+experiments/llvm-builds/linalg_reduction_op_fusion_v3/  # version 2
+```
+
+It configures a tree the first time it is used and runs `ninja` in it on every
+run, so a rerun rebuilds only what changed. This matters because the comparison
+spans two LLVM revisions: with a single shared build tree, every run would
+rebuild most of LLVM twice as it moved between them. Reusing per-revision trees
+turns a rerun after a small LLVM change into an incremental build.
+
+The trees are keyed on the revision *as named*, not on the resolved commit, so a
+branch that gains commits reuses its tree and rebuilds only the delta. They are
+made invisible to git (a `.gitignore` of `*` in the build root), so they can live
+inside the lighthouse checkout without showing up in `git status`.
+
+Budget roughly 2GB of disk per tree. A cold first build is 15-20 minutes per
+revision; incremental rebuilds afterwards are usually a minute or two, and
+`ccache` is enabled automatically if it is on PATH.
+
+Start with a cheap smoke test before committing to the full sweep -- it warms both
+build trees at one context length:
 
 ```bash
 experiments/run_attention_perf_comparison.py --llvm-dir <llvm-project> --n-ctx 1024

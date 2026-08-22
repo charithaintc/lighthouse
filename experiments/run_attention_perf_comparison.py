@@ -36,6 +36,9 @@ from pathlib import Path
 
 DEFAULT_LLVM_DIR = Path("/home/jovyan/llvm-project")
 DEFAULT_LIGHTHOUSE_DIR = Path(__file__).resolve().parent.parent
+# One LLVM build tree per revision, kept between runs so that a rerun rebuilds
+# only what changed instead of thrashing a single tree back and forth.
+DEFAULT_BUILD_ROOT = Path(__file__).resolve().parent / "llvm-builds"
 DEFAULT_N_CTX = [1024, 4096, 8192, 16384]
 
 # Versions with `llvm_branch = PIN` take their LLVM revision from the
@@ -225,14 +228,76 @@ def check_effects_api(
             )
 
 
+def build_dir_for(build_root: Path, rev: str) -> Path:
+    """Per-revision build directory.
+
+    Keyed on the revision *as named* (branch name or short sha), not on the
+    resolved commit: a branch that gains commits then reuses its directory and
+    rebuilds only the delta, which is the whole point of keeping these around. A
+    single shared build directory would instead rebuild most of LLVM every time
+    the run moves between revisions.
+    """
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", rev)
+    return build_root / slug
+
+
+# Mirrors the configuration the recorded numbers were produced with. SPIR-V, the
+# Level Zero runner and the python bindings are all load-bearing: without SPIR-V
+# the kernel cannot be serialized at all.
+CMAKE_ARGS = [
+    "-G",
+    "Ninja",
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DLLVM_ENABLE_PROJECTS=mlir",
+    "-DLLVM_TARGETS_TO_BUILD=host",
+    "-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV",
+    "-DLLVM_ENABLE_ASSERTIONS=ON",
+    "-DLLVM_BUILD_EXAMPLES=OFF",
+    "-DLLVM_INSTALL_UTILS=ON",
+    "-DMLIR_ENABLE_LEVELZERO_RUNNER=1",
+    "-DMLIR_ENABLE_BINDINGS_PYTHON=1",
+    # Shared libs keep each build directory to ~2GB instead of tens of GB, which
+    # matters once there is one per revision.
+    "-DBUILD_SHARED_LIBS=ON",
+]
+
+
+def configure_llvm(build_dir: Path, llvm_dir: Path, extra_args: list[str]) -> None:
+    """CMake-configure a build directory, unless it is already configured."""
+    if (build_dir / "build.ninja").exists():
+        return
+    build_dir.mkdir(parents=True, exist_ok=True)
+    # A .gitignore of '*' ignores the directory's contents and itself, so build
+    # trees living inside the lighthouse checkout stay invisible to git on every
+    # branch. Tracking one instead would only cover the branch it was added on.
+    (build_dir.parent / ".gitignore").write_text("*\n")
+
+    args = list(CMAKE_ARGS)
+    # Build the bindings against the interpreter that will import them.
+    args.append(f"-DPython3_EXECUTABLE={sys.executable}")
+    for tool, flag in (
+        ("clang", "CMAKE_C_COMPILER"),
+        ("clang++", "CMAKE_CXX_COMPILER"),
+    ):
+        if path := shutil.which(tool):
+            args.append(f"-D{flag}={path}")
+    if shutil.which("ccache"):
+        args.append("-DLLVM_CCACHE_BUILD=ON")
+    args += extra_args
+
+    print(f"  cmake configure ({build_dir})", flush=True)
+    proc = subprocess.run(
+        ["cmake", str(llvm_dir / "llvm"), *args], cwd=build_dir, text=True
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"CMake configure failed in {build_dir}. Remove that directory to "
+            f"retry from scratch."
+        )
+
+
 def build_llvm(build_dir: Path, jobs: int) -> None:
     """Incrementally build LLVM. 'no work to do' when already up to date."""
-    if not (build_dir / "build.ninja").exists():
-        raise SystemExit(
-            f"{build_dir} is not a configured ninja build directory. Configure "
-            f"CMake with -G Ninja, MLIR_ENABLE_BINDINGS_PYTHON=ON, "
-            f"MLIR_ENABLE_LEVELZERO_RUNNER=1 and SPIRV in LLVM_TARGETS_TO_BUILD."
-        )
     print(f"  ninja -j {jobs} ({build_dir})", flush=True)
     proc = subprocess.run(["ninja", "-j", str(jobs)], cwd=build_dir, text=True)
     if proc.returncode != 0:
@@ -356,13 +421,25 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--llvm-dir", type=Path, default=DEFAULT_LLVM_DIR)
+    parser.add_argument(
+        "--llvm-dir", type=Path, default=DEFAULT_LLVM_DIR, help="LLVM source tree"
+    )
     parser.add_argument("--lighthouse-dir", type=Path, default=DEFAULT_LIGHTHOUSE_DIR)
     parser.add_argument(
-        "--build-dir",
+        "--build-root",
         type=Path,
-        default=None,
-        help="LLVM ninja build directory (default: <llvm-dir>/build)",
+        default=DEFAULT_BUILD_ROOT,
+        help="Parent of the per-revision LLVM build directories, one per LLVM "
+        "revision so that reruns rebuild only what changed "
+        f"(default: {DEFAULT_BUILD_ROOT}, ~2GB each)",
+    )
+    parser.add_argument(
+        "--cmake-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Extra argument for the CMake configure of a fresh build directory "
+        "(repeatable). Ignored for directories already configured.",
     )
     parser.add_argument(
         "--fusion-llvm-rev",
@@ -406,7 +483,7 @@ def main() -> int:
 
     llvm_dir = args.llvm_dir.resolve()
     lighthouse_dir = args.lighthouse_dir.resolve()
-    build_dir = (args.build_dir or llvm_dir / "build").resolve()
+    build_root = args.build_root.resolve()
 
     for repo in (llvm_dir, lighthouse_dir):
         if not (repo / ".git").exists():
@@ -453,8 +530,15 @@ def main() -> int:
             commits.setdefault("llvm", {})[llvm_branch] = git(
                 llvm_dir, "rev-parse", "--short", "HEAD"
             )
+            build_dir = build_dir_for(build_root, llvm_branch)
             if not args.no_build:
+                configure_llvm(build_dir, llvm_dir, args.cmake_arg)
                 build_llvm(build_dir, args.jobs)
+            elif not (build_dir / "build.ninja").exists():
+                raise SystemExit(
+                    f"--no-build was passed but {build_dir} is not configured; "
+                    f"drop --no-build for the first run of this revision."
+                )
             env = bench_env(build_dir, lighthouse_dir)
 
             for version in (v for v in VERSIONS if v.llvm_branch == llvm_branch):
