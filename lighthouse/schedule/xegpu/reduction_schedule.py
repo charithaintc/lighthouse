@@ -47,6 +47,12 @@ def reduction_schedule(
             - subgroup_size: Size of subgroup
             - sizes: Tuple with the sizes of the input tensors (e.g. (M, N))
             - reduction_step_size: Optional step size for tiling reduction loops
+            - fuse_dependant_reductions: Optional; fold a two-reduction
+              `R1 -> E -> R2` chain into a single online loop instead of giving
+              each reduction its own. Off by default, and only sound when `E`'s
+              data inputs cancel in the new/old ratio of the online correction --
+              softmax's `exp(x - m) = exp(x)/exp(m)` does, layer norm's
+              `(x - mean)^2` does not.
 
     Returns:
         MLIR module containing the transform schedule
@@ -119,8 +125,15 @@ def bundle_xegpu_reduction_schedule(
     lh_transform.cleanup(func)
 
     # Fuse elementwise ops, also removes unused linalg op results (if any).
-    func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
-    lh_transform.cleanup(func)
+    #
+    # Skipped in the online form: `fuse_dependant_reduction_ops` needs the
+    # elementwise term `E` of the `R1 -> E -> R2` chain to still be an op of its
+    # own, and this pass folds it into every consumer. It runs after the fusion
+    # instead.
+    online_reduction = layer_params.get("fuse_dependant_reductions", False)
+    if not online_reduction:
+        func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
+        lh_transform.cleanup(func)
 
     # WG row tiling
     generic_ops = structured.structured_match(anytype, mod, ops=["linalg.generic"])
@@ -164,12 +177,17 @@ def bundle_xegpu_reduction_schedule(
 
     reduction_tile_size = [0, reduction_step_size]
 
-    # Tile trailing elemwise op first.
-    tiled_elemwise, tile_loop = structured.TileUsingForOp(
-        leaf_elemwise, sizes=reduction_tile_size
-    ).results
-    # Fuse all elemwise producers into the tiled leaf loop.
-    fuse_elemwise_producers_to_loop(tiled_elemwise, tile_loop)
+    def tile_leaf_elemwise():
+        """Tiles the trailing elemwise op and fuses its elemwise producers in."""
+        tiled_elemwise, tile_loop = structured.TileUsingForOp(
+            leaf_elemwise, sizes=reduction_tile_size
+        ).results
+        fuse_elemwise_producers_to_loop(tiled_elemwise, tile_loop)
+
+    # Tile trailing elemwise op first, unless the reductions are fused: the
+    # online form needs the chain still rooted at the untiled reductions.
+    if not online_reduction:
+        tile_leaf_elemwise()
 
     def tile_and_fuse_reduction(reduction_op, tile_sizes):
         # Tile the reduction op.
@@ -184,17 +202,58 @@ def bundle_xegpu_reduction_schedule(
         # Fuse all elemwise producers into the tiled leaf loop.
         fuse_elemwise_producers_to_loop(tiled_op, tile_loop)
 
-    # Tile and fuse the reduction loops in reverse order. After each fusion
-    # step, DCE removes the dead untiled elementwise epilogue so it cannot
-    # create a cross-loop use that breaks the next tile-fuse iteration. Note
-    # that DCE does not invalidate the reduction loop handles as the tracking
-    # listener only invalidates modified handles and the reduction loops are
-    # alive and thus not removed.
-    reduction_ops = transform_ext.reverse_handles(reduction_ops)
-    with lh_transform.foreach(reduction_ops) as reduction_op:
-        tile_and_fuse_reduction(reduction_op, reduction_tile_size)
-        transform.apply_dce(wg_loop)
-        transform.yield_()
+    if online_reduction:
+        # One-pass (online) form. Instead of one loop over the reduction axis
+        # per reduction, fold the whole `R1 -> E -> R2` chain into R1's loop:
+        # `fuse_dependant_reduction_ops` moves `E` and `R2` into it and inserts
+        # the correction that rescales R2's running accumulator whenever R1's
+        # changes. For softmax the chain is `max -> exp(x - max) -> sum`, so the
+        # running max and the running normalizer are accumulated together and
+        # the input is read once here instead of twice.
+        #
+        # `E` keeps a second, unfused copy outside the loop, which is what the
+        # normalizing divide reads: the tiles the fused copy computes use the
+        # *running* max, and only the accumulator the correction rescales is
+        # valid at the end. That copy is tiled into the trailing elemwise loop
+        # below, so it is recomputed per tile rather than materialized whole.
+        r1_op = transform_ext.extract_handle(reduction_ops, 0)
+        r2_op = transform_ext.extract_handle(reduction_ops, -1)
+        # `E` is R2's only input; R2 reduces nothing else.
+        e_op = transform.get_producer_of_operand(anytype, r2_op, operand_number=0)
+
+        # Tile R1 along the reduction axis. Unlike `tile_reduction_using_for`
+        # this carries the accumulator at its final shape rather than a partial
+        # one, which is what the fusion needs: the correction reads the running
+        # value per parallel slice. The marker attribute is how the fusion op
+        # recognizes the producer loop.
+        _, reduction_loop = structured.structured_tile_using_for(
+            anytype,
+            [anytype],
+            r1_op,
+            dynamic_sizes=[],
+            interchange=[],
+            static_sizes=reduction_tile_size,
+            scalable_sizes=[False] * len(reduction_tile_size),
+        )
+        transform.annotate(reduction_loop, "__reduction_loop__")
+        structured.structured_fuse_dependant_reduction_ops(
+            anytype, reduction_loop, e_op, r2_op
+        )
+
+        # Now tile the divide, pulling the leftover full-extent `E` in with it.
+        tile_leaf_elemwise()
+    else:
+        # Tile and fuse the reduction loops in reverse order. After each fusion
+        # step, DCE removes the dead untiled elementwise epilogue so it cannot
+        # create a cross-loop use that breaks the next tile-fuse iteration. Note
+        # that DCE does not invalidate the reduction loop handles as the tracking
+        # listener only invalidates modified handles and the reduction loops are
+        # alive and thus not removed.
+        reduction_ops = transform_ext.reverse_handles(reduction_ops)
+        with lh_transform.foreach(reduction_ops) as reduction_op:
+            tile_and_fuse_reduction(reduction_op, reduction_tile_size)
+            transform.apply_dce(wg_loop)
+            transform.yield_()
 
     # Fuse all sibling elementwise ops in scf.for loops.
     func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
@@ -203,11 +262,61 @@ def bundle_xegpu_reduction_schedule(
     transform.apply_cse(func)
     canonicalize(func)
 
+    if online_reduction:
+        # The fused `E` still writes each tile back into the full-extent
+        # iter_arg it was carved out of, a loop result nothing reads now that
+        # the divide recomputes the term. Neither DCE nor canonicalization can
+        # see that -- the writes feed the loop's yield, so the chain is only
+        # dead once the loop *results* are known dead, and scf.for only folds
+        # away an iter_arg whose region argument is unused too.
+        # `remove-dead-values` runs a liveness analysis across the loop and
+        # unwinds the whole chain.
+        func = apply_registered_pass(func, "remove-dead-values")
+        transform.apply_cse(func)
+        canonicalize(func)
+
     if stop_at_stage == "tiled":
         raise PipelineInterrupt()
 
-    # vectorize
-    func = vectorize(mod, payload_func_name=payload_func_name)
+    if online_reduction:
+        # Same as `vectorize`, with a CSE inserted before the subset hoisting.
+        # Vectorization emits one `transfer_read` per linalg op reading a given
+        # iter_arg -- the running max is read by its own reduction *and* by the
+        # correction's "old" term -- and subset hoisting refuses to hoist a
+        # read/write pair while any other subset op on the same tensor overlaps
+        # it. Merging the duplicate reads first is what keeps the accumulator
+        # loop-carried in a register instead of re-read and re-written per tile.
+        func = get_named_func(mod, payload_func_name)
+        func = structured.structured_vectorize_children_and_apply_patterns(
+            anytype,
+            func,
+            fold_type_extensions_into_contract=True,
+        )
+        transform.apply_cse(func)
+        reduction_loops = match(func, ops={"scf.for"})
+        lh_transform.loop_hoisting(reduction_loops)
+        lh_transform.cleanup(func)
+    else:
+        func = vectorize(mod, payload_func_name=payload_func_name)
+
+    # Relax the float semantics of the whole kernel. These reductions are
+    # transcendental-heavy, and with strict IEEE `exp` the kernel is bound by the
+    # precise polynomial expansion rather than by memory; `fast` lets the backend
+    # use the hardware transcendental unit, which is worth more here than any
+    # tiling choice.
+    transform_ext.set_fastmath(func)
+
+    # With that in place, rewrite `exp(a) / exp(b)` into `exp(a - b)`. The online
+    # rescale factor comes out of the fusion as `exp(-m_new) / exp(-m_old)`, so
+    # this trades two transcendentals and a divide per tile for one subtract and
+    # one exp. A no-op for the unfused form, which has no such divide.
+    #
+    # Both run here rather than at linalg level: the two exponentials and the
+    # divide live in separate linalg ops until vectorization merges them into a
+    # single block, and the divide originates from a `linalg.elementwise`, which
+    # carries no `fastmath` attribute for `fold_exp_div` to key off.
+    transform_ext.fold_exp_div(func)
+
     transform.apply_cse(func)
     canonicalize(func)
 

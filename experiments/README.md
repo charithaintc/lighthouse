@@ -1,3 +1,69 @@
+# Performance experiments
+
+| Script | What it compares | Output |
+|--------|------------------|--------|
+| `run_attention_perf_comparison.py` | Three attention lowerings across context lengths. Spans two LLVM revisions, so it switches branches and rebuilds. | `attention_perf_results.md` |
+| `run_softmax_online_comparison.py` | The two softmax reduction schedules across reduction-dimension sizes. One checkout, one build, no rebuilds. | `softmax_online_results.md` |
+
+---
+
+# Softmax reduction fusion comparison
+
+`run_softmax_online_comparison.py` benchmarks the two reduction schedules
+`examples/xegpu/softmax.py` can emit, with the parallel dimension fixed and the
+reduction dimension swept:
+
+| Variant | Loops over the reduction axis | Flag |
+|---------|-------------------------------|------|
+| baseline | one per reduction: `max`, `sum`, then the normalizing divide -- 3 passes over the input | (none) |
+| online | `max` and `sum` folded into one loop by `transform.structured.fuse_dependant_reduction_ops`, divide as the only epilogue -- 2 passes | `--online` |
+
+Both come from the same checkout and the same LLVM build, so unlike the attention
+script this one switches no branches and builds nothing. It needs only the MLIR
+python bindings from an existing build tree.
+
+```bash
+cd <lighthouse>
+experiments/run_softmax_online_comparison.py
+experiments/run_softmax_online_comparison.py --reduction-sizes 4096 8192 --nruns 50
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--parallel-size N` | Row dimension, held fixed (default 4096) |
+| `--reduction-sizes ...` | Column dimensions to sweep (default 4096 8192 16384) |
+| `--baseline-tile` / `--online-tile` | Reduction tile size per variant (default 128 / 64) |
+| `--nruns` / `--nwarmup` | Iteration counts (default 200 / 200) |
+| `--llvm-build DIR` | Build tree supplying the MLIR python bindings |
+| `--no-check` | Skip the numpy correctness check on every point |
+| `--output PATH` | Where to write the report |
+
+The two variants keep **different fixed tile sizes**, each tuned once at the
+smallest size. Their optima genuinely differ -- the online form does one
+cross-lane row reduction per tile where the baseline does one per row, so it wants
+larger tiles -- and holding them fixed shows how one tuned configuration scales
+rather than a per-size best-of.
+
+Bandwidth is reported against the minimum traffic a softmax must move
+(`2 * M * N * 4` bytes), so the baseline's extra pass lowers its achieved figure
+instead of being credited as useful traffic.
+
+## If the two variants look suspiciously similar
+
+They are probably both running installed code. There is a pip-installed
+`lighthouse` in site-packages on the dev machines, and
+`python examples/xegpu/softmax.py` puts only the *script's* directory on
+`sys.path` -- not the repository root -- so the installed copy wins unless
+PYTHONPATH names the repository. Nothing fails: the schedule under test simply
+is not there, `--online` is ignored, and the two variants end up differing only by
+tile size. The script sets PYTHONPATH itself and runs a preflight that imports
+`reduction_schedule` the same way the benchmark will and refuses to start if it
+does not resolve inside the repository. Do not work around that by exporting
+PYTHONPATH with a *trailing* colon: that adds the current directory, so results
+depend on where you invoked the script from.
+
+---
+
 # Attention performance comparison
 
 `run_attention_perf_comparison.py` benchmarks three attention lowerings across a

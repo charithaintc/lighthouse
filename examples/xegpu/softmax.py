@@ -195,6 +195,12 @@ def parse_cli():
         help="Step size for reduction loop tiling (optional).",
     )
     parser.add_argument(
+        "--online",
+        action="store_true",
+        help="Fuse the max and sum reductions into a single online (one-pass) "
+        "reduction loop.",
+    )
+    parser.add_argument(
         "--nruns",
         type=int,
         default=1000,
@@ -255,6 +261,7 @@ if __name__ == "__main__":
                 "sg_rows": args.sg_rows,
                 "subgroup_size": args.subgroup_size,
                 "reduction_step_size": args.reduction_step_size,
+                "fuse_dependant_reductions": args.online,
             }
         ]
     )
