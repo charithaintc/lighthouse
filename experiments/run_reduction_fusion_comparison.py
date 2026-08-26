@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Reproduce the 2-way softmax reduction-fusion comparison.
+"""Reproduce the 2-way dependent-reduction-fusion comparison.
 
-Benchmarks the two reduction schedules `examples/xegpu/softmax.py` can emit,
+Benchmarks the two reduction schedules the `max -> E -> sum` kernels can emit,
 over a range of reduction-dimension sizes with the parallel dimension fixed:
 
   baseline -- one loop over the reduction axis per reduction, so `max`, `sum`
-              and the normalizing divide each make their own pass: 3 passes.
+              and the epilogue each make their own pass: 3 passes.
   online   -- `max` and `sum` folded into a single loop by
               `transform.structured.fuse_dependant_reduction_ops`, leaving the
-              divide as the only epilogue: 2 passes.
+              epilogue as the only extra pass: 2 passes.
 
-Both run from the same checkout and the same LLVM build -- they differ only by
-the `--online` flag -- so unlike `run_attention_perf_comparison.py` this script
-switches no branches and builds nothing.
+Three kernels share that chain and differ in the elementwise term `E`, and so in
+the online correction the transform derives from it:
+
+  softmax       E = exp(x - m)     correction exp(m_old - m_new)
+  normalize-l1  E = |x / m|        correction m_old / m_new
+  normalize-l2  E = (x / m)^2      correction (m_old / m_new)^2
+
+Everything runs from the same checkout and the same LLVM build -- the variants
+differ only by the `--online` flag -- so unlike `run_attention_perf_comparison.py`
+this script switches no branches and builds nothing.
 
 Each variant keeps a fixed reduction tile size, tuned once at the smallest size
 (see `--baseline-tile` / `--online-tile`); the two optima differ, and holding
@@ -20,9 +27,10 @@ them fixed across the sweep is deliberate, so the table shows how one tuned
 configuration scales rather than a per-size best-of.
 
 Usage:
-    experiments/run_softmax_online_comparison.py
-    experiments/run_softmax_online_comparison.py --reduction-sizes 4096 8192
-    experiments/run_softmax_online_comparison.py --output /tmp/softmax.md
+    experiments/run_reduction_fusion_comparison.py
+    experiments/run_reduction_fusion_comparison.py --kernel normalize-l2
+    experiments/run_reduction_fusion_comparison.py --reduction-sizes 4096 8192
+    experiments/run_reduction_fusion_comparison.py --output /tmp/report.md
 """
 
 from __future__ import annotations
@@ -38,7 +46,26 @@ from pathlib import Path
 
 DEFAULT_LIGHTHOUSE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_LLVM_BUILD = Path("/home/jovyan/llvm-project/build")
-DEFAULT_OUTPUT = Path(__file__).resolve().parent / "softmax_online_results.md"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent
+
+# kernel -> (example script, extra CLI args, human-readable chain description)
+KERNELS = {
+    "softmax": (
+        "examples/xegpu/softmax.py",
+        [],
+        "max -> exp(x - m) -> sum, then the normalizing divide",
+    ),
+    "normalize-l1": (
+        "examples/xegpu/norm.py",
+        ["--norm", "l1", "--normalize"],
+        "max -> |x / m| -> sum, then x / norm",
+    ),
+    "normalize-l2": (
+        "examples/xegpu/norm.py",
+        ["--norm", "l2", "--normalize"],
+        "max -> (x / m)^2 -> sum, then x / norm",
+    ),
+}
 
 DEFAULT_PARALLEL = 4096
 DEFAULT_REDUCTION_SIZES = [4096, 8192, 16384]
@@ -87,6 +114,7 @@ def bench_env(llvm_build: Path, lighthouse_dir: Path) -> dict:
 def run_one(
     lighthouse_dir: Path,
     env: dict,
+    kernel: str,
     variant: Variant,
     parallel: int,
     reduction: int,
@@ -95,9 +123,11 @@ def run_one(
     check: bool,
 ) -> dict | None:
     """Run one (variant, size) point; returns None if the run failed."""
+    example, kernel_args, _ = KERNELS[kernel]
     cmd = [
         sys.executable,
-        "examples/xegpu/softmax.py",
+        example,
+        *kernel_args,
         "--sizes",
         str(parallel),
         str(reduction),
@@ -221,6 +251,7 @@ def preflight(lighthouse_dir: Path, env: dict) -> None:
 
 
 def markdown_report(
+    kernel: str,
     variants: list[Variant],
     parallel: int,
     reduction_sizes: list[int],
@@ -237,7 +268,9 @@ def markdown_report(
         return format(point[field], fmt) if point else "--"
 
     lines = [
-        "# Softmax reduction fusion: baseline vs online (generated)",
+        f"# {kernel} reduction fusion: baseline vs online (generated)",
+        "",
+        f"Chain: `{KERNELS[kernel][2]}`.",
         "",
         f"Host: `{info['hostname']}`  |  f32, parallel dim = {parallel}, "
         f"wg-rows=64, sg-rows=8, subgroup-size=16  |  "
@@ -246,7 +279,7 @@ def markdown_report(
         f"Reduction tile size held fixed per variant: baseline {base.tile}, "
         f"online {online.tile}. Both tuned at the smallest size only.",
         "",
-        "`GB/s` is against the minimum traffic a softmax must move "
+        "`GB/s` is against the minimum traffic the kernel must move "
         "(`2 * M * N * 4` bytes: read the input once, write the output once), so "
         "the extra pass the baseline makes shows up as lower achieved bandwidth "
         "rather than being counted as useful traffic.",
@@ -326,6 +359,12 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
+        "--kernel",
+        choices=sorted(KERNELS),
+        default="softmax",
+        help="Which max -> E -> sum kernel to benchmark",
+    )
+    parser.add_argument(
         "--lighthouse-dir",
         type=Path,
         default=DEFAULT_LIGHTHOUSE_DIR,
@@ -372,10 +411,13 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_OUTPUT,
-        help="Where to write the markdown report",
+        default=None,
+        help="Where to write the markdown report "
+        "(default: experiments/<kernel>_online_results.md)",
     )
     args = parser.parse_args()
+    if args.output is None:
+        args.output = DEFAULT_OUTPUT_DIR / f"{args.kernel}_online_results.md"
 
     bindings = args.llvm_build / "tools/mlir/python_packages/mlir_core"
     if not bindings.is_dir():
@@ -395,7 +437,7 @@ def main() -> int:
     env = bench_env(args.llvm_build, args.lighthouse_dir)
     preflight(args.lighthouse_dir, env)
     print(
-        f"=== softmax: {args.parallel_size} x "
+        f"=== {args.kernel}: {args.parallel_size} x "
         f"{{{', '.join(map(str, args.reduction_sizes))}}} ==="
     )
     print(f"    PYTHONPATH={env['PYTHONPATH']}")
@@ -405,6 +447,7 @@ def main() -> int:
             point = run_one(
                 args.lighthouse_dir,
                 env,
+                args.kernel,
                 variant,
                 args.parallel_size,
                 n,
@@ -416,6 +459,7 @@ def main() -> int:
                 results[variant.key][n] = point
 
     report = markdown_report(
+        args.kernel,
         variants,
         args.parallel_size,
         args.reduction_sizes,

@@ -3,40 +3,51 @@
 | Script | What it compares | Output |
 |--------|------------------|--------|
 | `run_attention_perf_comparison.py` | Three attention lowerings across context lengths. Spans two LLVM revisions, so it switches branches and rebuilds. | `attention_perf_results.md` |
-| `run_softmax_online_comparison.py` | The two softmax reduction schedules across reduction-dimension sizes. One checkout, one build, no rebuilds. | `softmax_online_results.md` |
+| `run_reduction_fusion_comparison.py` | The two reduction schedules for a `max -> E -> sum` kernel (softmax, L1/L2 normalize) across reduction-dimension sizes. One checkout, one build, no rebuilds. | `<kernel>_online_results.md` |
 
 ---
 
-# Softmax reduction fusion comparison
+# Dependent reduction fusion comparison
 
-`run_softmax_online_comparison.py` benchmarks the two reduction schedules
-`examples/xegpu/softmax.py` can emit, with the parallel dimension fixed and the
+`run_reduction_fusion_comparison.py` benchmarks the two reduction schedules a
+`max -> E -> sum` kernel can emit, with the parallel dimension fixed and the
 reduction dimension swept:
 
 | Variant | Loops over the reduction axis | Flag |
 |---------|-------------------------------|------|
-| baseline | one per reduction: `max`, `sum`, then the normalizing divide -- 3 passes over the input | (none) |
-| online | `max` and `sum` folded into one loop by `transform.structured.fuse_dependant_reduction_ops`, divide as the only epilogue -- 2 passes | `--online` |
+| baseline | one per reduction: `max`, `sum`, then the epilogue -- 3 passes over the input | (none) |
+| online | `max` and `sum` folded into one loop by `transform.structured.fuse_dependant_reduction_ops`, epilogue as the only extra pass -- 2 passes | `--online` |
 
-Both come from the same checkout and the same LLVM build, so unlike the attention
-script this one switches no branches and builds nothing. It needs only the MLIR
-python bindings from an existing build tree.
+Three kernels share that chain and differ only in the elementwise term `E`, and
+so in the correction the transform derives from it:
+
+| `--kernel` | `E` | Correction | Example |
+|------------|-----|------------|---------|
+| `softmax` (default) | `exp(x - m)` | `exp(m_old - m_new)` | `examples/xegpu/softmax.py` |
+| `normalize-l1` | `\|x / m\|` | `m_old / m_new` | `examples/xegpu/norm.py --norm l1 --normalize` |
+| `normalize-l2` | `(x / m)^2` | `(m_old / m_new)^2` | `examples/xegpu/norm.py --norm l2 --normalize` |
+
+Everything comes from the same checkout and the same LLVM build, so unlike the
+attention script this one switches no branches and builds nothing. It needs only
+the MLIR python bindings from an existing build tree.
 
 ```bash
 cd <lighthouse>
-experiments/run_softmax_online_comparison.py
-experiments/run_softmax_online_comparison.py --reduction-sizes 4096 8192 --nruns 50
+experiments/run_reduction_fusion_comparison.py
+experiments/run_reduction_fusion_comparison.py --kernel normalize-l2
+experiments/run_reduction_fusion_comparison.py --reduction-sizes 4096 8192 --nruns 50
 ```
 
 | Flag | Purpose |
 |------|---------|
+| `--kernel K` | Which kernel to benchmark (default `softmax`) |
 | `--parallel-size N` | Row dimension, held fixed (default 4096) |
 | `--reduction-sizes ...` | Column dimensions to sweep (default 4096 8192 16384) |
 | `--baseline-tile` / `--online-tile` | Reduction tile size per variant (default 128 / 64) |
 | `--nruns` / `--nwarmup` | Iteration counts (default 200 / 200) |
 | `--llvm-build DIR` | Build tree supplying the MLIR python bindings |
 | `--no-check` | Skip the numpy correctness check on every point |
-| `--output PATH` | Where to write the report |
+| `--output PATH` | Where to write the report (default `experiments/<kernel>_online_results.md`) |
 
 The two variants keep **different fixed tile sizes**, each tuned once at the
 smallest size. Their optima genuinely differ -- the online form does one
@@ -44,15 +55,24 @@ cross-lane row reduction per tile where the baseline does one per row, so it wan
 larger tiles -- and holding them fixed shows how one tuned configuration scales
 rather than a per-size best-of.
 
-Bandwidth is reported against the minimum traffic a softmax must move
-(`2 * M * N * 4` bytes), so the baseline's extra pass lowers its achieved figure
-instead of being credited as useful traffic.
+Bandwidth is reported against the minimum traffic the kernel must move
+(`2 * M * N * 4` bytes: read the input once, write the output once), so the
+baseline's extra pass lowers its achieved figure instead of being credited as
+useful traffic.
+
+A bare row-wise norm -- `examples/xegpu/norm.py` without `--normalize`, whose
+result is one scalar per row -- is deliberately **not** in the table. Its fused
+form would be a single pass rather than two, but its rank-1 output crashes the
+XeGPU pipeline (`setupLoadNdAnchorLayout` for the unfused schedule,
+`propagateLayouts` for the fused one) with or without fusion; see
+`debug_dir/issue-xegpu-rank1-row-reduction-output-crash*.mlir`. The kernel itself
+is correct at linalg level.
 
 ## If the two variants look suspiciously similar
 
 They are probably both running installed code. There is a pip-installed
 `lighthouse` in site-packages on the dev machines, and
-`python examples/xegpu/softmax.py` puts only the *script's* directory on
+`python examples/xegpu/<kernel>.py` puts only the *script's* directory on
 `sys.path` -- not the repository root -- so the installed copy wins unless
 PYTHONPATH names the repository. Nothing fails: the schedule under test simply
 is not there, `--online` is ignored, and the two variants end up differing only by

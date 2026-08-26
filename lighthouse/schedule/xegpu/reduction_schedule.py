@@ -53,6 +53,12 @@ def reduction_schedule(
               data inputs cancel in the new/old ratio of the online correction --
               softmax's `exp(x - m) = exp(x)/exp(m)` does, layer norm's
               `(x - mean)^2` does not.
+            - epilogue_spans_reduction_dim: Optional, default True. Whether the
+              trailing elementwise op covers the reduction axis and so has to be
+              tiled along it (softmax, layer norm). False for kernels whose
+              result is one value per parallel slice, e.g. a row-wise norm: there
+              the epilogue only consumes the reduced accumulators, so there is
+              nothing to tile and the output is rank-reduced.
 
     Returns:
         MLIR module containing the transform schedule
@@ -131,6 +137,7 @@ def bundle_xegpu_reduction_schedule(
     # own, and this pass folds it into every consumer. It runs after the fusion
     # instead.
     online_reduction = layer_params.get("fuse_dependant_reductions", False)
+    epilogue_spans_reduction = layer_params.get("epilogue_spans_reduction_dim", True)
     if not online_reduction:
         func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
         lh_transform.cleanup(func)
@@ -178,7 +185,14 @@ def bundle_xegpu_reduction_schedule(
     reduction_tile_size = [0, reduction_step_size]
 
     def tile_leaf_elemwise():
-        """Tiles the trailing elemwise op and fuses its elemwise producers in."""
+        """Tiles the trailing elemwise op and fuses its elemwise producers in.
+
+        A no-op when the epilogue does not span the reduction axis: it then has
+        no loop to tile (a row-wise norm's epilogue only reads the reduced
+        accumulators) and its producers are already inside the reduction loops.
+        """
+        if not epilogue_spans_reduction:
+            return
         tiled_elemwise, tile_loop = structured.TileUsingForOp(
             leaf_elemwise, sizes=reduction_tile_size
         ).results
@@ -286,11 +300,22 @@ def bundle_xegpu_reduction_schedule(
         # read/write pair while any other subset op on the same tensor overlaps
         # it. Merging the duplicate reads first is what keeps the accumulator
         # loop-carried in a register instead of re-read and re-written per tile.
+        # `disable_multi_reduction_to_contract_patterns` keeps the reduction as a
+        # `vector.multi_reduction`. Without it, a reduction whose per-element term
+        # is a product -- an L2 norm's `sum_j (x/m)^2`, once the elementwise term
+        # has been folded into the reduction body -- is rewritten to a
+        # `vector.contract` reducing a 2-D tile to a 1-D result. XeGPU expects
+        # contractions to be DPAS-shaped and asserts on that form, and lowering
+        # the contract back afterwards is worse: the only strategy that applies
+        # scalarizes it into one `vector.reduction` per row. Softmax and layer norm
+        # are unaffected -- their reduction terms are not products, so no contract
+        # was formed either way.
         func = get_named_func(mod, payload_func_name)
         func = structured.structured_vectorize_children_and_apply_patterns(
             anytype,
             func,
             fold_type_extensions_into_contract=True,
+            disable_multi_reduction_to_contract_patterns=True,
         )
         transform.apply_cse(func)
         reduction_loops = match(func, ops={"scf.for"})
@@ -354,17 +379,35 @@ def bundle_xegpu_reduction_schedule(
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
 
-    # Set layout attributes for xegpu.store_nd and xegpu.store_matrix ops.
+    # Set layout attributes on the stores. These are the anchors the wg-level
+    # layout propagation works backwards from, so every store needs one.
+    #
+    # `xegpu.store` covers the scattered form. `convert-vector-to-xegpu` only
+    # emits an `xegpu.store_nd` block store for a vector of rank >= 2 and routes
+    # rank-1 writes to the scatter path, so a kernel whose result is one value per
+    # row (a norm) reaches this point with no `store_nd` at all -- without an
+    # anchor on the scatter, propagation has nothing to start from and fails with
+    # "op has users but no layout assigned for its result".
     gpu_mod = match_and_split(mod, ops={"gpu.module"})[0]
     gpu_func = match(gpu_mod, ops={"gpu.func"})
     store_nd_ops = match(gpu_func, ops={"xegpu.store_nd"})
     store_matrix_ops = match(gpu_func, ops={"xegpu.store_matrix"})
-    sg_layout = [layer_params["wg_rows"] // layer_params["sg_rows"], 1]
-    sg_data = [layer_params["sg_rows"], layer_params["reduction_step_size"]]
+    store_scatter_ops = match(gpu_func, ops={"xegpu.store"})
+    if epilogue_spans_reduction:
+        sg_layout = [layer_params["wg_rows"] // layer_params["sg_rows"], 1]
+        sg_data = [layer_params["sg_rows"], layer_params["reduction_step_size"]]
+    else:
+        # The result is one value per row, so the store is rank 1: distribute the
+        # rows over the subgroups, sg_rows each, with no column dim to split.
+        sg_layout = [layer_params["wg_rows"] // layer_params["sg_rows"]]
+        sg_data = [layer_params["sg_rows"]]
     with lh_transform.foreach(store_nd_ops) as store_op:
         xegpu.set_anchor_layout(store_op, sg_layout=sg_layout, sg_data=sg_data)
         transform.yield_()
     with lh_transform.foreach(store_matrix_ops) as store_op:
+        xegpu.set_anchor_layout(store_op, sg_layout=sg_layout, sg_data=sg_data)
+        transform.yield_()
+    with lh_transform.foreach(store_scatter_ops) as store_op:
         xegpu.set_anchor_layout(store_op, sg_layout=sg_layout, sg_data=sg_data)
         transform.yield_()
 
