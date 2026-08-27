@@ -1,270 +1,231 @@
-"""Transform extension to generate fused attention computation."""
+"""Transform extension to generate fused attention computation at tensor level."""
 
-import numpy as np
 from mlir import ir
-from mlir.dialects import ext, transform, arith, scf, math, vector
+from mlir.dialects import ext, transform, arith, scf, math, linalg, tensor
 from mlir.dialects.transform import DiagnosedSilenceableFailure
-from lighthouse.utils.numpy import mlir_to_numpy_dtype
 
 from lighthouse.dialects.transform.transform_ext import TransformExtensionDialect
 
 
-def emit_vector_constant(shape, fill_value, element_type):
-    """Emit an arith.constant of vector type, filled with fill_value."""
-    vector_type = ir.VectorType.get(list(shape), element_type)
-    np_dtype = mlir_to_numpy_dtype(element_type)
-    values = np.full(shape, fill_value, dtype=np_dtype)
-    attr = ir.DenseElementsAttr.get(values, type=vector_type)
-    return arith.constant(vector_type, attr)
+def _scalar_constant(value, element_type):
+    """Emit a scalar arith.constant of the given float type."""
+    return arith.constant(element_type, ir.FloatAttr.get(element_type, value))
 
 
-def _iterator_types(num_parallel, num_reduction):
-    """Build a vector.contract iterator_types array attribute."""
-    parallel = ir.Attribute.parse("#vector.iterator_type<parallel>")
-    reduction = ir.Attribute.parse("#vector.iterator_type<reduction>")
+def _empty(shape, element_type):
+    """Emit a tensor.empty of the given static shape."""
+    return tensor.empty(list(shape), element_type)
+
+
+def _filled(shape, element_type, value):
+    """Emit a tensor.empty initialized with `value` through a linalg.fill."""
+    return linalg.fill(
+        _scalar_constant(value, element_type), outs=[_empty(shape, element_type)]
+    )
+
+
+def _iterators(num_parallel, num_reduction):
+    """Build a linalg iterator_types array attribute."""
+    parallel = ir.Attribute.parse("#linalg.iterator_type<parallel>")
+    reduction = ir.Attribute.parse("#linalg.iterator_type<reduction>")
     return ir.ArrayAttr.get([parallel] * num_parallel + [reduction] * num_reduction)
 
 
-def _broadcast_last_dim(value, batch_shape, wg_rows, last_dim, element_type):
-    """Broadcast a [*batch, wg_rows] vector to [*batch, wg_rows, last_dim].
+def _generic(ins, outs, maps, iterators, body):
+    """Emit a single-result linalg.generic.
 
-    vector.broadcast can only prepend leading dims, so the new dimension is
-    broadcast to the front and then transposed to the trailing position.
+    `maps` holds the indexing maps of `ins` followed by those of `outs`,
+    `iterators` the iterator_types attribute and `body` a callable receiving the
+    block arguments (inputs then outputs) and returning the value to yield.
     """
-    nb = len(batch_shape)
-    bcasted_type = ir.VectorType.get([last_dim, *batch_shape, wg_rows], element_type)
-    bcasted = vector.broadcast(bcasted_type, value)
-    # Move the leading (last_dim) axis to the back, keeping batch and wg_rows order.
-    perm = list(range(1, nb + 2)) + [0]
-    out_type = ir.VectorType.get([*batch_shape, wg_rows, last_dim], element_type)
-    return vector.transpose(out_type, bcasted, perm)
-
-
-def compute_qkt(
-    q_value,
-    k_load_op,
-    loop_idx,
-    batch_shape,
-    wg_rows,
-    d_head,
-    tile_size,
-    k_element_type,
-    compute_type,
-):
-    """Load the K tile, transpose it, and contract with Q to produce Q@K^T.
-
-    The K tile is [*batch, tile_size, d_head], transposed to
-    [*batch, d_head, tile_size] and contracted with q_value
-    [*batch, wg_rows, d_head] to produce [*batch, wg_rows, tile_size], reducing
-    over d_head. K is `k_element_type` (Q keeps whatever type q_value already
-    has), the contraction accumulates in `compute_type`.
-    """
-    nb = len(batch_shape)
-    k_memref = k_load_op.operands[0]
-    k_load_indices = list(k_load_op.operands[1:-1])
-    padding = k_load_op.operands[-1]
-    in_bounds = k_load_op.attributes.get("in_bounds", None)
-    k_perm_map = k_load_op.attributes.get("permutation_map", None)
-
-    dims = [ir.AffineExpr.get_dim(i) for i in range(nb + 3)]
-    batch = dims[:nb]
-    m, tile, k = dims[nb], dims[nb + 1], dims[nb + 2]
-
-    q_map = ir.AffineMap.get(nb + 3, 0, batch + [m, k])
-    k_map = ir.AffineMap.get(nb + 3, 0, batch + [k, tile])
-    out_map = ir.AffineMap.get(nb + 3, 0, batch + [m, tile])
-
-    indexing_maps = ir.ArrayAttr.get(
-        [
-            ir.AffineMapAttr.get(q_map),
-            ir.AffineMapAttr.get(k_map),
-            ir.AffineMapAttr.get(out_map),
+    generic = linalg.GenericOp(
+        result_tensors=[out.type for out in outs],
+        inputs=ins,
+        outputs=outs,
+        indexing_maps=ir.ArrayAttr.get([ir.AffineMapAttr.get(m) for m in maps]),
+        iterator_types=iterators,
+    )
+    block = generic.regions[0].blocks.append(
+        *[
+            ir.ShapedType(operand.type).element_type
+            for operand in list(ins) + list(outs)
         ]
     )
-    iterator_types = _iterator_types(nb + 2, 1)
-
-    qkt_type = ir.VectorType.get([*batch_shape, wg_rows, tile_size], compute_type)
-    qkt_acc = emit_vector_constant(
-        (*batch_shape, wg_rows, tile_size), 0.0, compute_type
-    )
-
-    k_tile_indices = k_load_indices.copy()
-    k_tile_indices[-2] = loop_idx
-
-    k_tile_type = ir.VectorType.get([*batch_shape, tile_size, d_head], k_element_type)
-    k_tile = vector.TransferReadOp(
-        k_tile_type,
-        k_memref,
-        k_tile_indices,
-        k_perm_map,
-        padding,
-        in_bounds=in_bounds,
-    ).result
-
-    k_transpose_type = ir.VectorType.get(
-        [*batch_shape, d_head, tile_size], k_element_type
-    )
-    k_transpose_perm = list(range(nb)) + [nb + 1, nb]
-    k_transpose = vector.transpose(k_transpose_type, k_tile, k_transpose_perm)
-
-    return vector.contract(
-        qkt_type,
-        q_value,
-        k_transpose,
-        qkt_acc,
-        indexing_maps=indexing_maps,
-        iterator_types=iterator_types,
-    )
+    with ir.InsertionPoint(block):
+        linalg.yield_([body(*block.arguments)])
+    return generic.results[0]
 
 
-def compute_online_softmax_and_sum(
-    qkt_scaled,
-    m_ij,
-    l_i_init,
-    batch_shape,
-    wg_rows,
-    tile_size,
-    element_type,
-):
-    """Apply online softmax to the scaled Q@K^T and reduce to a row-wise sum.
+def _tile_and_row_maps(nb):
+    """Maps over the [*batch, m, trailing] iteration space (nb + 2 dims).
 
-    Computes exp(qkt_scaled - m_ij), with m_ij broadcast over the inner dim.
-    Returns (qkt_exp, l_ij) where qkt_exp is the [*batch, wg_rows, tile_size] exp
-    tile and l_ij is its row-wise sum [*batch, wg_rows] (added into l_i_init).
+    Returns the identity map onto the full tile and the map dropping the
+    trailing dim, i.e. the one used by the [*batch, m] row vectors (either as
+    reduction results or as operands broadcast over the trailing dim).
+    """
+    dims = [ir.AffineExpr.get_dim(i) for i in range(nb + 2)]
+    return ir.AffineMap.get(nb + 2, 0, dims), ir.AffineMap.get(nb + 2, 0, dims[:-1])
+
+
+def _contract(lhs, rhs, acc, batch_shape):
+    """Emit a batched contraction `acc += lhs @ rhs` as a linalg.contract.
+
+    lhs is [*batch, m, k], rhs is [*batch, k, n] and acc is [*batch, m, n],
+    reducing over k. linalg.contract casts operands narrower than `acc` up to its
+    element type, which the vectorizer then folds back into the resulting
+    vector.contract (see `fold_type_extensions_into_contract`), so the DPAS keeps
+    its narrow operands and wide accumulator.
     """
     nb = len(batch_shape)
-    m_ij_bcasted = _broadcast_last_dim(
-        m_ij, batch_shape, wg_rows, tile_size, element_type
-    )
-
-    qkt_centered = arith.subf(qkt_scaled, m_ij_bcasted)
-    # fastmath<fast> lets the exp lower to the native hardware exp; without it
-    # the accurate expansion doubles the exp count and scalarizes part of it.
-    qkt_exp = math.exp(qkt_centered, fastmath="fast")
-
-    l_ij = vector.multi_reduction(
-        kind="add",
-        source=qkt_exp,
-        acc=l_i_init,
-        reduction_dims=[nb + 1],
-    )
-
-    return qkt_exp, l_ij
-
-
-def rescale_pv_out_accumulator(acc, alpha, batch_shape, wg_rows, d_head, compute_type):
-    """Rescale the running P@V accumulator by broadcasting alpha across d_head.
-
-    Broadcasts alpha [*batch, wg_rows] to [*batch, wg_rows, d_head] and
-    multiplies acc by it elementwise. Returns the rescaled accumulator.
-    """
-    alpha_bcasted = _broadcast_last_dim(
-        alpha, batch_shape, wg_rows, d_head, compute_type
-    )
-    return arith.mulf(acc, alpha_bcasted)
-
-
-def compute_pv(
-    qkt_exp,
-    v_load_op,
-    pv_init,
-    loop_idx,
-    batch_shape,
-    acc_vector_type,
-    d_head,
-    tile_size,
-    v_element_type,
-):
-    """Load the V tile and contract it with the softmax tile, accumulating into pv_init.
-
-    Loads V [*batch, tile_size, d_head] (`v_element_type`) and contracts it with
-    the exp tile [*batch, wg_rows, tile_size] (already narrowed to the matching P
-    dtype by the caller) into the running [*batch, wg_rows, d_head] accumulator,
-    whose type is given by `acc_vector_type`. Returns the accumulated result.
-    """
-    nb = len(batch_shape)
-    v_memref = v_load_op.operands[0]
-    v_load_indices = list(v_load_op.operands[1:-1])
-    v_padding = v_load_op.operands[-1]
-    v_in_bounds = v_load_op.attributes.get("in_bounds", None)
-    v_perm_map = v_load_op.attributes.get("permutation_map", None)
-
     dims = [ir.AffineExpr.get_dim(i) for i in range(nb + 3)]
     batch = dims[:nb]
-    m, k, tile = dims[nb], dims[nb + 1], dims[nb + 2]
+    m, n, k = dims[nb], dims[nb + 1], dims[nb + 2]
 
-    qkt_exp_map = ir.AffineMap.get(nb + 3, 0, batch + [m, tile])
-    v_map = ir.AffineMap.get(nb + 3, 0, batch + [tile, k])
-    pv_out_map = ir.AffineMap.get(nb + 3, 0, batch + [m, k])
-
-    indexing_maps_pv = ir.ArrayAttr.get(
-        [
-            ir.AffineMapAttr.get(qkt_exp_map),
-            ir.AffineMapAttr.get(v_map),
-            ir.AffineMapAttr.get(pv_out_map),
-        ]
+    return linalg.contract(
+        lhs,
+        rhs,
+        outs=[acc],
+        indexing_maps=[
+            ir.AffineMap.get(nb + 3, 0, batch + [m, k]),
+            ir.AffineMap.get(nb + 3, 0, batch + [k, n]),
+            ir.AffineMap.get(nb + 3, 0, batch + [m, n]),
+        ],
     )
-    iterator_types_pv = _iterator_types(nb + 2, 1)
 
-    v_tile_indices = v_load_indices.copy()
-    v_tile_indices[-2] = loop_idx
 
-    v_tile_type = ir.VectorType.get([*batch_shape, tile_size, d_head], v_element_type)
-    v_tile = vector.TransferReadOp(
-        v_tile_type,
-        v_memref,
-        v_tile_indices,
-        v_perm_map,
-        v_padding,
-        in_bounds=v_in_bounds,
+def _row_reduce(source, acc, combiner, batch_shape):
+    """Reduce a [*batch, m, trailing] tile to [*batch, m] over the trailing dim."""
+    nb = len(batch_shape)
+    tile_map, row_map = _tile_and_row_maps(nb)
+    return _generic(
+        [source],
+        [acc],
+        [tile_map, row_map],
+        _iterators(nb + 1, 1),
+        combiner,
+    )
+
+
+def _elemwise(ins, out, batch_shape, body, broadcast_row_operands=()):
+    """Emit an elementwise linalg.generic writing into `out`.
+
+    `out` is either a [*batch, m] row vector or a [*batch, m, trailing] tile.
+    Operands listed in `broadcast_row_operands` (by index into `ins`) are row
+    vectors broadcast over the trailing dim of `out`.
+    """
+    nb = len(batch_shape)
+    is_tile = ir.ShapedType(out.type).rank == nb + 2
+    if is_tile:
+        out_map, row_map = _tile_and_row_maps(nb)
+    else:
+        out_map = row_map = ir.AffineMap.get_identity(nb + 1)
+    in_maps = [
+        row_map if i in broadcast_row_operands else out_map for i in range(len(ins))
+    ]
+    return _generic(
+        ins,
+        [out],
+        in_maps + [out_map],
+        _iterators(nb + 2 if is_tile else nb + 1, 0),
+        body,
+    )
+
+
+def _drop_leading_dims(source, num_dims):
+    """Rank-reduce `source` by slicing away its `num_dims` leading unit dims."""
+    source_type = ir.RankedTensorType(source.type)
+    sizes = list(source_type.shape)
+    return tensor.ExtractSliceOp(
+        ir.RankedTensorType.get(sizes[num_dims:], source_type.element_type),
+        source,
+        [],
+        [],
+        [],
+        [0] * source_type.rank,
+        sizes,
+        [1] * source_type.rank,
     ).result
 
-    return vector.contract(
-        acc_vector_type,
-        qkt_exp,
-        v_tile,
-        pv_init,
-        indexing_maps=indexing_maps_pv,
-        iterator_types=iterator_types_pv,
-    )
+
+def _restore_leading_dims(source, destination):
+    """Insert a rank-reduced `source` back under the leading unit dims of `destination`."""
+    destination_type = ir.RankedTensorType(destination.type)
+    return tensor.InsertSliceOp(
+        source,
+        destination,
+        [],
+        [],
+        [],
+        [0] * destination_type.rank,
+        list(destination_type.shape),
+        [1] * destination_type.rank,
+    ).result
 
 
-def normalize_output_by_sum(
-    pv_out, l_i_out, batch_shape, wg_rows, d_head, compute_type
-):
-    """Divide pv_out [*batch, wg_rows, d_head] by l_i_out [*batch, wg_rows]."""
-    l_i_out_bcasted = _broadcast_last_dim(
-        l_i_out, batch_shape, wg_rows, d_head, compute_type
-    )
-    return arith.divf(pv_out, l_i_out_bcasted)
+def _extract_kv_tile(source, loop_idx, tile_size):
+    """Slice a [*batch, n_ctx, d_head] K/V tensor down to `tile_size` rows.
+
+    Extracts [*batch, tile_size, d_head] starting at `loop_idx` along the n_ctx
+    dim, i.e. at offset [0, ..., loop_idx, 0].
+    """
+    source_type = ir.RankedTensorType(source.type)
+    rank = source_type.rank
+    sizes = list(source_type.shape)
+    sizes[-2] = tile_size
+
+    static_offsets = [0] * rank
+    static_offsets[-2] = ir.ShapedType.get_dynamic_size()
+
+    return tensor.ExtractSliceOp(
+        ir.RankedTensorType.get(sizes, source_type.element_type),
+        source,
+        [loop_idx],
+        [],
+        [],
+        static_offsets,
+        sizes,
+        [1] * rank,
+    ).result
 
 
 class ReplaceWithFusedAttentionOp(
     TransformExtensionDialect.Operation, name="generate_fused_attention"
 ):
-    """Replace a given (standard) attention output with an equivalent output that is
-    computed in a fused fashion (fused attention optimization).
+    """Replace a tensor-level attention output with a fused (flash) attention loop.
 
-    Takes Q, K, V loads and scale constant from bufferized IR, and generates an inner
-    tiled loop that computes fused attention with online softmax using running max and sum.
+    Takes the Q, K, V tensors and the scale constant of a tiled but not yet
+    vectorized attention region and replaces the P@V linalg contraction with an
+    `scf.for` over the K/V sequence length that computes the same result with
+    online softmax:
 
-    This implements the flash attention algorithm where:
-    1. The computation is tiled along the reduction dimension (K/V sequence length)
-    2. Online max and sum are maintained across tiles
-    3. Output is incrementally updated with rescaled contributions
+        m, l, acc = -inf, 0, 0
+        for j in range(0, n_ctx, tile_size):
+            s     = (Q @ K[j:j+tile]^T) * scale
+            m_new = max(m, rowmax(s))
+            p     = exp(s - m_new)
+            alpha = exp(m - m_new)
+            l     = l * alpha + rowsum(p)
+            acc   = acc * alpha + p @ V[j:j+tile]
+            m     = m_new
+        out = acc / l
+
+    Doing this at tensor level keeps the tiling and fusion decisions at the
+    level where the rest of the schedule makes them; the regular vectorization
+    stage then lowers the emitted loop. The dead softmax and Q@K^T producers
+    left behind are removed by DCE.
 
     Args:
-        q_load: Handle to Q load operation (vector.transfer_read)
-        k_load: Handle to K load operation (vector.transfer_read)
-        v_load: Handle to V load operation (vector.transfer_read)
-        scale: Handle to scale constant operation (arith.constant)
-        output: Handle to the output operation to replace (vector.contract)
-        tile_size: Tile size for the reduction dimension tiling (K/V sequence length)
+        q: Handle to the op producing the Q tile [*batch, wg_rows, d_head]
+        k: Handle to the op producing the K tensor [*batch, n_ctx, d_head]
+        v: Handle to the op producing the V tensor [*batch, n_ctx, d_head]
+        scale: Handle to the scale constant op (scalar arith.constant)
+        output: Handle to the P@V linalg contraction to replace
+        tile_size: Tile size for the reduction dimension (K/V sequence length)
     """
 
-    q_load: ext.Operand[transform.AnyOpType]
-    k_load: ext.Operand[transform.AnyOpType]
-    v_load: ext.Operand[transform.AnyOpType]
+    q: ext.Operand[transform.AnyOpType]
+    k: ext.Operand[transform.AnyOpType]
+    v: ext.Operand[transform.AnyOpType]
     scale: ext.Operand[transform.AnyOpType]
     output: ext.Operand[transform.AnyOpType]
     tile_size: ir.IntegerAttr
@@ -283,254 +244,216 @@ class ReplaceWithFusedAttentionOp(
             results: transform.TransformResults,
             state: transform.TransformState,
         ) -> DiagnosedSilenceableFailure:
-            # Get payload operations
-            q_load_ops = state.get_payload_ops(op.q_load)
-            k_load_ops = state.get_payload_ops(op.k_load)
-            v_load_ops = state.get_payload_ops(op.v_load)
-            scale_ops = state.get_payload_ops(op.scale)
-            output_ops = state.get_payload_ops(op.output)
+            payloads = []
+            for handle in (op.q, op.k, op.v, op.scale, op.output):
+                handle_ops = state.get_payload_ops(handle)
+                if len(handle_ops) != 1:
+                    return DiagnosedSilenceableFailure.emit_silenceable_error(
+                        "Expected exactly one operation for each operand"
+                    )
+                payloads.append(handle_ops[0])
+            q_op, k_op, v_op, scale_op, output_op = payloads
 
-            if (
-                len(q_load_ops) != 1
-                or len(k_load_ops) != 1
-                or len(v_load_ops) != 1
-                or len(scale_ops) != 1
-                or len(output_ops) != 1
-            ):
-                return DiagnosedSilenceableFailure.emit_silenceable_error(
-                    "Expected exactly one operation for each operand"
-                )
-
-            q_load_op = q_load_ops[0]
-            k_load_op = k_load_ops[0]
-            v_load_op = v_load_ops[0]
-            scale_op = scale_ops[0]
-            output_op = output_ops[0]
-
-            # Verify operation types
-            if not isinstance(q_load_op.opview, vector.TransferReadOp):
-                return DiagnosedSilenceableFailure.emit_silenceable_error(
-                    f"Expected q_load to be vector.transfer_read, got {q_load_op.operation.name}"
-                )
-            if not isinstance(k_load_op.opview, vector.TransferReadOp):
-                return DiagnosedSilenceableFailure.emit_silenceable_error(
-                    f"Expected k_load to be vector.transfer_read, got {k_load_op.operation.name}"
-                )
-            if not isinstance(v_load_op.opview, vector.TransferReadOp):
-                return DiagnosedSilenceableFailure.emit_silenceable_error(
-                    f"Expected v_load to be vector.transfer_read, got {v_load_op.operation.name}"
-                )
             if not isinstance(scale_op.opview, arith.ConstantOp):
                 return DiagnosedSilenceableFailure.emit_silenceable_error(
-                    f"Expected scale to be arith.constant, got {scale_op.operation.name}"
+                    f"Expected scale to be arith.constant, got {scale_op.name}"
                 )
-            if not isinstance(output_op.opview, vector.ContractionOp):
+            if not output_op.name.startswith("linalg."):
                 return DiagnosedSilenceableFailure.emit_silenceable_error(
-                    f"Expected output to be vector.contract, got {output_op.operation.name}"
+                    f"Expected output to be a linalg op, got {output_op.name}"
                 )
 
-            # Extract the scale scalar value from scale_op (arith.constant); the
-            # splat value avoids materializing a numpy array (which mishandles bf16)
-            scale_attr = scale_op.attributes["value"]
-            scale_dense_attr = ir.DenseElementsAttr(scale_attr)
-            scale_value = ir.FloatAttr(scale_dense_attr.get_splat_value()).value
+            q, k, v = (payload.results[0] for payload in (q_op, k_op, v_op))
+            for name, value in (("q", q), ("k", k), ("v", v)):
+                if not isinstance(value.type, ir.RankedTensorType):
+                    return DiagnosedSilenceableFailure.emit_silenceable_error(
+                        f"Expected {name} to produce a ranked tensor, got {value.type}"
+                    )
 
             # The last two dims of Q are [wg_rows(M), d_head]; any leading dims
             # are batch dims carried through unchanged. Nothing is assumed about
             # the rank, so batched and non-batched payloads both work.
-            q_load_result = q_load_op.results[0]
-            q_vector_type = ir.VectorType(q_load_result.type)
-            batch_shape = list(q_vector_type.shape[:-2])
-            wg_rows = q_vector_type.shape[-2]
-            d_head = q_vector_type.shape[-1]
+            q_type = ir.RankedTensorType(q.type)
+            batch_shape = list(q_type.shape[:-2])
+            wg_rows, d_head = q_type.shape[-2], q_type.shape[-1]
+            n_ctx = ir.RankedTensorType(k.type).shape[-2]
+            tile_size = ir.IntegerAttr(op.tile_size).value
 
-            # Get tile size
-            tile_size_value = ir.IntegerAttr(op.tile_size).value
-
-            # Element types are read from the actual ops since Q, K, V, and the
+            # Element types are read from the matched ops since Q, K, V and the
             # softmax weights (P) may each use a different (possibly mixed)
-            # precision. Q keeps whatever type q_value already has.
-            k_element_type = ir.VectorType(k_load_op.results[0].type).element_type
-            v_element_type = ir.VectorType(v_load_op.results[0].type).element_type
-            # P is the lhs operand of the P@V contract being replaced, so its
-            # existing type tells us the precision the rest of the graph expects.
-            p_element_type = ir.VectorType(output_op.operands[0].type).element_type
-            # Both matmul accumulators and the online softmax (scale, running
-            # max and sum, exp) run in f32 for numerical accuracy; only the
-            # matmul operands (Q, K, V, P) keep their narrower element types.
+            # precision. Both matmul accumulators and the online softmax run in
+            # f32 for numerical accuracy; only the matmul operands keep their
+            # narrower element types.
+            k_element_type = ir.RankedTensorType(k.type).element_type
+            # P is the lhs operand of the contraction being replaced, so its
+            # element type is the precision the rest of the graph expects.
+            p_element_type = ir.RankedTensorType(
+                output_op.operands[0].type
+            ).element_type
+            out_element_type = ir.RankedTensorType(
+                output_op.results[0].type
+            ).element_type
             compute_type = ir.F32Type.get()
-            # Change this to a narrower type to run the softmax in lower precision;
-            # the `reduction_type != compute_type` guards handle the trunc/ext.
-            reduction_type = compute_type
 
-            # Build the fused attention computation
+            scale_value = ir.FloatAttr(scale_op.attributes["value"]).value
+
+            # WG tiling leaves the batch dims at extent one. Slice them away, as
+            # the XeGPU layout propagation cannot distribute the rank-3
+            # broadcasts and reductions of the online softmax.
+            squeeze = len(batch_shape) if all(d == 1 for d in batch_shape) else 0
+            if squeeze:
+                batch_shape = []
+
+            row_shape = (*batch_shape, wg_rows)
+            acc_shape = (*batch_shape, wg_rows, d_head)
+            qkt_shape = (*batch_shape, wg_rows, tile_size)
+            nb = len(batch_shape)
+
             with ir.InsertionPoint(output_op):
-                # Define m_i_init: [*batch, wg_rows] with neg_inf values
-                m_i_init = emit_vector_constant(
-                    (*batch_shape, wg_rows), float("-inf"), reduction_type
-                )
+                if squeeze:
+                    q, k, v = (_drop_leading_dims(t, squeeze) for t in (q, k, v))
 
-                # Define l_i_init: [*batch, wg_rows] with zero values
-                l_i_init = emit_vector_constant(
-                    (*batch_shape, wg_rows), 0.0, reduction_type
-                )
+                scale_tile = _filled(qkt_shape, compute_type, scale_value)
 
-                # Define acc_init: [*batch, wg_rows, d_head] with zero values
-                acc_vector_type = ir.VectorType.get(
-                    [*batch_shape, wg_rows, d_head], compute_type
-                )
-                acc_init = emit_vector_constant(
-                    (*batch_shape, wg_rows, d_head), 0.0, compute_type
-                )
-
-                # Get n_ctx (K/V sequence length) from the second-to-last k dim
-                k_load_result = k_load_op.results[0]
-                k_vector_type = ir.VectorType(k_load_result.type)
-                n_ctx = k_vector_type.shape[-2]
-                # Define scale tile: [*batch, wg_rows, tile_size] with the scale value
-                scale_tile = emit_vector_constant(
-                    (*batch_shape, wg_rows, tile_size_value),
-                    scale_value,
-                    reduction_type,
-                )
-
-                # Create loop bounds
                 index_type = ir.IndexType.get()
-                c0 = arith.constant(index_type, 0)
-                c_n_ctx = arith.constant(index_type, n_ctx)
-                c_tile_size = arith.constant(index_type, tile_size_value)
-
-                # Create scf.for loop that iterates from 0 to n_ctx in steps of tile_size
                 loop = scf.ForOp(
-                    c0, c_n_ctx, c_tile_size, [m_i_init, l_i_init, acc_init]
+                    arith.constant(index_type, 0),
+                    arith.constant(index_type, n_ctx),
+                    arith.constant(index_type, tile_size),
+                    [
+                        _filled(row_shape, compute_type, float("-inf")),
+                        _filled(row_shape, compute_type, 0.0),
+                        _filled(acc_shape, compute_type, 0.0),
+                    ],
                 )
 
                 with ir.InsertionPoint(loop.body):
-                    # Get the loop induction variable and iter_args
                     loop_idx = loop.induction_variable
-                    m_i = loop.inner_iter_args[0]
-                    l_i = loop.inner_iter_args[1]
-                    acc = loop.inner_iter_args[2]
+                    m_i, l_i, acc = loop.inner_iter_args
 
-                    q_value = q_load_op.results[0]
-
-                    # Load the K tile, transpose it, and contract with Q to get Q@K^T
-                    qkt = compute_qkt(
-                        q_value,
-                        k_load_op,
-                        loop_idx,
+                    # S = (Q @ K[j:j+tile]^T) * scale, accumulated in f32. K is
+                    # transposed explicitly so that the vectorized contraction
+                    # takes the same operand layouts as the untiled kernel.
+                    k_tile = _extract_kv_tile(k, loop_idx, tile_size)
+                    k_transposed = linalg.transpose(
+                        k_tile,
+                        outs=[
+                            _empty((*batch_shape, d_head, tile_size), k_element_type)
+                        ],
+                        permutation=[*range(nb), nb + 1, nb],
+                    ).results[0]
+                    qkt = _contract(
+                        q,
+                        k_transposed,
+                        _filled(qkt_shape, compute_type, 0.0),
                         batch_shape,
-                        wg_rows,
-                        d_head,
-                        tile_size_value,
-                        k_element_type,
-                        compute_type,
                     )
-                    # Truncate Q@K^T (f32 accumulator) to the softmax type before scaling.
-                    if reduction_type != compute_type:
-                        qkt_narrow_type = ir.VectorType.get(
-                            [*batch_shape, wg_rows, tile_size_value], reduction_type
-                        )
-                        qkt = arith.truncf(qkt_narrow_type, qkt)
-                    qkt_scaled = arith.mulf(qkt, scale_tile)
-
-                    # Reduce the scaled Q@K^T to a row-wise max: [*batch, wg_rows]
-                    qkt_row_max = vector.multi_reduction(
-                        kind="maximumf",
-                        source=qkt_scaled,
-                        acc=m_i_init,
-                        reduction_dims=[len(batch_shape) + 1],
+                    qkt_scaled = _elemwise(
+                        [qkt, scale_tile],
+                        _empty(qkt_shape, compute_type),
+                        batch_shape,
+                        lambda a, b, out: arith.mulf(a, b),
                     )
 
-                    # Compute m_ij = max(m_i, qkt_row_max)
-                    # Both have shape [*batch, wg_rows]
-                    m_ij = arith.maximumf(m_i, qkt_row_max)
-
-                    # Apply online softmax and reduce to row-wise sum
-                    qkt_exp, l_ij = compute_online_softmax_and_sum(
+                    # m_new = max(m, rowmax(S)), accumulated straight into m so
+                    # that the carried value stays a register once vectorized.
+                    m_new = _row_reduce(
                         qkt_scaled,
-                        m_ij,
-                        l_i_init,
+                        m_i,
+                        lambda value, out: arith.maximumf(value, out),
                         batch_shape,
-                        wg_rows,
-                        tile_size_value,
-                        reduction_type,
                     )
 
-                    # Compute alpha = exp(m_i - m_ij)
-                    m_diff = arith.subf(m_i, m_ij)
-                    alpha = math.exp(m_diff, fastmath="fast")
-
-                    # Update l_i: l_i_updated = l_i * alpha + l_ij
-                    l_i_scaled = arith.mulf(l_i, alpha)
-                    l_i_updated = arith.addf(l_i_scaled, l_ij)
-
-                    # Rescale running P@V accumulator by alpha; the accumulator is
-                    # kept in f32, so widen the softmax-type alpha to match.
-                    alpha_wide = alpha
-                    if reduction_type != compute_type:
-                        alpha_wide = arith.extf(
-                            ir.VectorType.get([*batch_shape, wg_rows], compute_type),
-                            alpha,
-                        )
-                    acc_updated = rescale_pv_out_accumulator(
-                        acc, alpha_wide, batch_shape, wg_rows, d_head, compute_type
-                    )
-
-                    # Narrow the softmax tile to the dtype the P@V contract expects
-                    if reduction_type != p_element_type:
-                        qkt_exp_type = ir.VectorType.get(
-                            [*batch_shape, wg_rows, tile_size_value], p_element_type
-                        )
-                        qkt_exp_narrow = arith.truncf(qkt_exp_type, qkt_exp)
-                    else:
-                        qkt_exp_narrow = qkt_exp
-
-                    # Load the V tile and contract with the softmax tile into pv_out
-                    pv_out = compute_pv(
-                        qkt_exp_narrow,
-                        v_load_op,
-                        acc_updated,
-                        loop_idx,
+                    # P = exp(S - m_new). fastmath<fast> lets the exp lower to
+                    # the native hardware exp; without it the accurate expansion
+                    # doubles the exp count and scalarizes part of it.
+                    p = _elemwise(
+                        [qkt_scaled, m_new],
+                        _empty(qkt_shape, compute_type),
                         batch_shape,
-                        acc_vector_type,
-                        d_head,
-                        tile_size_value,
-                        v_element_type,
+                        lambda a, b, out: math.exp(arith.subf(a, b), fastmath="fast"),
+                        broadcast_row_operands={1},
                     )
 
-                    # Yield the updated iter args
-                    scf.yield_([m_ij, l_i_updated, pv_out])
+                    # alpha = exp(m - m_new) rescales the running row sum and
+                    # the P@V accumulator to the new row maximum.
+                    alpha = _elemwise(
+                        [m_i, m_new],
+                        _empty(row_shape, compute_type),
+                        batch_shape,
+                        lambda a, b, out: math.exp(arith.subf(a, b), fastmath="fast"),
+                    )
 
-            # Extract the final accumulator result (3rd output) from the loop
-            pv_out = loop.results[2]
-            l_i_out = loop.results[1]
+                    # l = l * alpha + rowsum(P)
+                    l_scaled = _elemwise(
+                        [l_i, alpha],
+                        l_i,
+                        batch_shape,
+                        lambda a, b, out: arith.mulf(a, b),
+                    )
+                    l_new = _row_reduce(
+                        p,
+                        l_scaled,
+                        lambda value, out: arith.addf(value, out),
+                        batch_shape,
+                    )
+
+                    # acc = acc * alpha + P @ V[j:j+tile], with P narrowed to
+                    # the dtype the replaced contraction expects.
+                    acc_scaled = _elemwise(
+                        [acc, alpha],
+                        acc,
+                        batch_shape,
+                        lambda a, b, out: arith.mulf(a, b),
+                        broadcast_row_operands={1},
+                    )
+                    p_operand = p
+                    if p_element_type != compute_type:
+                        p_operand = _elemwise(
+                            [p],
+                            _empty(qkt_shape, p_element_type),
+                            batch_shape,
+                            lambda value, out: arith.truncf(p_element_type, value),
+                        )
+                    v_tile = _extract_kv_tile(v, loop_idx, tile_size)
+                    acc_new = _contract(p_operand, v_tile, acc_scaled, batch_shape)
+
+                    scf.yield_([m_new, l_new, acc_new])
+
+            # out = acc / l, narrowed back to the element type of the replaced
+            # op. Its destination is reused so that bufferization writes the
+            # result in place; the destination's now dead zero fill is dropped
+            # by DCE.
+            destination = output_op.operands[-1]
+            if isinstance(destination, ir.OpResult) and isinstance(
+                destination.owner, linalg.FillOp
+            ):
+                destination = destination.owner.operands[1]
+
             with ir.InsertionPoint.after(loop):
-                # The sum accumulator is in the softmax type; widen it to the f32
-                # accumulator type before dividing the f32 P@V result.
-                if reduction_type != compute_type:
-                    l_i_out = arith.extf(
-                        ir.VectorType.get([*batch_shape, wg_rows], compute_type),
-                        l_i_out,
-                    )
-                # Normalize the output: output_final = pv_out / l_i_out
-                output_normalized = normalize_output_by_sum(
-                    pv_out, l_i_out, batch_shape, wg_rows, d_head, compute_type
+                _, l_out, acc_out = loop.results
+
+                def normalize(value, row_sum, out):
+                    normalized = arith.divf(value, row_sum)
+                    if out_element_type != compute_type:
+                        normalized = arith.truncf(out_element_type, normalized)
+                    return normalized
+
+                output_final = _elemwise(
+                    [acc_out, l_out],
+                    _drop_leading_dims(destination, squeeze)
+                    if squeeze
+                    else destination,
+                    batch_shape,
+                    normalize,
+                    broadcast_row_operands={1},
                 )
-                # Narrow back to the type of the output op being replaced, if needed
-                output_type = output_op.results[0].type
-                if ir.VectorType(output_type).element_type != compute_type:
-                    output_final = arith.truncf(output_type, output_normalized)
-                else:
-                    output_final = output_normalized
+                if squeeze:
+                    output_final = _restore_leading_dims(output_final, destination)
 
-            # Replace all uses of the original output operation with the final loop result
             output_op.results[0].replace_all_uses_with(output_final)
-
-            # Erase the original output operation
             rewriter.erase_op(output_op)
 
-            # Return the final output handle
             results.set_ops(op.new_output, [output_final.owner])
             return DiagnosedSilenceableFailure.Success
 
@@ -542,7 +465,7 @@ class ReplaceWithFusedAttentionOp(
         @staticmethod
         def get_effects(op: ir.Operation):
             return (
-                # Read Q, K, scale, V slices
+                # Read Q, K, V and scale
                 transform.only_reads_handle(op.op_operands[:4])
                 # Consume and replace output
                 + transform.consumes_handle(op.op_operands[4:5])
@@ -554,23 +477,22 @@ class ReplaceWithFusedAttentionOp(
 
 
 def replace_with_fused_attention(
-    q_load: ir.Value,
-    k_load: ir.Value,
-    v_load: ir.Value,
+    q: ir.Value,
+    k: ir.Value,
+    v: ir.Value,
     scale: ir.Value,
     output: ir.Value,
     tile_size: int | ir.IntegerAttr,
 ) -> ir.Value:
-    """Replace a given (standard) attention output with an equivalent output
-    that is computed in a fused fashion (fused attention optimization).
+    """Replace a tensor-level attention output with a fused attention loop.
 
     Args:
-        q_load: Handle to Q load operation (vector.transfer_read)
-        k_load: Handle to K load operation (vector.transfer_read)
-        v_load: Handle to V load operation (vector.transfer_read)
-        scale: Handle to scale constant operation (arith.constant)
-        output: Handle to output operation to replace (vector.contract)
-        tile_size: Tile size for the reduction dimension tiling (K/V sequence length)
+        q: Handle to the op producing the Q tile [*batch, wg_rows, d_head]
+        k: Handle to the op producing the K tensor [*batch, n_ctx, d_head]
+        v: Handle to the op producing the V tensor [*batch, n_ctx, d_head]
+        scale: Handle to the scale constant op (scalar arith.constant)
+        output: Handle to the P@V linalg contraction to replace
+        tile_size: Tile size for the reduction dimension (K/V sequence length)
 
     Returns:
         Handle to the new output operation
@@ -579,5 +501,5 @@ def replace_with_fused_attention(
         tile_size = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), tile_size)
 
     return ReplaceWithFusedAttentionOp(
-        q_load, k_load, v_load, scale, output, tile_size=tile_size
+        q, k, v, scale, output, tile_size=tile_size
     ).new_output

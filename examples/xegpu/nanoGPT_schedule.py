@@ -222,30 +222,28 @@ def _tile_one_fused_attention_region(anytype, pv_bmm, softmax_op, fa_params):
 
 
 def _fuse_attention_in_region(anytype, forall, fa_params):
-    """After the shared bufferize+vectorize, rewrite one attention region's
-    vector.contract pair (QK^T, @V) into the flash loop via the transform
-    op. Scoped to `forall` so counts are exact at any multiplicity."""
-    contract_ops = match_and_split(forall, ops={"vector.contract"}, nhandles=2)
-    first_contract, second_contract = contract_ops[0], contract_ops[1]
-    q_load = transform.get_producer_of_operand(
-        anytype, first_contract, operand_number=0
-    )
-    k_load = transform.get_producer_of_operand(
-        anytype, first_contract, operand_number=1
-    )
-    v_load = transform.get_producer_of_operand(
-        anytype, second_contract, operand_number=1
-    )
-    mulf_op = match_and_split(forall, ops={"arith.mulf"}, nhandles=1)[0]
-    scale = transform.get_producer_of_operand(anytype, mulf_op, operand_number=1)
+    """Rewrite one attention region's tensor-level batch_matmul pair (QK^T, @V)
+    into the flash loop via the transform op. Scoped to `forall` so counts are
+    exact at any multiplicity. Runs right after the region was tiled, i.e. still
+    on tensors, so the shared vectorize tail lowers the emitted loop."""
+    prod = transform.get_producer_of_operand
+    bmms = match_and_split(forall, ops={"linalg.batch_matmul"}, nhandles=2)
+    qk_bmm, pv_bmm = bmms[0], bmms[1]
+    q = prod(anytype, qk_bmm, operand_number=0)
+    # K reaches the QK^T matmul through the linalg.transpose that forms K^T.
+    k = prod(anytype, prod(anytype, qk_bmm, operand_number=1), operand_number=0)
+    v = prod(anytype, pv_bmm, operand_number=1)
+    # The scale is the fill value of the linalg.mul rhs operand.
+    mul_op = match_and_split(forall, ops={"linalg.mul"}, nhandles=1)[0]
+    scale = prod(anytype, prod(anytype, mul_op, operand_number=1), operand_number=0)
     # NB: the merged fused-attention op is non-causal only -- there is
     # no `causal` parameter yet, so the model runs as non-causal attention.
     transform_ext.replace_with_fused_attention(
-        q_load=q_load,
-        k_load=k_load,
-        v_load=v_load,
+        q=q,
+        k=k,
+        v=v,
         scale=scale,
-        output=second_contract,
+        output=pv_bmm,
         tile_size=fa_params["inner_loop_tile_size"],
     )
 
@@ -488,9 +486,13 @@ def _bundle(
         fa_bmms = match_and_split(mod, ops={"linalg.batch_matmul"}, nhandles=2 * n_fa)
         fa_softmaxes = match_and_split(mod, ops={"linalg.softmax"}, nhandles=n_fa)
         for r in range(n_fa):
-            _tile_one_fused_attention_region(
+            _, fa_forall = _tile_one_fused_attention_region(
                 anytype, fa_bmms[2 * r + 1], fa_softmaxes[r], fa_params
             )
+            # Rewrite the region into the flash online-softmax loop while it is
+            # still on tensors, so the shared vectorize tail lowers it like any
+            # other tiled region.
+            _fuse_attention_in_region(anytype, fa_forall, fa_params)
 
     func = match(mod, ops={"func.func"})
     lh_transform.cleanup(func)
@@ -502,9 +504,17 @@ def _bundle(
         anytype, func, fold_type_extensions_into_contract=True
     )
     lh_transform.cleanup(func)
-    # Fused-attention regions carry a batch-of-1 dim from the (1,wg_rows,0,0) tiling;
-    # drop leading unit dims so the QK^T/@V vector.contracts become 2D, as the flash
-    # rewrite expects.
+    # Accumulators of the tiled reduction loops (the flash loop's running max /
+    # sum / @V accumulator, the layernorm partial reductions) are tensors at
+    # linalg level, so vectorization turns them into a transfer_read/write pair
+    # per iteration. Hoist those subsets so they are carried as vector iter_args,
+    # i.e. in registers instead of through a scratch buffer.
+    with lh_transform.foreach(match(mod, ops={"scf.for"})) as reduction_loop:
+        lh_transform.loop_hoisting(reduction_loop)
+        transform.yield_()
+    lh_transform.cleanup(func)
+    # Drop any leading unit dims left over from the (1, wg_rows, 0, 0) tiling of
+    # the attention regions so the QK^T/@V vector.contracts stay 2D.
     if n_fa:
         with ir.InsertionPoint(transform.apply_patterns(func).patterns):
             apply_patterns_vector_cast_away_vector_leading_one_dim()
@@ -535,22 +545,6 @@ def _bundle(
         },
     )
     if stop_at_stage == "bufferized":
-        raise PipelineInterrupt()
-
-    # ===== FUSED-ATTENTION REWRITE (after bufferize+vectorize, before gpu.launch) =====
-    # Re-find each attention forall by kinds index (forall IR order == kinds order,
-    # the invariant the launch/gpu_mods loops below also rely on) and rewrite its
-    # QK^T/@V vector.contract pair into the flash online-softmax loop. Must run
-    # BEFORE forall->gpu.launch so the producer-walks for q/k/v loads stay in-region.
-    if n_fa:
-        all_foralls = match_and_split(mod, ops={"scf.forall"}, nhandles=nkernels)
-        for idx, kind in enumerate(kinds):
-            if kind == "fa":
-                _fuse_attention_in_region(anytype, all_foralls[idx], fa_params)
-        func = match(mod, ops={"func.func"})
-        transform.apply_cse(func)
-        canonicalize(func)
-    if stop_at_stage == "inner-tiled":
         raise PipelineInterrupt()
 
     # Shared with the per-op xegpu schedules: forall -> scf.parallel -> gpu.launch.

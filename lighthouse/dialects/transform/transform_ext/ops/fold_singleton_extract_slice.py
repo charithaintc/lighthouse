@@ -57,15 +57,21 @@ def _as_single_result_value(op_or_val):
     raise ValueError("Expected a value or single-result operation")
 
 
+def _producer_name(value: ir.Value) -> str | None:
+    """Name of the op defining `value`, or None if it is a block argument."""
+    if not isinstance(value, ir.OpResult):
+        return None
+    return value.owner.name
+
+
 def _rewrite_extract_of_expand(
     extract_op: ir.Operation, rewriter: transform.TransformRewriter
 ) -> bool:
     source = extract_op.operands[0]
-    producer = source.owner
-    if producer is None or producer.name != "tensor.expand_shape":
+    if _producer_name(source) != "tensor.expand_shape":
         return False
 
-    expanded_source = producer.operands[0]
+    expanded_source = source.owner.operands[0]
     extract_result_ty = extract_op.results[0].type
     expanded_source_ty = expanded_source.type
     expanded_ty = source.type
@@ -91,8 +97,7 @@ def _rewrite_extract_of_fill(
     extract_op: ir.Operation, rewriter: transform.TransformRewriter
 ) -> bool:
     source = extract_op.operands[0]
-    producer = source.owner
-    if producer is None or producer.name != "linalg.fill":
+    if _producer_name(source) != "linalg.fill":
         return False
 
     fill_result_ty = source.type
@@ -110,7 +115,7 @@ def _rewrite_extract_of_fill(
         # Keep conservative behavior for dynamic shapes.
         return False
 
-    fill_value = producer.operands[0]
+    fill_value = source.owner.operands[0]
     with ir.InsertionPoint(extract_op), extract_op.location:
         empty = tensor.EmptyOp(
             tuple(extract_result_ty.shape), extract_result_ty.element_type
