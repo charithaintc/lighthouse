@@ -131,82 +131,24 @@ def fused_attention_schedule(
     return schedule
 
 
-def bundle_xegpu_fused_attention_schedule(
-    mod: ir.Value[transform.AnyOpType],
-    params: ScheduleParameters,
-    stop_at_stage: str = "",
-) -> ir.Value[transform.AnyOpType]:
-    """Schedule for lowering attention payload to xegpu wg level."""
+def _derive_flash_attention(anytype, func, layer_params):
+    """Derive the flash loop from the payload chain with the reduction fusion.
 
-    layer_params = params[0]
+    `fuse_dependant_reduction_ops` moves the elementwise term and one consumer
+    reduction into an already-tiled producer reduction loop and inserts the online
+    correction that rescales that reduction's running accumulator whenever the
+    running max changes. Applied once per consumer reduction -- the row sum and the
+    `P@V` contraction -- it folds the whole chain into a single loop.
 
-    if stop_at_stage == "initial":
-        raise PipelineInterrupt()
+    Inside the WG forall the chain reads, in program order:
 
-    anytype = transform.AnyOpType.get()
-
-    # Match payload function
-    func = get_payload_func(mod, op_name=["linalg.generic", "linalg.batch_matmul"])
-
-    # The payload spells the softmax out as `max -> exp -> {sum, P@V} -> divide`
-    # (see `generate_gpu_attention_payload`), so there is no `linalg.softmax` to
-    # decompose: its decomposition normalizes *before* the contraction, which
-    # would leave the P@V reading the normalized P and so break the dependency
-    # chain the reduction fusion needs.
-
-    # Normalize possible singleton dimensions so tile+fuse logic works.
-    with ir.InsertionPoint(transform.apply_patterns(func).patterns):
-        # fold unit dims in linalg.generic op inputs
-        structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
-        # fold tensor.extract_slice(tensor.expand_shape(x)) into x
-        tensor.apply_patterns_tensor_reassociative_reshape_folding()
-        # swap tensor.extract_slice(linalg.fill(...)) ops
-        structured.apply_patterns_linalg_swap_extract_slice_with_fill()
-        # fold tensor.extract_slice(tensor.empty(...)) into tensor.tensor_empty(...)
-        tensor.apply_patterns_tensor_fold_tensor_empty(fold_single_use_only=True)
-    lh_transform.cleanup(func)
-
-    # Fuse elementwise ops, also removes unused linalg op results (if any).
-    func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
-    lh_transform.cleanup(func)
-
-    # Apply WG tiling
-    wg_tile = layer_params["wg_tile"]
-    for wg in wg_tile[:-1]:
-        assert wg == 1, "WG tile must be of form [1, ..., wg_rows]"
-    wg_rows = wg_tile[-1]
-
-    linalg_ops = structured.structured_match(
-        anytype, func, ops=["linalg.generic", "linalg.batch_matmul"]
-    )
-    leaf_linalg_op = transform_ext.extract_handle(linalg_ops, -1)
-    leaf_generic_wg, _, _ = lh_transform.tile(
-        leaf_linalg_op,
-        tile_sizes=wg_tile,
-        fuse_producers=True,
-        use_forall=True,
-        apply_cleanup=False,
-    )
-    lh_transform.cleanup(func)
-
-    if stop_at_stage == "tiled":
-        raise PipelineInterrupt()
-
-    # Fold the whole softmax-and-contract chain into a single loop over the
-    # key/value axis -- the fused (flash) attention inner loop -- while still at
-    # linalg level. `fuse_dependant_reduction_ops` does the work: it moves the
-    # elementwise term and one consumer reduction into an already-tiled producer
-    # reduction loop and inserts the online correction that rescales that
-    # reduction's running accumulator whenever the running max changes.
-    #
-    # Inside the WG forall the chain reads, in program order:
-    #
-    #   %s   = linalg.mul(batch_matmul(q, k^T), fill(scale))   the scaled scores
-    #   %m   = max_k %s                                        the producer reduction
-    #   %p   = exp(%s - %m)                                    the elementwise term
-    #   %o   = batch_matmul(%p, v)                             consumer reduction
-    #   %l   = sum_k %p                                        consumer reduction
-    #   %out = %o / %l                                         the deferred divide
+        %s   = linalg.mul(batch_matmul(q, k^T), fill(scale))   the scaled scores
+        %m   = max_k %s                                        the producer reduction
+        %p   = exp(%s - %m)                                    the elementwise term
+        %o   = batch_matmul(%p, v)                             consumer reduction
+        %l   = sum_k %p                                        consumer reduction
+        %out = %o / %l                                         the deferred divide
+    """
     # Tile size for the reduction dimension (the K/V sequence length).
     reduction_tile = layer_params["reduction_tile"]
 
@@ -328,6 +270,131 @@ def bundle_xegpu_fused_attention_schedule(
         transform.apply_patterns_canonicalization()
     transform.apply_cse(func)
 
+
+def _replace_with_reference_flash_attention(anytype, func, layer_params):
+    """Emit the flash loop from the hand-written generator instead of deriving it.
+
+    `replace_with_fused_attention` builds the whole online-softmax loop from
+    scratch given Q, K, V and the scale, replacing the chain's leaf. It is kept as
+    a reference point: the derived path (the default, see
+    `fuse_dependant_reduction_ops`) should converge on the same loop, and diffing
+    the two at `--dump-kernel=reduction-tiled` is how that is tracked.
+
+    Both paths consume the same payload. The generator's own output *is* the
+    normalized result, so its `output` is the payload's deferred divide -- the
+    chain's leaf -- rather than the `P@V` contraction; everything upstream of it
+    (max, exp, row sum, `P@V`) is left dead for DCE.
+    """
+    prod = transform.get_producer_of_operand
+    # The Q, K, V tensors and the scale constant are found by walking the SSA chain
+    # of the two batch matmuls inside the WG forall:
+    #
+    #   Q@K^T:  linalg.batch_matmul(q_slice, linalg.transpose(k_slice))
+    #   scale:  linalg.mul(qkt, linalg.fill(scale_constant))
+    #   P@V:    linalg.batch_matmul(probs, v_slice)
+    qk_matmul, pv_matmul = match_and_split(
+        func, ops={"linalg.batch_matmul"}, nhandles=2
+    )
+    q = prod(anytype, qk_matmul, operand_number=0)
+    k_transpose = prod(anytype, qk_matmul, operand_number=1)
+    k = prod(anytype, k_transpose, operand_number=0)
+    v = prod(anytype, pv_matmul, operand_number=1)
+    mul_op = match_and_split(func, ops={"linalg.mul"}, nhandles=1)[0]
+    scale = prod(anytype, prod(anytype, mul_op, operand_number=1), operand_number=0)
+    # The chain's leaf is the deferred divide, i.e. the last of the four generics.
+    *_, divide_op = match_and_split(func, ops={"linalg.generic"}, nhandles=4)
+
+    transform_ext.replace_with_fused_attention(
+        q=q,
+        k=k,
+        v=v,
+        scale=scale,
+        output=divide_op,
+        tile_size=layer_params["reduction_tile"],
+    )
+    transform.apply_cse(func)
+    lh_transform.cleanup(func)
+
+
+def bundle_xegpu_fused_attention_schedule(
+    mod: ir.Value[transform.AnyOpType],
+    params: ScheduleParameters,
+    stop_at_stage: str = "",
+) -> ir.Value[transform.AnyOpType]:
+    """Schedule for lowering attention payload to xegpu wg level."""
+
+    layer_params = params[0]
+
+    if stop_at_stage == "initial":
+        raise PipelineInterrupt()
+
+    anytype = transform.AnyOpType.get()
+
+    # Match payload function
+    func = get_payload_func(mod, op_name=["linalg.generic", "linalg.batch_matmul"])
+
+    # The payload spells the softmax out as `max -> exp -> {sum, P@V} -> divide`
+    # (see `generate_gpu_attention_payload`), so there is no `linalg.softmax` to
+    # decompose: its decomposition normalizes *before* the contraction, which
+    # would leave the P@V reading the normalized P and so break the dependency
+    # chain the reduction fusion needs.
+
+    # Normalize possible singleton dimensions so tile+fuse logic works.
+    with ir.InsertionPoint(transform.apply_patterns(func).patterns):
+        # fold unit dims in linalg.generic op inputs
+        structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
+        # fold tensor.extract_slice(tensor.expand_shape(x)) into x
+        tensor.apply_patterns_tensor_reassociative_reshape_folding()
+        # swap tensor.extract_slice(linalg.fill(...)) ops
+        structured.apply_patterns_linalg_swap_extract_slice_with_fill()
+        # fold tensor.extract_slice(tensor.empty(...)) into tensor.tensor_empty(...)
+        tensor.apply_patterns_tensor_fold_tensor_empty(fold_single_use_only=True)
+    lh_transform.cleanup(func)
+
+    # Fuse elementwise ops, also removes unused linalg op results (if any).
+    func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
+    lh_transform.cleanup(func)
+
+    # Apply WG tiling
+    wg_tile = layer_params["wg_tile"]
+    for wg in wg_tile[:-1]:
+        assert wg == 1, "WG tile must be of form [1, ..., wg_rows]"
+    wg_rows = wg_tile[-1]
+
+    linalg_ops = structured.structured_match(
+        anytype, func, ops=["linalg.generic", "linalg.batch_matmul"]
+    )
+    leaf_linalg_op = transform_ext.extract_handle(linalg_ops, -1)
+    leaf_generic_wg, _, _ = lh_transform.tile(
+        leaf_linalg_op,
+        tile_sizes=wg_tile,
+        fuse_producers=True,
+        use_forall=True,
+        apply_cleanup=False,
+    )
+    lh_transform.cleanup(func)
+
+    if stop_at_stage == "tiled":
+        raise PipelineInterrupt()
+
+    # Build the fused (flash) attention inner loop -- a single loop over the
+    # key/value axis -- while still at linalg level. Two paths produce it, and both
+    # consume the same payload, so their output can be diffed at
+    # `--dump-kernel=reduction-tiled`:
+    #
+    #   * the default derives it from the payload's chain with
+    #     `fuse_dependant_reduction_ops` (below);
+    #   * `reference_flash` emits it from the hand-written generator instead, as a
+    #     reference point for how close the derived version gets.
+    # Tile size for the reduction dimension (the K/V sequence length); also drives
+    # the K/V prefetch and the XeGPU layouts further down.
+    reduction_tile = layer_params["reduction_tile"]
+
+    if layer_params.get("reference_flash", False):
+        _replace_with_reference_flash_attention(anytype, func, layer_params)
+    else:
+        _derive_flash_attention(anytype, func, layer_params)
+
     if stop_at_stage == "reduction-tiled":
         raise PipelineInterrupt()
 
@@ -340,6 +407,18 @@ def bundle_xegpu_fused_attention_schedule(
     # accumulators are carried as vector iter_args, i.e. in registers.
     reduction_loop = match(func, ops={"scf.for"})
     lh_transform.loop_hoisting(reduction_loop)
+
+    # Turn on fast math and take the rewrite it licenses: the online rescale factor
+    # comes out of `fuse_dependant_reduction_ops` as `exp(-m_new) / exp(-m_old)`,
+    # and becomes the single `exp(m_old - m_new)` a hand-written flash-attention
+    # kernel uses. That drops a transcendental and a divide per iteration, and with
+    # them the row temporaries. Run here rather than at linalg level: before
+    # vectorization the two exponentials and the divide live in three separate
+    # linalg.generics, so there is no single op to match.
+    transform_ext.enable_fastmath_optimizations(func)
+    transform.apply_cse(func)
+    canonicalize(func)
+
     func = apply_registered_pass(func, "remove-dead-values")
     lh_transform.cleanup(func)
 

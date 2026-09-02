@@ -7,7 +7,9 @@ from .ops.get_named_attribute import get_named_attribute
 from .ops.get_tile_sizes import get_tile_sizes
 from .ops.param_cmp_eq import param_cmp_eq
 from .ops.replace import replace
+from .ops.replace_with_fused_attention import replace_with_fused_attention
 from .ops.convert_func_results_to_args import convert_func_results_to_args
+from .ops.enable_fastmath_optimizations import enable_fastmath_optimizations
 from .ops.extract_handle import extract_handle
 from .ops.get_tileable_consumers import get_tileable_consumers
 from .ops.get_tiling_sizes import get_tiling_sizes
@@ -30,6 +32,7 @@ __all__ = [
     "assign_tile_sizes",
     "clear_tile_and_fuse_annotations",
     "convert_func_results_to_args",
+    "enable_fastmath_optimizations",
     "extract_handle",
     "filter_by_name",
     "filter_elementwise",
@@ -48,6 +51,7 @@ __all__ = [
     "propagate_tile_sizes",
     "register_and_load",
     "replace",
+    "replace_with_fused_attention",
     "reverse_handles",
     "trace_producers",
     "update_address_space",
