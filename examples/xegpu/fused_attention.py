@@ -309,9 +309,9 @@ def parse_cli():
         choices=[
             "initial",
             "tiled",
+            "reduction-tiled",
             "vectorized",
             "bufferized",
-            "reduction-tiled",
             "gpu-outlining",
             "xegpu-initial",
             "xegpu-wg",

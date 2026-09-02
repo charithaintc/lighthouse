@@ -167,7 +167,6 @@ def main():
             "tiled",
             "vectorized",
             "bufferized",
-            "inner-tiled",
             "gpu-outlining",
             "xegpu-initial",
             "xegpu-wg",

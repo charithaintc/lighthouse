@@ -2,7 +2,7 @@
 
 from mlir import ir
 from mlir.dialects import transform
-from mlir.dialects.transform import structured, xegpu
+from mlir.dialects.transform import structured, xegpu, tensor
 import lighthouse.transform as lh_transform
 from lighthouse.pipeline.helper import (
     apply_registered_pass,
@@ -49,9 +49,9 @@ def fused_attention_schedule(
     The schedule performs the following transformations:
 
         1. Tile and fuse the attention computation along parallel dims
-        2. Vectorize operations
-        3. Bufferize tensors
-        4. Perform the fused attention optimization for the innermost block
+        2. Perform the fused attention optimization for the innermost block
+        3. Vectorize operations
+        4. Bufferize tensors
         5. Convert to GPU dialect
         6. Lower to XeGPU operations
 
@@ -72,10 +72,12 @@ def fused_attention_schedule(
     of form [1, ..., wg_rows], depending on the number of leading parallel
     dimensions, and the `sg_rows` tiling is applied over the n_ctx dimension.
 
-    In step 4., the inner attention block is tiled and fused over the
+    In step 2., the inner attention block is tiled and fused over the
     reduction dimension (n_ctx) of the final P@V operation, controlled by the
     `reduction_tile` parameter. The Q@K^T and softmax operations are fused into
-    the P@V loop, implementing online softmax.
+    the P@V loop, implementing online softmax. This happens at tensor level, so
+    the tiling and fusion decisions stay at the level the rest of the schedule
+    works on and the emitted loop is lowered by the regular vectorization step.
 
     Prefetching of K and V tiles is controlled by the `prefetch_tile` and
     `nb_prefetch` parameters.
@@ -152,8 +154,14 @@ def bundle_xegpu_fused_attention_schedule(
 
     # Normalize possible singleton dimensions so tile+fuse logic works.
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
+        # fold unit dims in linalg.generic op inputs
         structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
-    transform_ext.fold_singleton_extract_slice(func)
+        # fold tensor.extract_slice(tensor.expand_shape(x)) into x
+        tensor.apply_patterns_tensor_reassociative_reshape_folding()
+        # swap tensor.extract_slice(linalg.fill(...)) ops
+        structured.apply_patterns_linalg_swap_extract_slice_with_fill()
+        # fold tensor.extract_slice(tensor.empty(...)) into tensor.tensor_empty(...)
+        tensor.apply_patterns_tensor_fold_tensor_empty(fold_single_use_only=True)
     lh_transform.cleanup(func)
 
     # Fuse elementwise ops, also removes unused linalg op results (if any).
@@ -182,8 +190,57 @@ def bundle_xegpu_fused_attention_schedule(
     if stop_at_stage == "tiled":
         raise PipelineInterrupt()
 
+    # Apply reduction tiling and fusion, still at tensor level. The Q, K, V
+    # tensors and the scale constant are found by walking the SSA chain of the
+    # two batch matmuls inside the WG forall:
+    #
+    #   Q@K^T:  linalg.batch_matmul(q_slice, linalg.transpose(k_slice))
+    #   scale:  linalg.mul(qkt, linalg.fill(scale_constant))
+    #   P@V:    linalg.batch_matmul(softmax_out, v_slice)
+    matmul_ops = match_and_split(func, ops={"linalg.batch_matmul"}, nhandles=2)
+    qk_matmul, pv_matmul = matmul_ops[0], matmul_ops[1]
+
+    q = transform.get_producer_of_operand(anytype, qk_matmul, operand_number=0)
+    k_transpose = transform.get_producer_of_operand(
+        anytype, qk_matmul, operand_number=1
+    )
+    k = transform.get_producer_of_operand(anytype, k_transpose, operand_number=0)
+    v = transform.get_producer_of_operand(anytype, pv_matmul, operand_number=1)
+
+    # The scale is the fill value of the linalg.mul rhs operand.
+    mul_op = match_and_split(func, ops={"linalg.mul"}, nhandles=1)[0]
+    scale_fill = transform.get_producer_of_operand(anytype, mul_op, operand_number=1)
+    scale = transform.get_producer_of_operand(anytype, scale_fill, operand_number=0)
+
+    # Replace the P@V batch matmul with a loop over the K/V sequence length that
+    # implements online softmax, fusing Q@K^T and the softmax into it.
+    reduction_tile = layer_params[
+        "reduction_tile"
+    ]  # Tile size for reduction dimension (K/V sequence length)
+    transform_ext.replace_with_fused_attention(
+        q=q,
+        k=k,
+        v=v,
+        scale=scale,
+        output=pv_matmul,
+        tile_size=reduction_tile,
+    )
+    transform.apply_cse(func)
+    lh_transform.cleanup(func)
+
+    if stop_at_stage == "reduction-tiled":
+        raise PipelineInterrupt()
+
     # Vectorize
     func = vectorize(mod, payload_func=func)
+
+    # The accumulators of the flash loop are tensors at linalg level, so
+    # vectorization turns them into a transfer_read/transfer_write pair per
+    # iteration. Repeat the subset hoisting now that CSE has run, so that all
+    # accumulators are carried as vector iter_args, i.e. in registers.
+    reduction_loop = match(func, ops={"scf.for"})
+    lh_transform.loop_hoisting(reduction_loop)
+    lh_transform.cleanup(func)
 
     if stop_at_stage == "vectorized":
         raise PipelineInterrupt()
@@ -194,56 +251,8 @@ def bundle_xegpu_fused_attention_schedule(
     if stop_at_stage == "bufferized":
         raise PipelineInterrupt()
 
-    # Apply reduction tiling and fusion
-
-    # Extract q, k, v memrefs from the bufferized IR
-    # Match vector.contract ops to find the q, k, v loads
     for_all = match(mod, ops={"scf.forall"})
     func = transform.get_parent_op(anytype, for_all, op_name="func.func")
-    contract_ops = match_and_split(func, ops={"vector.contract"}, nhandles=2)
-
-    # First vector.contract is Q @ K^T
-    # Its first operand is the q load (vector.transfer_read)
-    # Its second operand is the k load (vector.transfer_read)
-    first_contract = contract_ops[0]
-    q_load = transform.get_producer_of_operand(
-        anytype, first_contract, operand_number=0
-    )
-    k_load = transform.get_producer_of_operand(
-        anytype, first_contract, operand_number=1
-    )
-
-    # Second vector.contract is attention_weights @ V
-    # Its second operand is the v load (vector.transfer_read)
-    second_contract = contract_ops[1]
-    v_load = transform.get_producer_of_operand(
-        anytype, second_contract, operand_number=1
-    )
-
-    # Match arith.mulf to get the scale parameter
-    # The scale is the second operand of arith.mulf (the constant)
-    mulf_op = match_and_split(func, ops={"arith.mulf"}, nhandles=1)[0]
-    scale = transform.get_producer_of_operand(anytype, mulf_op, operand_number=1)
-
-    # Apply the fused attention optimization. This replaces the second vector.contract
-    # (attention_weights @ V) with a tiled loop that implements online softmax for
-    # efficient memory usage
-    reduction_tile = layer_params[
-        "reduction_tile"
-    ]  # Tile size for reduction dimension (K/V sequence length)
-    transform_ext.replace_with_fused_attention(
-        q_load=q_load,
-        k_load=k_load,
-        v_load=v_load,
-        scale=scale,
-        output=second_contract,
-        tile_size=reduction_tile,
-    )
-    transform.apply_cse(func)
-    canonicalize(func)
-
-    if stop_at_stage == "reduction-tiled":
-        raise PipelineInterrupt()
 
     func = convert_to_gpu_launch(mod, payload_func=func)
 
