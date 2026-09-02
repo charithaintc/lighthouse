@@ -4,9 +4,34 @@ import math
 
 from mlir import ir
 from mlir.dialects import arith, bufferization, linalg, memref, tensor
+from mlir.dialects import math as math_dialect
 
 from lighthouse.utils.mlir import func_cif
 from lighthouse.ingress.mlir_gen.utils import emit_buf_to_tensor
+
+
+def _generic(ins, out, indexing_maps, iterator_types, body):
+    """Emit a single-result ``linalg.generic`` over statically shaped tensors.
+
+    `body` receives one scalar block argument per input followed by the output's,
+    and returns the value to yield.
+    """
+    maps = ir.ArrayAttr.get([ir.AffineMapAttr.get(m) for m in indexing_maps])
+    iterators = ir.ArrayAttr.get(
+        [ir.Attribute.parse(f"#linalg.iterator_type<{it}>") for it in iterator_types]
+    )
+    op = linalg.GenericOp(
+        result_tensors=[out.type],
+        inputs=ins,
+        outputs=[out],
+        indexing_maps=maps,
+        iterator_types=iterators,
+    )
+    element_type = ir.ShapedType(out.type).element_type
+    block = op.regions[0].blocks.append(*([element_type] * (len(ins) + 1)))
+    with ir.InsertionPoint(block):
+        linalg.yield_([body(*block.arguments)])
+    return op.results[0]
 
 
 def generate_gpu_attention_payload(
@@ -22,6 +47,11 @@ def generate_gpu_attention_payload(
 
     Computes attention:
     output = softmax(Q @ K^T / sqrt(d_head)) @ V
+
+    The softmax is emitted in the flash-attention form -- ``max``, ``exp``, row
+    ``sum`` and the ``P@V`` contraction as separate ops, with the normalizing
+    divide *after* the contraction -- rather than as a `linalg.softmax`. See
+    step 4 for why.
 
     Args:
         func_name: Name of the payload function
@@ -105,23 +135,74 @@ def generate_gpu_attention_payload(
             scaled_qkt_init = tensor.empty(qkt_shape_3d, dtype)
             scaled_qkt = linalg.mul(qkt, scale_tensor, outs=[scaled_qkt_init])
 
-            # Step 4: Apply softmax along the last dimension (dim=2 in 3D)
-            softmax_init = tensor.empty(qkt_shape_3d, dtype)
-            attention_weights = linalg.softmax(
-                result=[ir.RankedTensorType.get(qkt_shape_3d, dtype)],
-                input=scaled_qkt,
-                output=softmax_init,
-                dimension=2,
+            # Step 4: softmax over the last dimension, written in the
+            # flash-attention form -- with the normalizing divide deferred past the
+            # P@V contraction:
+            #
+            #   m   = max_k s          l   = sum_k P
+            #   P   = exp(s - m)       O   = P @ V         out = O / l
+            #
+            # This is algebraically identical to `softmax(s) @ V`: dividing by the
+            # per-row `l` commutes with a contraction that reduces the *other*
+            # axis. Writing it this way (rather than as `linalg.softmax`, whose
+            # decomposition normalizes before the contraction) leaves the
+            # `max -> exp -> {sum, P@V}` dependency chain explicit, which is what
+            # `transform_ext.fuse_dependant_reduction_ops` consumes to build the
+            # online one-pass loop.
+            d0, d1, d2 = (ir.AffineDimExpr.get(i) for i in range(3))
+            # (batch, row, col) -> (batch, row, col) and -> (batch, row): the
+            # per-row statistics are broadcast over the reduced axis.
+            elementwise_map = ir.AffineMap.get(3, 0, [d0, d1, d2])
+            row_map = ir.AffineMap.get(3, 0, [d0, d1])
+            row_shape_3d = (batch_dim, n_ctx)
+
+            # m = max_k s
+            neg_inf = arith.constant(dtype, float("-inf"))
+            m_init = linalg.fill(neg_inf, outs=[tensor.empty(row_shape_3d, dtype)])
+            row_max = _generic(
+                [scaled_qkt],
+                m_init,
+                [elementwise_map, row_map],
+                ["parallel", "parallel", "reduction"],
+                lambda s, acc: arith.maximumf(s, acc),
             )
 
-            # Step 5: Multiply attention weights by V using batch_matmul
-            # attention_weights: (batch_dim, n_ctx, n_ctx) @ V: (batch_dim, n_ctx, d_head)
+            # P = exp(s - m), read by both the row sum and the P@V contraction.
+            probs = _generic(
+                [scaled_qkt, row_max],
+                tensor.empty(qkt_shape_3d, dtype),
+                [elementwise_map, row_map, elementwise_map],
+                ["parallel", "parallel", "parallel"],
+                lambda s, m, out: math_dialect.exp(arith.subf(s, m)),
+            )
+
+            # l = sum_k P
+            l_init = linalg.fill(zero, outs=[tensor.empty(row_shape_3d, dtype)])
+            row_sum = _generic(
+                [probs],
+                l_init,
+                [elementwise_map, row_map],
+                ["parallel", "parallel", "reduction"],
+                lambda p, acc: arith.addf(p, acc),
+            )
+
+            # Step 5: O = P @ V, still unnormalized.
+            # probs: (batch_dim, n_ctx, n_ctx) @ V: (batch_dim, n_ctx, d_head)
             # Result: (batch_dim, n_ctx, d_head)
             output_3d_init = tensor.empty(collapsed_shape_3d, dtype)
             output_3d_init_filled = linalg.fill(zero, outs=[output_3d_init])
+            unnormalized = linalg.batch_matmul(
+                probs, V_3d, outs=[output_3d_init_filled]
+            )
 
-            result_3d = linalg.batch_matmul(
-                attention_weights, V_3d, outs=[output_3d_init_filled]
+            # Step 6: out = O / l, the deferred normalization. `l` is broadcast
+            # over d_head, the contraction's free axis.
+            result_3d = _generic(
+                [unnormalized, row_sum],
+                tensor.empty(collapsed_shape_3d, dtype),
+                [elementwise_map, row_map, elementwise_map],
+                ["parallel", "parallel", "parallel"],
+                lambda o, denom, out: arith.divf(o, denom),
             )
 
             # Materialize 3D result back to 3D output memref
