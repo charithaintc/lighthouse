@@ -193,3 +193,32 @@ run(
     BATCH_MATMUL_PAYLOAD,
     lambda: build_assign_schedule("linalg.batch_matmul"),
 )
+
+
+# Register-parallel strategy: batch outer dim tiled to 1, inner M/N tiled by
+# f32 FMA defaults, K untiled.
+# CHECK-LABEL: Test: register_parallel_strategy
+# CHECK: linalg.batch_matmul
+# CHECK-SAME: transform_ext.tile_sizes = array<i64: 1, 8, 32, 0>
+run(
+    "register_parallel_strategy",
+    BATCH_MATMUL_PAYLOAD,
+    lambda: build_assign_schedule(
+        "linalg.batch_matmul",
+        strategy="register_parallel",
+    ),
+)
+
+
+# Register-reduction strategy: only the reduction K dim is tiled.
+# CHECK-LABEL: Test: register_reduction_strategy
+# CHECK: linalg.batch_matmul
+# CHECK-SAME: transform_ext.tile_sizes = array<i64: 0, 0, 0, 2>
+run(
+    "register_reduction_strategy",
+    BATCH_MATMUL_PAYLOAD,
+    lambda: build_assign_schedule(
+        "linalg.batch_matmul",
+        strategy="register_reduction",
+    ),
+)

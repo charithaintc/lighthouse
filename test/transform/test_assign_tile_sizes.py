@@ -66,6 +66,16 @@ def run(
         print(payload)
 
 
+# CHECK-LABEL: Test: strategy_attr_register_parallel
+# CHECK: linalg.matmul
+# CHECK-SAME: transform_ext.tile_sizes = array<i64: 8, 32, 0>
+run("strategy_attr_register_parallel", PAYLOAD, "linalg.matmul", "register_parallel")
+
+# CHECK-LABEL: Test: strategy_attr_register_reduction
+# CHECK: linalg.matmul
+# CHECK-SAME: transform_ext.tile_sizes = array<i64: 0, 0, 2>
+run("strategy_attr_register_reduction", PAYLOAD, "linalg.matmul", "register_reduction")
+
 # CHECK-LABEL: Test: strategy_attr_cache
 # CHECK: linalg.matmul
 # CHECK-SAME: transform_ext.tile_sizes = array<i64: 32, 32, 0>
