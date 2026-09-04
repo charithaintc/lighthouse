@@ -13,11 +13,13 @@ from lighthouse.utils.mlir import defining_op, opview
 
 __all__ = [
     "backward_slice",
+    "cast_float",
     "clone_block_body",
     "clone_op_deep_with_map",
     "clone_op_with_map",
     "constant_int_value",
     "depends_on_op",
+    "float_width",
     "is_defined_as_zero",
     "match_reduction",
     "mixed_sizes",
@@ -29,6 +31,7 @@ __all__ = [
     "properly_dominates",
     "remap_dims",
     "resolve_slice_source",
+    "wider_float_type",
 ]
 
 
@@ -42,7 +45,10 @@ def op_attributes(op: ir.Operation | ir.OpView) -> dict[str, ir.Attribute]:
 
 
 def clone_op_with_map(
-    op: ir.Operation | ir.OpView, value_map: dict
+    op: ir.Operation | ir.OpView,
+    value_map: dict,
+    *,
+    result_type: ir.Type | None = None,
 ) -> ir.Operation | None:
     """Clone `op` at the current insertion point, remapping operands via `value_map`.
 
@@ -52,15 +58,30 @@ def clone_op_with_map(
     linalg body -- which is all the fusion clones one op at a time. Results are
     recorded into `value_map`, so cloning a block in order threads the
     substitution through.
+
+    `result_type` retypes the clone's results, which is how a body is re-emitted in
+    a different precision; an ``arith.constant``'s value attribute is rebuilt to
+    match. It only makes sense for the single-type scalar float ops a linalg body is
+    made of -- the caller is responsible for having remapped the operands to that
+    same type.
     """
     ov = opview(op)
     if any(len(r.blocks) for r in ov.operation.regions):
         return None
+    attributes = op_attributes(ov)
+    result_types = [r.type for r in ov.results]
+    if result_type is not None:
+        result_types = [result_type] * len(result_types)
+        value = attributes.get("value")
+        if value is not None and ir.FloatAttr.isinstance(value):
+            attributes["value"] = ir.FloatAttr.get(
+                result_type, ir.FloatAttr(value).value
+            )
     cloned = ir.Operation.create(
         ov.operation.name,
-        results=[r.type for r in ov.results],
+        results=result_types,
         operands=[value_map.get(o, o) for o in ov.operands],
-        attributes=op_attributes(ov),
+        attributes=attributes,
     )
     value_map.update(zip(ov.results, cloned.results))
     return cloned
@@ -386,6 +407,57 @@ def is_defined_as_zero(value: ir.Value) -> bool:
         inputs = list(ov.inputs)
         return len(inputs) == 1 and is_defined_as_zero(inputs[0])
     return False
+
+
+#: Supported float element types with their bit widths. `f16` and `bf16` share a
+#: width but not a format, so neither widens into the other.
+_FLOAT_WIDTHS = (
+    (ir.F16Type, 16),
+    (ir.BF16Type, 16),
+    (ir.F32Type, 32),
+    (ir.F64Type, 64),
+)
+
+
+def float_width(element_type: ir.Type) -> int | None:
+    """Bit width of a supported float type, else None."""
+    for cls, width in _FLOAT_WIDTHS:
+        if isinstance(element_type, cls):
+            return width
+    return None
+
+
+def wider_float_type(a: ir.Type, b: ir.Type) -> ir.Type | None:
+    """The wider of two float types, or None if there is no common widening.
+
+    Picks the precision a mixed-precision body is evaluated in. Equal-width types
+    of different format (``f16`` vs ``bf16``) have no single-step conversion between
+    them, so they are refused rather than guessed at.
+    """
+    width_a, width_b = float_width(a), float_width(b)
+    if width_a is None or width_b is None:
+        return None
+    if a == b:
+        return a
+    if width_a == width_b:
+        return None
+    return a if width_a > width_b else b
+
+
+def cast_float(value: ir.Value, element_type: ir.Type) -> ir.Value | None:
+    """`value` converted to `element_type` via ``extf``/``truncf``, or unchanged.
+
+    Returns None when the two types have no such conversion, which is exactly when
+    `wider_float_type` refuses them.
+    """
+    if value.type == element_type:
+        return value
+    have, want = float_width(value.type), float_width(element_type)
+    if have is None or want is None or have == want:
+        return None
+    if want > have:
+        return arith.extf(element_type, value)
+    return arith.truncf(element_type, value)
 
 
 def operand_eliminating_constant(

@@ -633,6 +633,18 @@ def check_legal_fusion_triple(
             f"floating-point type (f16/bf16/f32/f64)"
         )
 
+    # (5d) E's element type and R2's accumulator must have a common widening: the
+    # correction term is E's body re-evaluated in the wider of the two, with casts on
+    # the way in and out. `f16` and `bf16` have no single-step conversion between
+    # them, so such a pair is rejected here rather than mid-rewrite.
+    e_element_type = ir.ShapedType(e.results[0].type).element_type
+    if irr.wider_float_type(e_element_type, element_type) is None:
+        raise FusionRejected(
+            f"E's element type {e_element_type} and R2's accumulator type "
+            f"{element_type} have no common widening to evaluate the correction "
+            f"term in"
+        )
+
     # (6a) Any other user of any R1 loop result (besides E) must post-dominate E
     # so re-routing the values through the fused op is safe. Note the anchor is E,
     # not R2: E directly consumes the R1 loop results and is cloned into the loop

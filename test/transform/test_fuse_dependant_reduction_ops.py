@@ -3,7 +3,7 @@
 """Tests for `transform_ext.fuse_dependant_reduction_ops`.
 
 The op fuses a dependency chain ``R1 -> E -> R2`` into ``R1``'s already-tiled
-reduction loop, turning a two-pass reduction into an online (one-pass) one. Two
+reduction loop, turning a two-pass reduction into an online (one-pass) one. Three
 scenarios are covered:
 
   1. **softmax** -- ``max`` then ``sum(exp)``, with the normalizing divide reading
@@ -12,6 +12,9 @@ scenarios are covered:
   2. **flash attention** -- one ``exp`` term feeding both a row sum and a `P @ V`
      contraction. Applying the op once per consumer reduction folds both into a
      single loop, leaving only the normalization outside.
+  3. **mixed-precision softmax** -- the same chain with an f16 term feeding an f32
+     sum accumulator, checking the correction factor is evaluated in the wider of
+     the two element types.
 """
 
 from mlir import ir
@@ -82,6 +85,54 @@ func.func @softmax(%x: tensor<64x512xf32>) -> tensor<64x512xf32> {
     linalg.yield %d : f32
   } -> tensor<64x512xf32>
   return %out : tensor<64x512xf32>
+}
+"""
+
+#: Softmax whose term is f16 while the sum accumulates in f32, the usual attention
+#: mix: `m = max_j x`, `p = exp(x - m)` in f16, `s = sum_j p` in f32.
+MIXED_SOFTMAX = """
+#rowcol = affine_map<(d0, d1) -> (d0, d1)>
+#row    = affine_map<(d0, d1) -> (d0)>
+
+func.func @mixed_softmax(%x: tensor<64x512xf16>) -> tensor<64xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %ninf = arith.constant 0xFC00 : f16
+  %row_init_f16 = tensor.empty() : tensor<64xf16>
+  %row_init_f32 = tensor.empty() : tensor<64xf32>
+  %full_init = tensor.empty() : tensor<64x512xf16>
+
+  // R1: m = max_j x, in f16.
+  %m_init = linalg.fill ins(%ninf : f16) outs(%row_init_f16 : tensor<64xf16>) -> tensor<64xf16>
+  %m = linalg.generic {indexing_maps = [#rowcol, #row],
+                       iterator_types = ["parallel", "reduction"]}
+      ins(%x : tensor<64x512xf16>) outs(%m_init : tensor<64xf16>) {
+  ^bb0(%in: f16, %out: f16):
+    %mx = arith.maximumf %in, %out : f16
+    linalg.yield %mx : f16
+  } -> tensor<64xf16>
+
+  // E: p = exp(x - m), also f16.
+  %p = linalg.generic {indexing_maps = [#rowcol, #row, #rowcol],
+                       iterator_types = ["parallel", "parallel"]}
+      ins(%x, %m : tensor<64x512xf16>, tensor<64xf16>)
+      outs(%full_init : tensor<64x512xf16>) {
+  ^bb0(%in: f16, %mv: f16, %out: f16):
+    %d = arith.subf %in, %mv : f16
+    %e = math.exp %d : f16
+    linalg.yield %e : f16
+  } -> tensor<64x512xf16>
+
+  // R2: s = sum_j p, widened into an f32 accumulator.
+  %s_init = linalg.fill ins(%zero : f32) outs(%row_init_f32 : tensor<64xf32>) -> tensor<64xf32>
+  %s = linalg.generic {indexing_maps = [#rowcol, #row],
+                       iterator_types = ["parallel", "reduction"]}
+      ins(%p : tensor<64x512xf16>) outs(%s_init : tensor<64xf32>) {
+  ^bb0(%in: f16, %out: f32):
+    %w = arith.extf %in : f16 to f32
+    %a = arith.addf %w, %out : f32
+    linalg.yield %a : f32
+  } -> tensor<64xf32>
+  return %s : tensor<64xf32>
 }
 """
 
@@ -184,6 +235,23 @@ def online_softmax_schedule(tile_size: int = 32) -> ir.Module:
 
         fused = transform_ext.fuse_dependant_reduction_ops(e, r2, r1_loop)
         transform.annotate(fused, "online_softmax_loop")
+        transform.yield_([])
+    return sched
+
+
+def mixed_softmax_schedule(tile_size: int = 32) -> ir.Module:
+    """Same as `online_softmax_schedule`, for a payload with no trailing divide."""
+    with schedule_boilerplate() as (sched, seq):
+        generics = lh_transform.match_op(seq.bodyTarget, "linalg.generic")
+        anyop = transform.AnyOpType.get()
+        # In program order: the max (R1), the exp term (E) and the sum (R2).
+        r1, e, r2 = transform.split_handle([anyop] * 3, generics)
+
+        _tiled_r1, r1_loop = structured.TileUsingForOp(r1, sizes=[0, tile_size]).results
+        transform.annotate(r1_loop, transform_ext.REDUCTION_LOOP_ATTR_NAME)
+
+        fused = transform_ext.fuse_dependant_reduction_ops(e, r2, r1_loop)
+        transform.annotate(fused, "mixed_softmax_loop")
         transform.yield_([])
     return sched
 
@@ -346,6 +414,48 @@ def test_attention_structure() -> None:
 # CHECK:           arith.divf
 
 
+def test_mixed_precision_softmax() -> None:
+    """Fuse a softmax whose f16 term feeds an f32 sum accumulator."""
+    with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+        print(apply_schedule(MIXED_SOFTMAX, mixed_softmax_schedule, 32))
+
+
+# The running max and the term stay f16; only the sum accumulator is f32.
+# CHECK-LABEL: func.func @mixed_softmax
+# CHECK-SAME:      %[[X:[a-zA-Z0-9_]+]]: tensor<64x512xf16>
+# CHECK:         %[[LOOP:.+]]:3 = scf.for %[[IV:[a-zA-Z0-9_]+]] =
+# CHECK-SAME:        iter_args(%[[MARG:[a-zA-Z0-9_]+]] = %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} = %{{[a-zA-Z0-9_]+}}, %[[SARG:[a-zA-Z0-9_]+]] = %{{[a-zA-Z0-9_]+}})
+# CHECK-SAME:        -> (tensor<64xf16>, tensor<64x512xf16>, tensor<64xf32>)
+# CHECK:           %[[MOLD:.+]] = tensor.extract_slice %[[MARG]]
+# CHECK:           %[[MNEW:.+]] = linalg.generic
+# CHECK:             arith.maximumf %{{.+}} : f16
+# CHECK:           %[[P:.+]] = linalg.generic
+# CHECK:             math.exp %{{.+}} : f16
+
+# The correction is evaluated in f32 -- the wider of E's f16 and R2's f32
+# accumulator -- so the f16 running max enters the body and is widened there.
+# CHECK:           linalg.generic {{.*}}ins(%[[MNEW]] : tensor<64xf16>) outs(%{{.+}} : tensor<64xf32>)
+# CHECK:             %[[WNEW:.+]] = arith.extf %in : f16 to f32
+# CHECK:             arith.subf %{{.+}}, %[[WNEW]] : f32
+# CHECK:             math.exp %{{.+}} : f32
+# CHECK:           linalg.generic {{.*}}ins(%[[MOLD]] : tensor<64xf16>) outs(%{{.+}} : tensor<64xf32>)
+# CHECK:             %[[WOLD:.+]] = arith.extf %in : f16 to f32
+# CHECK:             arith.subf %{{.+}}, %[[WOLD]] : f32
+# CHECK:             math.exp %{{.+}} : f32
+
+# The factor already has R2's element type, so it rescales the running sum directly.
+# CHECK:           linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%{{.+}} : tensor<64xf32>, tensor<64xf32>)
+# CHECK:           %[[SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul>
+# CHECK-SAME:          tensor<64xf32>, tensor<64xf32>
+# CHECK:           linalg.generic
+# CHECK-SAME:          ins(%[[P]] : tensor<64x32xf16>)
+# CHECK-SAME:          outs(%[[SCALED]] : tensor<64xf32>)
+# CHECK:             arith.addf
+# CHECK:         } {__reduction_loop__, mixed_softmax_loop}
+
+
 if __name__ == "__main__":
     test_softmax_structure()
     test_attention_structure()
+    test_mixed_precision_softmax()

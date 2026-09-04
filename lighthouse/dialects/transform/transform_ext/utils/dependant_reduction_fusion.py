@@ -196,14 +196,48 @@ def _emit_elementwise(
     return op.results[0]
 
 
+def _cast_tensor(value: ir.Value, element_type: ir.Type) -> ir.Value:
+    """Elementwise ``extf``/``truncf`` of a whole tensor to `element_type`.
+
+    The caller has established that the conversion exists (`irr.cast_float` accepts
+    the pair), so the emitted body cannot fail to build.
+    """
+    shaped = ir.RankedTensorType(value.type)
+    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(shaped.rank))
+    dest = tensor.empty(irr.mixed_sizes(value), element_type)
+    op = linalg.GenericOp(
+        result_tensors=[dest.type],
+        inputs=[value],
+        outputs=[dest],
+        indexing_maps=ir.ArrayAttr.get([identity, identity]),
+        iterator_types=ir.ArrayAttr.get(
+            [
+                ir.Attribute.parse("#linalg.iterator_type<parallel>")
+                for _ in range(shaped.rank)
+            ]
+        ),
+    )
+    body = op.regions[0].blocks.append(shaped.element_type, element_type)
+    with ir.InsertionPoint(body):
+        linalg.yield_([irr.cast_float(body.arguments[0], element_type)])
+    return op.results[0]
+
+
 def _emit_correction_term(
-    e: ir.OpView, bindings: list[tuple[ls.Operand, ir.Value]]
+    e: ir.OpView,
+    bindings: list[tuple[ls.Operand, ir.Value]],
+    compute_type: ir.Type,
 ) -> ir.Value | None:
     """Emit `e`'s body at the current insertion point, isolated on its accumulators.
 
     `bindings` binds each accumulator-reading ``E`` input operand to the scalar to
     substitute for it -- the current-tile value for the "new" factor, the previous
     running value for the "old" one.
+
+    Every op is rebuilt at `compute_type` rather than at the type it had in ``E``,
+    so the term is evaluated in the precision `_correction_factor` picked; the bound
+    values are already of that type, and anything the body captures from an enclosing
+    scope is converted to it.
 
     Because ``E`` is a separate op its body can be cloned directly; no backward
     slice is needed, ``E``'s yielded value *is* the term. Data block arguments are
@@ -231,16 +265,23 @@ def _emit_correction_term(
         ov = opview(op)
         temporary: list = []
         for operand in ov.operands:
-            if not isinstance(operand, ir.BlockArgument):
+            if operand in value_map:
                 continue
-            if operand.owner != body or operand in value_map:
-                continue
-            neutral = irr.operand_eliminating_constant(ov, operand.type)
-            if neutral is None:
-                return None
-            value_map[operand] = arith.constant(operand.type, neutral)
-            temporary.append(operand)
-        irr.clone_op_with_map(ov, value_map)
+            if isinstance(operand, ir.BlockArgument) and operand.owner == body:
+                neutral = irr.operand_eliminating_constant(ov, compute_type)
+                if neutral is None:
+                    return None
+                value_map[operand] = arith.constant(compute_type, neutral)
+                temporary.append(operand)
+            else:
+                # Captured from an enclosing scope: kept, but at `compute_type`. Not
+                # dropped afterwards -- unlike a neutral element it is reusable.
+                converted = irr.cast_float(operand, compute_type)
+                if converted is None:
+                    return None
+                value_map[operand] = converted
+        if irr.clone_op_with_map(ov, value_map, result_type=compute_type) is None:
+            return None
         # Drop the per-op substitutions so the next consumer of the same data
         # argument gets its own neutral element.
         for operand in temporary:
@@ -268,6 +309,14 @@ def _correction_factor(
     ``E``'s dims into ``R2``'s and with ``R2``'s reduction dim projected out.
     Legality guarantees those maps do not reference the reduction axis, so the
     projection is lossless.
+
+    ``E``'s body and ``R2``'s accumulator need not share an element type (narrow
+    probabilities feeding a wide contraction accumulator is the usual attention
+    shape), so the term is evaluated in whichever of the two is wider and cast at the
+    boundaries: the accumulator inputs are converted on entry to the body, and the
+    finished factor is converted back to ``R2``'s accumulator type for the rescale
+    multiply. Evaluating in the wider type keeps a ratio of two exponentials off f16's
+    exponent range even when the payload's term is f16.
     """
     # Align E's output map with R2's map for E's result position-by-position to
     # get the E-dim -> R2-dim correspondence.
@@ -307,23 +356,38 @@ def _correction_factor(
         [ir.Attribute.parse("#linalg.iterator_type<parallel>") for _ in range(rank)]
     )
     element_type = accumulator_type.element_type
-    init = tensor.empty(irr.mixed_sizes(r2_accumulator), element_type)
+    # Legality has already checked the two types have a common widening.
+    compute_type = irr.wider_float_type(
+        ir.ShapedType(e.results[0].type).element_type, element_type
+    )
+    if compute_type is None:
+        return None
+    init = tensor.empty(irr.mixed_sizes(r2_accumulator), compute_type)
 
     def build_term(pick) -> ir.Value | None:
+        inputs = [pick(acc) for acc in accumulators]
         op = linalg.GenericOp(
             result_tensors=[init.type],
-            inputs=[pick(acc) for acc in accumulators],
+            inputs=inputs,
             outputs=[init],
             indexing_maps=maps_attr,
             iterator_types=iterator_types,
         )
-        body = op.regions[0].blocks.append(*([element_type] * (len(accumulators) + 1)))
+        # A block argument type follows its operand, so the accumulators enter the
+        # body at their own element type and are converted inside it.
+        arg_types = [ir.ShapedType(v.type).element_type for v in inputs]
+        body = op.regions[0].blocks.append(*arg_types, compute_type)
         with ir.InsertionPoint(body):
-            bindings = [
-                (operand, arg)
-                for (operand, _, _), arg in zip(accumulators, list(body.arguments)[:-1])
-            ]
-            term = _emit_correction_term(e, bindings)
+            bindings = []
+            for (operand, _, _), arg in zip(accumulators, list(body.arguments)[:-1]):
+                converted = irr.cast_float(arg, compute_type)
+                if converted is None:
+                    return None
+                bindings.append((operand, converted))
+            term = _emit_correction_term(e, bindings, compute_type)
+            # `E` may yield a bare accumulator or a captured value; either way the
+            # yielded type has to be the output's.
+            term = None if term is None else irr.cast_float(term, compute_type)
             if term is None:
                 return None
             linalg.yield_([term])
@@ -334,12 +398,17 @@ def _correction_factor(
     if term_new is None or term_old is None:
         return None
 
-    return _emit_elementwise(
+    factor = _emit_elementwise(
         linalg.ElementwiseKind.div,
         lambda a, b: arith.divf(a, b),
         [term_new, term_old],
         init,
     )
+    if compute_type == element_type:
+        return factor
+    # Narrow the ratio back to R2's accumulator type, which the rescale multiply and
+    # the fused R2 both work in.
+    return _cast_tensor(factor, element_type)
 
 
 def fuse_dependant_reduction_ops(
