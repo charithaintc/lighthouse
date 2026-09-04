@@ -30,47 +30,42 @@ class FuseDependantReductionOpsOp(
     TransformExtensionDialect.Operation, name="fuse_dependant_reduction_ops"
 ):
     """
-    Fuse a dependent elementwise + consumer reduction into an already-tiled
-    producer reduction loop.
-
     Fuses a dependency chain ``R1 -> E -> R2`` into a single online (one-pass)
     reduction loop, where ``R1`` is the producer reduction (`tiled_reduction_loop`),
     ``E`` is an elementwise op (`elementwise_op`) consuming ``R1``'s result as a
     broadcast input, and ``R2`` is the consumer reduction (`reduction_op`) reducing
-    ``E``'s output over the same axis. The canonical case is two-pass softmax
-    becoming the online form; an attention chain is the same shape with a `P @ V`
-    contraction as a second ``R2``.
+    ``E``'s output over the same axis.
 
     ``E`` is kept as a *separate* elementwise op rather than folded into ``R2``'s
     body; this keeps the per-element term explicit and easier to vectorize later.
     Because ``E`` is exactly the per-element term that ``R2`` reduces, the online
-    correction factor is derived directly from ``E`` (evaluate ``E`` with its data
-    inputs set to the neutral element and the consumed accumulators bound to their
-    new/old values), without inspecting ``R2``'s body.
+    correction factor is derived directly from ``E``.
 
     The producer must already be tiled along the shared reduction dimension into
     an ``scf.for`` annotated with the ``__reduction_loop__`` unit attribute; the
     tile size is read from that loop's step. This op does not tile the producer
     itself -- use ``transform.structured.tile_using_for`` followed by
     ``transform.annotate`` for that.
+    TODO: Remove the annotation requirement for the producer reduction loop.
 
-    ``E`` may feed consumers besides ``R2``. If it does, this op fuses a *clone* of
-    ``E`` and leaves the original in place for them. The fused copy computes each
-    tile against the *running* accumulator, which the online correction only
+    This op fuses a *clone* of
+    ``E`` and leaves the original in place for them if it has other users. The fused copy computes each
+    tile against the *running* `R1` accumulator, which the online correction only
     accounts for on ``R2``'s accumulator, so ``E``'s own full-extent result is
-    stale in every tile but the last and must not be read off the loop -- softmax's
-    normalizing divide, for one, needs ``E`` evaluated at the *final* max. The
+    stale in every tile but the last and must not be read off the loop. The
     original ``E`` still reads ``R1``'s final result off the loop, so it recomputes
     the term correctly; the clone's full-extent loop result is dead, and the
     schedule drops it with ``remove-dead-values`` after vectorization.
 
     A consumer that *reduces* ``E`` over the same axis is a candidate ``R2`` in its
-    own right, and is fused into the same loop by applying this op again -- the
-    clone is what leaves it a term to fuse. Applying the op once per consumer
-    reduction therefore fuses an attention chain (one ``exp`` term feeding both a
-    row sum and a `P @ V` contraction) into a single loop. The returned loop keeps
-    the ``__reduction_loop__`` attribute, so no re-annotation is needed between
-    applications.
+    own right, and is fused into the same loop by this op along with necessary
+    *online correction*. Applying the op once per consumer reduction therefore
+    fuses an attention chain (one ``exp`` term feeding both a row sum and a `P @ V`
+    contraction) into a single loop. The returned loop keeps the ``__reduction_loop__``
+    attribute, so no re-annotation is needed between applications.
+
+    For more details about the fusion algorithm refer:
+    https://discourse.llvm.org/t/linalg-rfc-an-approach-for-tiling-and-fusing-dependent-reductions-in-linalg/91698
 
     Return modes:
         Each handle must point to exactly one payload op, otherwise this produces

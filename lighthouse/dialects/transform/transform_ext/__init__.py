@@ -26,8 +26,10 @@ from .ops.move_offsets_to_subview import move_offsets_to_subview
 from .ops.clear_tile_and_fuse_annotations import clear_tile_and_fuse_annotations
 from .ops.get_fusion_roots import get_fusion_roots
 from .ops.propagate_tile_sizes import propagate_tile_sizes
+from .utils.dependant_reduction_legality import REDUCTION_LOOP_ATTR_NAME
 
 __all__ = [
+    "REDUCTION_LOOP_ATTR_NAME",
     "TransformExtensionDialect",
     "assign_tile_sizes",
     "clear_tile_and_fuse_annotations",

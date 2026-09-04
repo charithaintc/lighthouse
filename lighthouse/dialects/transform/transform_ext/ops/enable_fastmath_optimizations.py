@@ -68,13 +68,17 @@ def _annotate_fastmath(root: ir.Operation) -> None:
 def _fastmath_allows_transform(op: ir.Operation) -> bool:
     """True if `op`'s `fastmath` flags permit `exp(a)/exp(b)` -> `exp(a-b)`.
 
-    The rewrite is not IEEE-preserving: it changes the rounding of the two
-    intermediate exponentials into a single one, and it turns a division into a
-    subtraction. `reassoc` is what licenses that regrouping, and the flag set also
-    has to cover the values the identity ignores -- `exp(a)/exp(b)` is finite when
-    both exponentials overflow or underflow together, whereas `exp(a-b)` is not
-    (and vice versa), so `nnan`/`ninf` are required too. `fastmath<fast>` is the
-    only flag set that provides all three.
+    The rewrite is not IEEE-preserving and relies on three flags:
+
+      - `reassoc`, which licenses regrouping the expression at all.
+      - `nnan` and `ninf`, because the two forms disagree once an exponential
+        overflows or underflows. For `a = b = 1000`, `exp(a)/exp(b)` is `inf/inf`,
+        i.e. NaN, while `exp(a-b)` is 1.
+
+    Only the full `fastmath<fast>` set is accepted. That is stricter than the
+    three flags above require -- `<reassoc,nnan,ninf>` would also be sound -- but
+    it is the only set the payloads here produce, so the check stays a plain
+    comparison.
     """
     if "fastmath" not in op.attributes:
         return False
@@ -134,21 +138,13 @@ class EnableFastmathOptimizationsOp(
       2. Rewrite `exp(a) / exp(b)` into `exp(a - b)`, trading a transcendental and
          a divide for a subtract. Only applied where the `arith.divf` and both
          `math.exp` producers carry `fastmath<fast>`; see
-         `_fastmath_allows_transform` for why nothing weaker is accepted.
+         `_fastmath_allows_transform` for which flags the rewrite relies on.
 
     The order matters and is why the two are one op: the fold keys off the
     annotation. Ops without the flag are skipped rather than rejected, so this is
     safe to run over a whole function.
 
-    The motivating case is the online-softmax rescale factor emitted by
-    `fuse_dependant_reduction_ops`, which is `exp(-m_new) / exp(-m_old)`; this turns
-    it into the single `exp(m_old - m_new)` a hand-written flash-attention kernel
-    uses. That factor is built from `linalg.elementwise`, which has no `fastmath`
-    attribute, so the `arith.divf` it expands to arrives unannotated even when the
-    surrounding payload ops are `fastmath<fast>` -- hence step 1.
-
-    Run after vectorization: before it the two exponentials and the divide live in
-    three separate `linalg.generic`s, so there is no single op to match.
+    Ideally must be run after vectorization.
 
     Args:
         target: Handle to root ops to work within (e.g. func.func).

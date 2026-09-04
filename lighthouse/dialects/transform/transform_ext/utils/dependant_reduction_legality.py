@@ -27,7 +27,6 @@ from lighthouse.dialects.transform.transform_ext.utils import linalg_structured 
 __all__ = [
     "REDUCTION_LOOP_ATTR_NAME",
     "FusionRejected",
-    "check_elementwise_separability",
     "check_legal_fusion_triple",
     "collect_inner_reduction_generics",
     "collect_r1_as_elementwise_inputs",
@@ -136,29 +135,17 @@ def find_r2_elementwise_operand(r2: ir.OpView, e: ir.OpView) -> ls.Operand:
 def needs_elementwise_clone(e: ir.OpView, r2: ir.OpView) -> bool:
     """Whether the fusion must work on a *clone* of `e` rather than `e` itself.
 
-    Fusing ``E`` moves it into the loop, where each tile is computed against the
-    *running* value of ``R1``'s accumulator rather than its final one. That is
-    exactly what the online correction accounts for -- but only for ``R2``'s
-    accumulator. ``E``'s own full-extent result is therefore stale in every tile
-    but the last, so no consumer outside the loop may read it. For softmax
-    ``E = exp(x - m)``, the tile written at step ``t`` is ``exp(x - m_t)`` and
-    differs from the final ``exp(x - m)`` by ``exp(m - m_t)``; a normalizing
-    divide reading it off the loop would normalize stale numerators and get row
-    sums above one.
-
-    So whenever ``E`` has another consumer, fuse a clone and leave the original
-    in place, where it still reads ``R1``'s final result off the loop and
-    recomputes the term correctly. That covers both shapes this arises in: an
-    all-parallel consumer (softmax's normalizing divide), and another consumer
-    *reduction* over the same axis (an attention chain's row sum alongside its
-    ``P @ V`` contraction), which is a candidate ``R2`` in its own right and gets
-    fused into the same loop by applying the fusion again.
+    True if ``E`` has any user besides ``R2``. Fusing ``E`` computes each tile
+    against the *running* ``R1`` accumulator instead of its final result, so
+    ``E``'s own output is stale in every tile but the last and no user outside the
+    loop may read it. The original is left in place for those users, where it still
+    reads ``R1``'s final result and recomputes the term correctly.
     """
     r2_op = r2.operation
     return any(user != r2_op for user in op_users(e.results[0]))
 
 
-# --- separability ------------------------------------------------------------
+# --- separability analysis ------------------------------------------------------------
 
 #: `v` is independent of every block argument (a loop-invariant scalar).
 _CONST = 1 << 0
@@ -356,12 +343,22 @@ def check_inner_reduction_against_elementwise(
 
     ``r1`` must reduce over exactly one innermost loop, and every ``r1`` input
     (resolved *through* its tile ``extract_slice`` to the source tensor) must also
-    appear as an ``e`` input -- *except* inputs that are results of a sibling
-    inner reduction (`inner_results`), which are themselves broadcast running
-    accumulators. The shared inputs' indexing maps must agree under a consistent
-    injective dim-mapping phi from ``r1``'s loop dims to ``e``'s loop dims, with
-    phi total over ``r1``'s loops and aligning ``r1``'s reduction dim with the
-    ``e`` dim carrying ``R2``'s reduction axis (`e_tiled_dim`).
+    appear as an ``e`` input.
+
+    Fusion rewrites ``r1``'s indexing maps into ``e``'s iteration space, so the two
+    ops' loop dims have to correspond. That correspondence ``phi`` is not given but
+    *derived*, by unifying the maps of the inputs they share: at each position of a
+    shared input's map, the ``r1`` dim indexing that tensor dim pairs with the ``e``
+    dim indexing it, and the pairing must be consistent across all shared inputs.
+    For softmax's ``max`` and ``exp(x - m)``, both read ``x`` as
+    ``(d0, d1) -> (d0, d1)``, so ``phi = {0: 0, 1: 1}``.
+
+    ``phi`` must additionally be
+
+      * total over ``r1``'s loop dims, so every ``r1`` map -- its init map included
+        -- can be translated, and
+      * reduction-aligned: ``phi[r1_red_dim] == e_tiled_dim``, i.e. ``r1`` reduces
+        the same axis that ``R2`` reduces through ``e``.
 
     Note the comparison is against ``E``, not ``R2``: with the elementwise term
     left unfused, ``E`` is the op sharing ``R1``'s data inputs (e.g. ``x`` in
@@ -377,8 +374,8 @@ def check_inner_reduction_against_elementwise(
     if r1_red_dims[0] != ls.num_loops(r1) - 1:
         raise FusionRejected("reduction iterator is not the innermost loop in inner R1")
 
-    # Every input of R1 must also appear as an input of E, and the two ops' maps
-    # for each shared input must agree up to a consistent injective mapping phi.
+    # Every input of R1 must also appear as an input of E. Unifying the two ops'
+    # maps for each shared input derives phi: R1 loop dim -> E loop dim.
     phi: dict[int, int] = {}
 
     def try_add_mapping(r1_dim: int, e_dim: int) -> bool:
@@ -460,6 +457,7 @@ def check_legal_fusion_triple(
     reduction axis, which the retiling step needs, and the tile size.
 
     Raises `FusionRejected` with the reason on any violated condition.
+    TODO: These conditions are too strict, reconsider and relax later.
     """
     if len(list(r2.results)) != 1 or ls.num_dps_inits(r2) != 1:
         raise FusionRejected(

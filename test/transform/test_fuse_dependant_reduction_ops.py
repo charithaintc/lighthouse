@@ -23,10 +23,6 @@ from lighthouse import transform as lh_transform
 from lighthouse.dialects.transform import transform_ext
 from lighthouse.schedule.builders import schedule_boilerplate
 
-#: Marks the tiled producer loop. A plain `scf.for` carries no iterator-type
-#: metadata, so this is how the fusion recognises a tiled reduction axis.
-REDUCTION_LOOP_ATTR = "__reduction_loop__"
-
 
 # ---------------------------------------------------------------------------
 # Payloads
@@ -184,7 +180,7 @@ def online_softmax_schedule(tile_size: int = 32) -> ir.Module:
         # Tile R1 along the reduction dim only, giving the `scf.for` the fusion
         # needs, and mark it as a reduction loop.
         _tiled_r1, r1_loop = structured.TileUsingForOp(r1, sizes=[0, tile_size]).results
-        transform.annotate(r1_loop, REDUCTION_LOOP_ATTR)
+        transform.annotate(r1_loop, transform_ext.REDUCTION_LOOP_ATTR_NAME)
 
         fused = transform_ext.fuse_dependant_reduction_ops(e, r2, r1_loop)
         transform.annotate(fused, "online_softmax_loop")
@@ -202,7 +198,7 @@ def flash_attention_schedule(tile_size: int = 32) -> ir.Module:
         r1, e, r2a, r2b, _divide = transform.split_handle([anyop] * 5, generics)
 
         _tiled_r1, r1_loop = structured.TileUsingForOp(r1, sizes=[0, tile_size]).results
-        transform.annotate(r1_loop, REDUCTION_LOOP_ATTR)
+        transform.annotate(r1_loop, transform_ext.REDUCTION_LOOP_ATTR_NAME)
 
         # First chain: the row sum. This fuses a *clone* of E, since E still feeds
         # the contraction, and leaves the original E in place for it.

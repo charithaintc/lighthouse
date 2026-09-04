@@ -175,7 +175,7 @@ def _derive_flash_attention(anytype, func, layer_params):
         static_sizes=[0, 0, reduction_tile],
         scalable_sizes=[False, False, False],
     )
-    transform.annotate(reduction_loop, "__reduction_loop__")
+    transform.annotate(reduction_loop, transform_ext.REDUCTION_LOOP_ATTR_NAME)
 
     # First chain: max -> p -> row sum. `p` also feeds the contraction, so the op
     # fuses a clone of it and leaves the original in place for the second chain.
