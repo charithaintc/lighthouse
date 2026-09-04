@@ -366,9 +366,10 @@ def test_attention_structure() -> None:
         print(apply_schedule(ATTENTION, flash_attention_schedule, 32))
 
 
-# Both consumer reductions end up in one loop, which now carries five
-# accumulators: the running max, one full-extent (stale, write-only) E result per
-# fused chain, the running row sum and the running contraction accumulator.
+# Both consumer reductions end up in one loop, which now carries five accumulators,
+# in this order: the running max, the first chain's full-extent (stale, write-only) E
+# result, the running row sum, the second chain's E result, and the running
+# contraction accumulator.
 # CHECK-LABEL: func.func @attention
 # CHECK-SAME:      %[[X:[a-zA-Z0-9_]+]]: tensor<64x512xf32>
 # CHECK-SAME:      %[[V:[a-zA-Z0-9_]+]]: tensor<512x128xf32>
@@ -392,8 +393,9 @@ def test_attention_structure() -> None:
 # CHECK-SAME:          outs(%[[LSCALED]] : tensor<64xf32>)
 # CHECK:             arith.addf
 
-# The second chain: E's second clone, then a correction over the contraction's
-# *wider* 64x128 accumulator -- the per-row factor broadcast over the N dim.
+# The second chain. No clone this time: the row sum is gone, so the contraction is
+# E's only remaining user and E itself is fused. Its correction runs over the
+# contraction's *wider* 64x128 accumulator -- the per-row factor broadcast over N.
 # CHECK:           %[[P2:.+]] = linalg.generic
 # CHECK-SAME:          ins(%{{.+}}, %[[MNEW]] : tensor<64x32xf32>, tensor<64xf32>)
 # CHECK:             math.exp

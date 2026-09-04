@@ -244,7 +244,12 @@ class Builder:
         # one-pass loop (see `_fuse_attention_in_region` in nanoGPT_schedule.py).
         # A `linalg.softmax` would not do: its decomposition normalizes *before* the
         # contraction, leaving @V reading the normalized P and breaking the chain.
-        # Matches the sequence `generate_gpu_attention_payload` emits.
+        #
+        # Same chain shape as `generate_gpu_attention_payload`, but not the same ops:
+        # this one stays f16 throughout and keeps @V a named `linalg.batch_matmul`,
+        # while that one accumulates in f32 and writes @V as a `linalg.generic` so the
+        # narrowing of P can sit in its body. Hence the extra `generalize` on the
+        # `_fuse_attention_in_region` path -- the fusion needs @V as a generic.
         #
         # After the per-region fused tiling, all these ops fuse into one scf.forall
         # -> one GPU kernel (the flash/online-softmax kernel). Counts as one 'fa'.

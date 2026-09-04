@@ -192,8 +192,11 @@ def check_elementwise_separability(
     Implemented as an abstract interpretation over the fact sets above, in one
     forward pass -- ``E``'s body is straight-line. Accumulator block arguments are
     seeded ``_ADD | _MUL`` (a bare ``m`` is both ``m + 0`` and ``m * 1``), other
-    block arguments ``_IND``, values from an enclosing scope ``_CONST``; ``E`` is
-    separable iff the yielded value holds ``_MUL``.
+    block arguments ``_IND``, values from an enclosing scope ``_CONST``. The analysis
+    is one-sided, as an abstract interpretation must be: ``_MUL`` on the yielded value
+    proves separability, its absence only fails to. Accepting additionally requires
+    the yield *not* to hold ``_IND``, which would mean it never reads an accumulator
+    at all -- a constant-``1`` correction, i.e. not a dependent reduction.
 
     Tracking both shapes rather than just ``_MUL`` is what ``exp`` needs:
     ``exp(alpha(m) + h(x)) = exp(alpha(m)) * exp(h(x))`` converts an additive
@@ -222,9 +225,13 @@ def check_elementwise_separability(
     for op in ops[:-1]:
         ov = opview(op)
         # Only single-result scalar arithmetic is modelled; anything else (a
-        # comparison, a select, a call) is opaque and leaves the result with no
-        # facts, which rejects the chain unless the value is dead.
+        # comparison, a select, a call) is opaque, so its results are recorded with
+        # no facts, which rejects the chain unless they are dead. Recorded rather
+        # than skipped: an absent value is read as loop-invariant by `facts_of`,
+        # which for an unmodelled result would be a wrong (and unsound) answer.
         if len(ov.results) != 1:
+            for opaque in ov.results:
+                facts[opaque] = 0
             continue
         result = ov.results[0]
         f = 0
@@ -459,18 +466,18 @@ def check_legal_fusion_triple(
     Raises `FusionRejected` with the reason on any violated condition.
     TODO: These conditions are too strict, reconsider and relax later.
     """
-    if len(list(r2.results)) != 1 or ls.num_dps_inits(r2) != 1:
+    # A structured op on tensors has one init per result (`num_dps_inits` is derived
+    # from the result count), so one condition covers both.
+    if ls.num_dps_inits(r2) != 1:
         raise FusionRejected(
-            f"R2 does not have exactly one result/init "
-            f"(results: {len(list(r2.results))}, inits: {ls.num_dps_inits(r2)})"
+            f"R2 does not have exactly one result/init ({ls.num_dps_inits(r2)})"
         )
 
     # (E1) E must be all-parallel with exactly one result/init: it is the
     # elementwise term feeding R2, not a reduction of its own.
-    if len(list(e.results)) != 1 or ls.num_dps_inits(e) != 1:
+    if ls.num_dps_inits(e) != 1:
         raise FusionRejected(
-            f"E does not have exactly one result/init "
-            f"(results: {len(list(e.results))}, inits: {ls.num_dps_inits(e)})"
+            f"E does not have exactly one result/init ({ls.num_dps_inits(e)})"
         )
     if ls.num_reduction_loops(e) != 0:
         raise FusionRejected(
@@ -478,16 +485,19 @@ def check_legal_fusion_triple(
             f"reduction loops)"
         )
 
-    # (E2) R2 may have MULTIPLE inputs (e.g. a GEMM-like contraction), but
-    # exactly one must be E's result, and *every* input must be reduced along the
-    # shared reduction axis -- see (E2b).
+    # (E2) The three ops must share a block: the rewrite builds the replacement loop
+    # at E's position and reasons about program order there, and both dominance
+    # helpers answer only within one block.
     if e.operation.block != r2.operation.block or (
         e.operation.block != r1_loop.operation.block
     ):
         raise FusionRejected("R1 loop, E and R2 are not all in the same block")
+
+    # (E3) R2 may have MULTIPLE inputs (e.g. a GEMM-like contraction), but exactly
+    # one must be E's result.
     r2_e_operand = find_r2_elementwise_operand(r2, e)
 
-    # R2 must have exactly one reduction loop, and it must be its innermost.
+    # (E4) R2 must have exactly one reduction loop, and it must be its innermost.
     r2_red_dims = ls.reduction_dims(r2)
     if len(r2_red_dims) != 1:
         raise FusionRejected(
@@ -496,7 +506,7 @@ def check_legal_fusion_triple(
     if r2_red_dims[0] != ls.num_loops(r2) - 1:
         raise FusionRejected("reduction iterator is not the innermost loop in R2")
 
-    # (E2b) Every R2 input must be reduced along R2's reduction axis, i.e. its
+    # (E5) Every R2 input must be reduced along R2's reduction axis, i.e. its
     # indexing map must reference `r2_red_dim`. An input that does *not* is
     # broadcast across the reduction (a per-parallel-slice value); such an operand
     # would have to be re-derived per tile rather than simply re-sliced, which the
@@ -518,7 +528,7 @@ def check_legal_fusion_triple(
                 f"not reference dim {r2_red_dims[0]}): {imap}"
             )
 
-    # (E3) Locate the E loop dim carrying R2's reduction axis. This is the axis
+    # (E6) Locate the E loop dim carrying R2's reduction axis. This is the axis
     # along which E is re-sliced when cloned into R1's tiled loop, and the axis
     # R1's reduction dim must align with.
     e_tiled_dim = find_elementwise_dim_for_r2_reduction_dim(
@@ -553,7 +563,7 @@ def check_legal_fusion_triple(
             f"{full_extent}"
         )
 
-    # (E4) E's extent along the axis carrying R2's reduction must match the R1
+    # (E7) E's extent along the axis carrying R2's reduction must match the R1
     # loop extent too, so re-slicing E to the tile is well defined.
     e_red_range = ls.static_loop_ranges(e)[e_tiled_dim]
     if ir.ShapedType.is_dynamic_size(e_red_range) or e_red_range != full_extent:
@@ -568,7 +578,7 @@ def check_legal_fusion_triple(
     if not r1_as_e_operands:
         raise FusionRejected("E does not consume any result of the R1 loop")
 
-    # (E5) E must be multiplicatively separable in the accumulators it reads, or
+    # (E8) E must be multiplicatively separable in the accumulators it reads, or
     # the online correction it is asked to derive does not exist.
     accumulator_args = [
         ls.matching_block_argument(e, operand) for operand in r1_as_e_operands
@@ -608,7 +618,7 @@ def check_legal_fusion_triple(
             )
         check_inner_reduction_against_elementwise(inner, e, e_tiled_dim, inner_results)
 
-    # (5a) R2's region must be a single-combiner sum reduction.
+    # (E9) R2's region must be a single-combiner sum reduction.
     _, combiners = irr.match_reduction(ls.region_output_args(r2), 0)
     if not combiners:
         raise FusionRejected("R2's region does not match a reduction pattern")
@@ -619,13 +629,13 @@ def check_legal_fusion_triple(
     if not isinstance(combiners[0].opview, arith.AddFOp):
         raise FusionRejected(f"R2's combiner is not arith.addf: {combiners[0].name}")
 
-    # (5b) R2's init must be the additive identity (zero), produced directly or
+    # (E10) R2's init must be the additive identity (zero), produced directly or
     # through a linalg.fill of zero into an empty tensor.
     r2_init = ls.dps_init_operands(r2)[0].value
     if not irr.is_defined_as_zero(r2_init):
         raise FusionRejected("R2's init is not the additive identity (zero)")
 
-    # (5c) Restrict to supported floating-point element types.
+    # (E11) Restrict to supported floating-point element types.
     element_type = ir.ShapedType(r2.results[0].type).element_type
     if not isinstance(element_type, _SUPPORTED_FLOAT_TYPES):
         raise FusionRejected(
@@ -633,7 +643,7 @@ def check_legal_fusion_triple(
             f"floating-point type (f16/bf16/f32/f64)"
         )
 
-    # (5d) E's element type and R2's accumulator must have a common widening: the
+    # (E12) E's element type and R2's accumulator must have a common widening: the
     # correction term is E's body re-evaluated in the wider of the two, with casts on
     # the way in and out. `f16` and `bf16` have no single-step conversion between
     # them, so such a pair is rejected here rather than mid-rewrite.
@@ -645,7 +655,7 @@ def check_legal_fusion_triple(
             f"term in"
         )
 
-    # (6a) Any other user of any R1 loop result (besides E) must post-dominate E
+    # (E13) Any other user of any R1 loop result (besides E) must post-dominate E
     # so re-routing the values through the fused op is safe. Note the anchor is E,
     # not R2: E directly consumes the R1 loop results and is cloned into the loop
     # first.

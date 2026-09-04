@@ -25,15 +25,18 @@ For softmax ``m = max_j x``, ``p = exp(x - m)``, ``s = sum_j p`` the result is::
       %f    = linalg.elementwise kind=div ins(%tNew, %tOld)
       %sc   = linalg.elementwise kind=mul ins(%sOld, %f)
       %sNew = linalg.generic ins(%p) outs(%sc) { arith.addf }          // fused R2
-      scf.yield %mi, insert_slice(%p into %eArg), insert_slice(%sNew into %sArg)
+      scf.yield %mNew, insert_slice(%p into %eArg), insert_slice(%sNew into %sArg)
     }
 
-``%eArg`` carries ``E``'s full-extent result only so the fused clone has a
-destination; every tile but the last is stale (computed against the *running*
-accumulator), so nothing may read it off the loop. It is dead on arrival, but not
-provably so until vectorization has replaced the in-loop destination slice with
-transfer ops -- so the schedule runs ``remove-dead-values`` after vectorizing to
-unwind it. See ``needs_elementwise_clone``.
+``%eArg`` carries ``E``'s full-extent result only so the fused op has a destination;
+every tile but the last is stale (computed against the *running* accumulator), so
+nothing may read it off the loop. It is dead on arrival, but not provably so until
+vectorization has replaced the in-loop destination slice with transfer ops -- so the
+schedule runs ``remove-dead-values`` after vectorizing to unwind it.
+
+The op fused is ``E`` itself, unless ``E`` has a consumer besides ``R2``: then a
+clone is fused and the original stays put for that consumer, still reading ``R1``'s
+final result. See ``needs_elementwise_clone``.
 """
 
 from mlir import ir
@@ -181,9 +184,9 @@ def _emit_elementwise(
 ) -> ir.Value:
     """Emit a ``linalg.elementwise`` of `kind` over `inputs` into `dest`.
 
-    The Python builder infers the kind and default identity indexing maps but
-    leaves the region empty (the C++ region builder is not bound), so the scalar
-    body is emitted here via `scalar_op`.
+    The Python builder fills in the default identity indexing maps but leaves the
+    region empty (the C++ region builder is not bound), so the scalar body is emitted
+    here via `scalar_op` -- which therefore has to agree with `kind`.
     """
     op = linalg.ElementwiseOp(
         result_tensors=[dest.type], inputs=inputs, outputs=[dest], kind=kind
@@ -241,15 +244,22 @@ def _emit_correction_term(
 
     Because ``E`` is a separate op its body can be cloned directly; no backward
     slice is needed, ``E``'s yielded value *is* the term. Data block arguments are
-    replaced by the constant that eliminates their contribution to the consuming
-    op (`operand_eliminating_constant`): ``1.0`` for ``mulf``/``divf``, ``0.0``
-    for ``addf``/``subf``, decided per use so a data op drops out cleanly instead
-    of contributing a spurious magnitude. This is sound because the data inputs
-    cancel in the new/old ratio -- for softmax ``E = exp(x - m)`` gives
-    ``exp(x - m_new) / exp(x - m_old) = exp(m_old - m_new)`` for any ``x``.
+    replaced by a stand-in constant chosen per consuming op
+    (`operand_eliminating_constant`): ``1.0`` for ``mulf``/``divf``, ``0.0`` for
+    ``addf``/``subf``. What makes that sound is not the constant itself but
+    separability, which legality has already established: with
+    ``E(x, m) = f(x) * g(m)``, substituting any ``c`` for ``x`` leaves
+    ``E(c, m_new) / E(c, m_old) = g(m_new) / g(m_old)``. For softmax
+    ``E = exp(x - m)`` and ``c = 0`` that is ``exp(-m_new) / exp(-m_old)``, the same
+    ratio as ``exp(x - m_new) / exp(x - m_old)`` for any ``x``.
+
+    TODO: Caveat: the cancellation needs ``f(c)`` to be finite and non-zero, which is not
+    checked. A body where the substitution zeroes the data factor -- ``mulf`` fed by
+    a ``subf`` of two data arguments, say ``(x1 - x2) * exp(-m)`` -- is accepted by
+    the separability analysis but yields ``0 / 0`` here.
 
     Returns the cloned term value, or None if a data argument feeds an op with no
-    eliminating constant.
+    stand-in constant, or a captured value cannot be converted to `compute_type`.
     """
     body = e.regions[0].blocks[0]
     ops = list(body.operations)

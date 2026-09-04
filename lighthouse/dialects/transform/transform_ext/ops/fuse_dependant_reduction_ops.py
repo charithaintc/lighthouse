@@ -48,21 +48,24 @@ class FuseDependantReductionOpsOp(
     ``transform.annotate`` for that.
     TODO: Remove the annotation requirement for the producer reduction loop.
 
-    This op fuses a *clone* of
-    ``E`` and leaves the original in place for them if it has other users. The fused copy computes each
-    tile against the *running* `R1` accumulator, which the online correction only
-    accounts for on ``R2``'s accumulator, so ``E``'s own full-extent result is
-    stale in every tile but the last and must not be read off the loop. The
-    original ``E`` still reads ``R1``'s final result off the loop, so it recomputes
-    the term correctly; the clone's full-extent loop result is dead, and the
-    schedule drops it with ``remove-dead-values`` after vectorization.
+    Whichever copy is fused computes each tile against the *running* ``R1``
+    accumulator, which the online correction only accounts for on ``R2``'s
+    accumulator, so its own full-extent result is stale in every tile but the last
+    and must not be read off the loop. That result surfaces as a dead loop result,
+    which the schedule drops with ``remove-dead-values`` after vectorization.
 
-    A consumer that *reduces* ``E`` over the same axis is a candidate ``R2`` in its
-    own right, and is fused into the same loop by this op along with necessary
-    *online correction*. Applying the op once per consumer reduction therefore
-    fuses an attention chain (one ``exp`` term feeding both a row sum and a `P @ V`
-    contraction) into a single loop. The returned loop keeps the ``__reduction_loop__``
-    attribute, so no re-annotation is needed between applications.
+    So if ``E`` has users besides ``R2``, this op fuses a *clone* and leaves the
+    original where it is: there it still reads ``R1``'s final result off the loop and
+    recomputes the term correctly for those users. With ``R2`` as its only user,
+    ``E`` itself is fused and nothing is left behind.
+
+    One application fuses one consumer reduction. ``E`` may have several, though --
+    any consumer reducing it over the same axis is a candidate ``R2`` in its own
+    right -- so applying the op once per consumer folds an attention chain (one
+    ``exp`` term feeding both a row sum and a `P @ V` contraction) into a single loop,
+    each application adding its own online correction. The returned loop keeps the
+    ``__reduction_loop__`` attribute, so it can be passed straight back in as
+    `tiled_reduction_loop` with no re-annotation.
 
     For more details about the fusion algorithm refer:
     https://discourse.llvm.org/t/linalg-rfc-an-approach-for-tiling-and-fusing-dependent-reductions-in-linalg/91698

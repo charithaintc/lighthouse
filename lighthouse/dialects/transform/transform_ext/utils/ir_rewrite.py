@@ -463,14 +463,19 @@ def cast_float(value: ir.Value, element_type: ir.Type) -> ir.Value | None:
 def operand_eliminating_constant(
     op: ir.Operation | ir.OpView, element_type: ir.Type
 ) -> ir.Attribute | None:
-    """The constant that eliminates one operand's contribution to `op`.
+    """The constant to substitute for one operand of `op` to drop its magnitude.
 
-    The value ``c`` making the op the identity on its *other* operand: ``0`` for
-    the additive family (``addf``/``subf``/``addi``/``subi``) and ``1`` for the
-    multiplicative one (``mulf``/``divf``/``muli``). Unlike
-    ``arith::getNeutralElement`` this is defined for the non-commutative ops
-    (``subf``, ``divf``) that show up in correction terms. Returns None for op
-    kinds without such a constant.
+    ``0`` for the additive family (``addf``/``subf``/``addi``/``subi``) and ``1`` for
+    the multiplicative one (``mulf``/``divf``/``muli``) -- i.e. the neutral element of
+    the family, which `arith::getNeutralElement` also gives for the commutative ops.
+    Unlike that helper this answers for the non-commutative ones too, where the
+    constant is *not* an identity in the left operand's position: ``0 - x`` is ``-x``
+    and ``1 / x`` is the reciprocal, not ``x``.
+
+    So the substitution generally changes the value, and the caller has to have its
+    own reason why that is harmless -- for the fusion's correction term it is that the
+    substituted part cancels in the new/old ratio, see `_emit_correction_term`.
+    Returns None for op kinds with no such constant.
     """
     ov = opview(op)
     if isinstance(ov, (arith.AddFOp, arith.SubFOp)):
