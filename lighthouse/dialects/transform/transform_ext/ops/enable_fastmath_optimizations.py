@@ -8,33 +8,15 @@ from lighthouse.dialects.transform.transform_ext import TransformExtensionDialec
 #: but elided when printed, and carries no intent, so it counts as absent.
 NO_FASTMATH = "#arith.fastmath<none>"
 
-#: Ops that carry an optional `fastmath` attribute. Structured ops that expand to
-#: these later (e.g. `linalg.elementwise`) have no such attribute, so anything they
-#: emit has to be annotated after it materializes.
-FASTMATH_OP_NAMES = frozenset(
-    {
-        "arith.addf",
-        "arith.divf",
-        "arith.maximumf",
-        "arith.maxnumf",
-        "arith.minimumf",
-        "arith.minnumf",
-        "arith.mulf",
-        "arith.negf",
-        "arith.remf",
-        "arith.subf",
-        "math.absf",
-        "math.exp",
-        "math.exp2",
-        "math.expm1",
-        "math.fma",
-        "math.log",
-        "math.powf",
-        "math.rsqrt",
-        "math.sqrt",
-        "math.tanh",
-    }
-)
+#: Ops that get the `fastmath` attribute. Deliberately narrow -- only what the
+#: current usecases need.
+#:
+#:   - `math.exp`, for the `exp(a)/exp(b)` fold below.
+#:   - `arith.subf`, because the correction's terms come out as `0.0 - m` (the
+#:     fusion substitutes the additive neutral for `E`'s data operand). LLVM only
+#:     narrows that to a negation under `nsz` -- `0.0 - x` and `-x` disagree at
+#:     `x = 0.0` -- so without the flags the subtraction survives to the ISA.
+FASTMATH_OP_NAMES = frozenset({"math.exp", "arith.subf"})
 
 
 def _collect(root: ir.Operation, names) -> list[ir.Operation]:
@@ -51,7 +33,7 @@ def _collect(root: ir.Operation, names) -> list[ir.Operation]:
 
 
 def _annotate_fastmath(root: ir.Operation) -> None:
-    """Set `fastmath<fast>` on every floating-point arith/math op under `root`.
+    """Set `fastmath<fast>` on every `FASTMATH_OP_NAMES` op under `root`.
 
     Ops that already carry a non-default `fastmath` attribute are left alone, so an
     explicitly-chosen weaker flag set is never widened.
@@ -98,10 +80,12 @@ def _exp_operand(value: ir.Value) -> ir.Value | None:
 
 
 def _fold_exp_div(div_op: ir.Operation, rewriter: transform.TransformRewriter) -> bool:
-    """Rewrite one `exp(a) / exp(b)` into `exp(a - b)`. True if it applied."""
-    if not _fastmath_allows_transform(div_op):
-        return False
+    """Rewrite one `exp(a) / exp(b)` into `exp(a - b)`. True if it applied.
 
+    Gated on the two `math.exp` producers alone, not on the `arith.divf`: the flags
+    the rewrite needs describe the exponentials overflowing, and the divide is not in
+    `FASTMATH_OP_NAMES`.
+    """
     numerator = _exp_operand(div_op.operands[0])
     denominator = _exp_operand(div_op.operands[1])
     if numerator is None or denominator is None:
@@ -114,6 +98,11 @@ def _fold_exp_div(div_op: ir.Operation, rewriter: transform.TransformRewriter) -
     if numerator.type != div_op.results[0].type:
         return False
 
+    # Both replacements are flagged directly: step 1 has already walked the payload,
+    # so ops created here never pass through `_annotate_fastmath`. The subtract wants
+    # the flags for the same reason every other one does -- `a - b` is
+    # `(0.0 - m_new) - (0.0 - m_old)`, which only collapses to `m_old - m_new` once
+    # reassociation is licensed.
     fast = arith.FastMathFlags.fast
     with ir.InsertionPoint(div_op), div_op.location:
         difference = arith.SubFOp(numerator, denominator, fastmath=fast)
@@ -132,13 +121,14 @@ class EnableFastmathOptimizationsOp(
 
     Two steps, in this order:
 
-      1. Set `fastmath<fast>` on every floating-point arith/math op. Ops that
-         already carry a non-default flag set keep it, so an explicitly-chosen
-         weaker one is never widened.
+      1. Set `fastmath<fast>` on every op in `FASTMATH_OP_NAMES` -- a deliberately
+         narrow set, see there for what is in it and why. Ops that already carry a
+         non-default flag set keep it, so an explicitly-chosen weaker one is never
+         widened.
       2. Rewrite `exp(a) / exp(b)` into `exp(a - b)`, trading a transcendental and
-         a divide for a subtract. Only applied where the `arith.divf` and both
-         `math.exp` producers carry `fastmath<fast>`; see
-         `_fastmath_allows_transform` for which flags the rewrite relies on.
+         a divide for a subtract. Only applied where both `math.exp` producers carry
+         `fastmath<fast>`; see `_fastmath_allows_transform` for which flags the
+         rewrite relies on.
 
     The order matters and is why the two are one op: the fold keys off the
     annotation. Ops without the flag are skipped rather than rejected, so this is
