@@ -5,19 +5,54 @@ Kept local to the example (rather than added to
 ``lighthouse.schedule.xegpu.mlp_schedule``) so that experiments with a dynamic
 reduction dimension cannot regress the existing static schedules.
 
-The schedule is being built up stage by stage. Right now only the ``initial``
-stage is wired: the payload is matched and immediately handed back untouched, so
-``--dump-kernel=initial`` shows the generated linalg payload. Requesting any
-later stage raises, rather than silently dumping the initial IR.
+The schedule is being built up stage by stage. Wired so far:
+
+  * ``initial``: the payload is matched and handed back untouched.
+  * ``tiled``:   workgroup tiling of the parallel dims (M, N) into an scf.forall,
+                 then tiling of the dynamic reduction dim K into an scf.for with a
+                 runtime trip count and an affine.min-clamped last tile.
+  * ``vectorized``: masked vectorization of the dynamic K tile, see
+                 `_vectorize_masked` below.
+  * ``bufferized``: one-shot bufferization, see `_bufferize` below.
+  * ``gpu-outlining``: map the workgroup scf.forall onto gpu.launch and outline
+                 the body into a gpu.func. Masks survive unchanged.
+  * ``xegpu-initial``: wired up, but currently FAILS -- convert-vector-to-xegpu
+                 is not mask-aware. See the FIXME in
+                 bundle_dyn_shape_matmul_schedule for the two blockers.
+
+Requesting a later stage raises, rather than silently dumping earlier IR.
+
+The vectorize and bufferize stages are re-implemented locally rather than reusing
+`lowering_common.vectorize_bufferize_and_outline_gpu_func`, because the stock
+`vectorize()` infers vector sizes from static shapes and silently no-ops on a
+dynamic K tile. This is prototype code; if it works out, the masked path belongs
+back in lowering_common behind a flag.
 """
 
 from mlir import ir
+from mlir.dialects.bufferization import LayoutMapOption
 from mlir.dialects import transform
+from mlir.dialects.transform import bufferization as transform_bufferization
+from mlir.dialects.transform import memref as transform_memref
+from mlir.dialects.transform import structured
 
-from lighthouse.pipeline.helper import PipelineInterrupt
+import lighthouse.transform as lh_transform
+from lighthouse.dialects.transform import transform_ext
+from lighthouse.pipeline.helper import (
+    PipelineInterrupt,
+    apply_registered_pass,
+    canonicalize,
+    match,
+)
 from lighthouse.schedule import schedule_boilerplate
 from lighthouse.schedule.parameters import ScheduleParameters
-from lighthouse.schedule.xegpu.lowering_common import get_payload_func
+from lighthouse.schedule.xegpu import XeGPUParameterSelector
+from lighthouse.schedule.xegpu.lowering_common import (
+    convert_to_gpu_launch,
+    get_payload_func,
+    outline_gpu_function,
+)
+from lighthouse.schedule.xegpu.xegpu_specs import XeGPUSpecs
 
 # Lowering stages in pipeline order. Stages after `initial` are not implemented
 # yet; extend IMPLEMENTED_STAGES as each one is added.
@@ -26,12 +61,23 @@ STAGES = (
     "tiled",
     "vectorized",
     "bufferized",
+    "gpu-outlining",
     "xegpu-initial",
     "xegpu-wg",
     "final",
 )
 
-IMPLEMENTED_STAGES = ("initial",)
+IMPLEMENTED_STAGES = (
+    "initial",
+    "tiled",
+    "vectorized",
+    "bufferized",
+    "gpu-outlining",
+)
+
+# Parameters the schedule needs so far. Filled from the cost model / parameter DB
+# when the caller does not supply them.
+REQUIRED_PARAMS = ("wg_m", "wg_n", "sg_m", "sg_n", "k_tile")
 
 
 def dyn_shape_matmul_schedule(
@@ -52,6 +98,23 @@ def dyn_shape_matmul_schedule(
     assert params is not None and len(params) > 0, "params must be provided."
     assert len(params) == 1, "the dynamic-shape matmul example has a single layer."
 
+    layer_params = params[0]
+    m, n, k = (layer_params.get(d) for d in ("m", "n", "k"))
+    assert all(d is not None for d in (m, n, k)), "m, n, k must be provided in params"
+
+    param_selector = XeGPUParameterSelector(device=device)
+    if not all(p in layer_params for p in REQUIRED_PARAMS):
+        # K is dynamic in the payload, so the nominal K only feeds the tile-size
+        # heuristic here; it never reaches the IR.
+        generated = param_selector.get_parameters(
+            (m, n, k),
+            layer_params.get("transpose_a", False),
+            layer_params.get("transpose_b", False),
+        )
+        # Caller-provided values win over generated ones.
+        for key, value in generated[0].items():
+            layer_params.setdefault(key, value)
+
     with schedule_boilerplate() as (schedule, named_seq):
         anytype = transform.AnyOpType.get()
         func = get_payload_func(named_seq.bodyTarget, func_name=payload_func_name)
@@ -67,7 +130,7 @@ def dyn_shape_matmul_schedule(
                 payload_mod,
                 payload_func_name=payload_func_name,
                 params=params,
-                device=device,
+                gpu_specs=param_selector.gpu_specs,
                 stop_at_stage=stop_at_stage,
             )
         except PipelineInterrupt:
@@ -78,11 +141,100 @@ def dyn_shape_matmul_schedule(
     return schedule
 
 
+def _vectorize_masked(
+    func: ir.Value,
+    matmul_op: ir.Value,
+    *,
+    wg_m: int,
+    wg_n: int,
+    k_tile: int,
+) -> None:
+    """
+    Masked vectorization of a matmul whose reduction dim is dynamic.
+
+    Unlike the stock `lowering_common.vectorize`, this passes explicit vector
+    sizes, so the vectorizer does not need to infer them from the (partly
+    dynamic) operand shapes. It reads the tile's `affine.min` and emits a
+    `vector.create_mask` per operand to guard the clamped last K tile.
+
+    `create_named_contraction` makes it emit a `vector.contract` on 2-D operands
+    directly, instead of broadcasting both operands to a 3-D MxNxK vector and
+    reducing. The latter is both wasteful and awkward to lower.
+
+    Before:
+      %5 = affine.min #map(%arg6)[%dim]
+      %a = tensor.extract_slice ... to tensor<128x?xf16>
+      %b = tensor.extract_slice ... to tensor<?x128xf16>
+      linalg.matmul ins(%a, %b) outs(%acc : tensor<128x128xf32>)
+
+    After:
+      %m_a = vector.create_mask %c128, %5 : vector<128x16xi1>
+      %a   = vector.mask %m_a { vector.transfer_read ... } -> vector<128x16xf16>
+      %m_b = vector.create_mask %5, %c128 : vector<16x128xi1>
+      %b   = vector.mask %m_b { vector.transfer_read ... } -> vector<16x128xf16>
+      %m_c = vector.create_mask %c128, %c128, %5 : vector<128x128x16xi1>
+      %d   = vector.mask %m_c { vector.contract %a, %b, %acc } -> vector<128x128xf32>
+    """
+    structured.structured_vectorize(
+        matmul_op,
+        [],
+        static_vector_sizes=[wg_m, wg_n, k_tile],
+        # Must be spelled out: the op asserts len(scalable_sizes) == len(sizes).
+        scalable_sizes=[False, False, False],
+        create_named_contraction=True,
+    )
+    transform.apply_cse(func)
+    canonicalize(func)
+
+    # Hoist the MxN accumulator read/write out of the K loop so it becomes an
+    # scf.for iter_args of vector type, matching the static flow.
+    k_loop = match(func, ops={"scf.for"})
+    lh_transform.loop_hoisting(k_loop)
+
+    transform.apply_cse(func)
+    canonicalize(func)
+
+
+def _bufferize(mod: ir.Value) -> ir.Value:
+    """
+    One-shot bufferization of the masked-vectorized payload.
+
+    Same recipe as `lowering_common.bufferize`, inlined here to keep the
+    prototype self-contained. Folding the memref aliases is what turns the
+    per-tile `memref.subview` chains back into direct indexed transfers off the
+    function arguments.
+    """
+    transform_bufferization.bufferization_eliminate_empty_tensors(mod)
+    mod = transform_bufferization.bufferization_one_shot_bufferize(
+        transform.any_op_t(),
+        mod,
+        function_boundary_type_conversion=LayoutMapOption.IdentityLayoutMap,
+        bufferize_function_boundaries=True,
+    )
+    with ir.InsertionPoint(transform.apply_patterns(mod).patterns):
+        transform_memref.apply_patterns_memref_fold_memref_alias_ops()
+    transform.apply_cse(mod)
+    canonicalize(mod)
+
+    # NOTE The stock flow runs `buffer-deallocation-pipeline` here (see
+    # lowering_common.convert_allocs_to_gpu). It is omitted on purpose:
+    # `-ownership-based-buffer-deallocation` materializes an `arith.constant false`
+    # ownership indicator *inside* the `vector.mask` regions we just created,
+    # which violates vector.mask's single-op region constraint and fails with
+    # "'vector.mask' op expects only one operation to mask".
+    #
+    # Safe for now because this payload accumulates in place and allocates
+    # nothing. It has to be dealt with (mask lowering first, or a fix upstream)
+    # before any variant that needs a temporary buffer.
+
+    return mod
+
+
 def bundle_dyn_shape_matmul_schedule(
     mod: ir.Value,
     payload_func_name: str,
     params: ScheduleParameters,
-    device: str | None = None,
+    gpu_specs: XeGPUSpecs,
     stop_at_stage: str = "",
 ) -> ir.Value:
     """Lower the dynamic-shape matmul payload towards XeGPU, stage by stage."""
@@ -90,12 +242,111 @@ def bundle_dyn_shape_matmul_schedule(
     if stop_at_stage == "initial":
         raise PipelineInterrupt()
 
+    layer_params = params[0]
+    wg_tile = [layer_params["wg_m"], layer_params["wg_n"]]
+    k_tile = layer_params["k_tile"]
+
+    func = get_payload_func(mod, func_name=payload_func_name)
+    # Collapse the elementwise epilogue (the acc/result type conversions) so
+    # there is a single tileable consumer to anchor the workgroup loop on.
+    func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
+
+    # Anchor on the last tileable consumer rather than the matmul itself, so any
+    # elementwise epilogue lands inside the workgroup loop instead of after it.
+    matmul_op = match(func, ops={"linalg.matmul"})
+    consumers = transform_ext.get_tileable_consumers(matmul_op)
+    leaf_consumer_op = transform_ext.extract_handle(consumers, -1)
+
+    # Workgroup tiling of the parallel dims only. Passing two tile sizes for a
+    # 3-loop matmul leaves the innermost (reduction) loop untiled, so K remains a
+    # single dynamic-trip-count reduction inside each tile.
+    _, [wg_loop], _ = lh_transform.tile(
+        leaf_consumer_op,
+        tile_sizes=wg_tile,
+        fuse_producers=True,
+        use_forall=True,
+        apply_cleanup=False,
+    )
+    # Reduction tiling. The K extent is dynamic, so the loop gets a runtime upper
+    # bound (memref.dim) and, since k_tile cannot be proven to divide it, an
+    # affine.min clamps the last tile. That clamp is the seam the vectorizer will
+    # later have to mask.
+    wg_matmul = match(wg_loop, ops={"linalg.matmul"})
+    _, [k_loop], _ = lh_transform.tile(wg_matmul, tile_sizes=[0, 0, k_tile])
+    lh_transform.cleanup(wg_loop)
+
+    lh_transform.cleanup(func)
+
+    if stop_at_stage == "tiled":
+        raise PipelineInterrupt()
+
+    # Masked vectorization. The stock `lowering_common.vectorize` cannot be used:
+    # it goes through transform.structured.vectorize_children_and_apply_patterns,
+    # whose VectorizationPattern calls linalg::vectorize with inputVectorSizes={}
+    # and so infers sizes from the op's static shape. On
+    # `linalg.matmul ins(tensor<256x?xf16>, tensor<?x256xf16>)` it returns a plain
+    # pattern-match failure inside a greedy rewriter -- no diagnostic -- and the
+    # matmul is left as-is, which then flows all the way down to a gpu.func
+    # holding a raw linalg.matmul and no DPAS.
+    func = get_payload_func(mod, func_name=payload_func_name)
+    matmul_op = match(func, ops={"linalg.matmul"})
+    _vectorize_masked(
+        func,
+        matmul_op,
+        wg_m=layer_params["wg_m"],
+        wg_n=layer_params["wg_n"],
+        k_tile=k_tile,
+    )
+    if stop_at_stage == "vectorized":
+        raise PipelineInterrupt()
+
+    mod = _bufferize(mod)
+    if stop_at_stage == "bufferized":
+        raise PipelineInterrupt()
+
+    # Map the workgroup scf.forall onto gpu.launch and outline the body into a
+    # gpu.func. The masks are untouched here: `affine.min` is lowered to
+    # arith.subi/arith.minsi by lower-affine, and the dynamic K extent travels
+    # into the kernel as a `memref<M x ? x f16>` argument, so memref.dim still
+    # recovers it inside gpu.func.
+    convert_to_gpu_launch(mod, payload_func_name=payload_func_name)
+    mod = outline_gpu_function(
+        mod, payload_func_name=payload_func_name, gpu_specs=gpu_specs, params=params
+    )
+    if stop_at_stage == "gpu-outlining":
+        raise PipelineInterrupt()
+
+    # FIXME Everything below currently fails: convert-vector-to-xegpu has no
+    # notion of masking. Two independent blockers, both reproducible with
+    # `--dump-kernel=xegpu-initial`:
+    #
+    #  1. Masked A/B loads never reach XeGPU. `transferPreconditions` in
+    #     VectorToXeGPU.cpp bails out on any transfer with a mask operand
+    #     ("Masked transfer is not supported"), so the loads stay as
+    #     `vector.transfer_read` -- no xegpu.load_nd, hence no block loads or
+    #     prefetching. Without the `lower-vector-mask` below it is worse: the
+    #     pattern fires *inside* the `vector.mask` region, expands the read into
+    #     create_nd_tdesc + load_nd (two ops, so the region constraint breaks)
+    #     and drops the mask entirely, emitting boundary_check = false.
+    #
+    #  2. There is no such thing as a masked DPAS. `vector.contract` does get
+    #     rewritten to `xegpu.dpas`, but it sits inside a
+    #     `vector.mask ... : vector<wg_m x wg_n x k_tile x i1>` region and
+    #     xegpu.dpas does not implement MaskableOpInterface, so the verifier
+    #     rejects it: "'vector.mask' op expects a MaskableOpInterface within the
+    #     mask region".
+    #
+    # Lower the masks to transfer mask operands first. This does not fix either
+    # blocker, but it moves the failure from a region-constraint violation to
+    # blocker 2, which is the one that actually needs a design decision.
+    gpu_func = get_payload_func(mod, op_name="vector.mask")
+    apply_registered_pass(gpu_func, "lower-vector-mask")
+
+    # mod = convert_vector_to_xegpu(mod)
+    if stop_at_stage == "xegpu-initial":
+        raise PipelineInterrupt()
+
     # Next steps, in the order we will add them:
-    #   - "tiled":         workgroup-tile the parallel dims (M, N) into an
-    #                      scf.forall, then tile the dynamic K reduction loop.
-    #   - "vectorized":    mask the vectorization so partial K tiles are safe.
-    #   - "bufferized":    one-shot bufferize and outline the gpu.func.
-    #   - "xegpu-initial": convert vector to xegpu.
     #   - "xegpu-wg":      attach workgroup layouts / prefetches.
     raise NotImplementedError(
         f"stop_at_stage={stop_at_stage!r} is not implemented yet; "

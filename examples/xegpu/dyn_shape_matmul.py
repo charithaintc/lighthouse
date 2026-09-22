@@ -3,6 +3,20 @@
 # RUN: %PYTHON %s --dump-kernel=initial --ab-type bf16 | FileCheck %s
 # RUN: %PYTHON %s --dump-kernel=initial --no-accumulate-c | FileCheck %s
 # RUN: %PYTHON %s --dump-kernel=initial --truncate-c | FileCheck %s
+# RUN: %PYTHON %s --dump-kernel=tiled | FileCheck %s --check-prefix=TILED
+# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=tiled | FileCheck %s --check-prefix=TILED
+# RUN: %PYTHON %s --dump-kernel=tiled --wg-tile 256 256 | FileCheck %s --check-prefix=TILED
+# RUN: %PYTHON %s --dump-kernel=tiled --k-tile 64 | FileCheck %s --check-prefix=TILED
+# RUN: %PYTHON %s --dump-kernel=tiled --ab-type bf16 | FileCheck %s --check-prefix=TILED
+# RUN: %PYTHON %s --dump-kernel=tiled --no-accumulate-c | FileCheck %s --check-prefix=TILED
+# RUN: %PYTHON %s --dump-kernel=tiled --truncate-c | FileCheck %s --check-prefix=TILED
+# RUN: %PYTHON %s --dump-kernel=vectorized | FileCheck %s --check-prefix=VEC
+# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=vectorized | FileCheck %s --check-prefix=VEC
+# RUN: %PYTHON %s --dump-kernel=vectorized --k-tile 64 | FileCheck %s --check-prefix=VEC
+# RUN: %PYTHON %s --dump-kernel=bufferized | FileCheck %s --check-prefix=BUF
+# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=bufferized | FileCheck %s --check-prefix=BUF
+# RUN: %PYTHON %s --dump-kernel=gpu-outlining | FileCheck %s --check-prefix=OUTLINE
+# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=gpu-outlining | FileCheck %s --check-prefix=OUTLINE
 # RUN: %PYTHON %s --dump-schedule | FileCheck %s --check-prefix=SCHEDULE
 
 # K must stay dynamic all the way to the payload: A is Mx? and B is ?xN.
@@ -13,10 +27,63 @@
 # CHECK:         linalg.matmul ins(%{{.*}}, %{{.*}} : tensor<{{[0-9]+}}x?x{{[a-z0-9]+}}>, tensor<?x{{[0-9]+}}x{{[a-z0-9]+}}>)
 # CHECK:         bufferization.materialize_in_destination
 
-# The schedule currently stops at the `initial` stage, so it only matches the
-# payload and yields.
+# M and N are tiled statically into an scf.forall, K into an scf.for whose trip
+# count is only known at runtime. The affine.min clamps the last K tile, and the
+# matmul operands keep `?` on the reduction dim.
+# TILED-LABEL: func.func @payload(
+# TILED:         scf.forall
+# TILED:           scf.for
+# TILED:             affine.min
+# TILED:             linalg.matmul ins(%{{.*}}, %{{.*}} : tensor<{{[0-9]+}}x?x{{[a-z0-9]+}}>, tensor<?x{{[0-9]+}}x{{[a-z0-9]+}}>)
+# TILED:           tensor.parallel_insert_slice
+# TILED:         bufferization.materialize_in_destination
+
+# Masked vectorization: the affine.min feeds a vector.create_mask per operand,
+# the A/B reads become fixed-shape masked transfers, the contract is masked on
+# the reduction dim, and the MxN accumulator is hoisted into the K loop's
+# iter_args as a vector.
+# VEC-LABEL: func.func @payload(
+# VEC:         vector.transfer_read
+# VEC:         scf.for {{.*}} iter_args({{.*}}) -> (vector<{{[0-9]+}}x{{[0-9]+}}xf32>)
+# VEC:           affine.min
+# VEC:           vector.create_mask
+# VEC:           vector.mask {{.*}} { vector.transfer_read
+# VEC:           vector.create_mask
+# VEC:           vector.mask {{.*}} { vector.transfer_read
+# VEC:           vector.create_mask
+# VEC:           vector.mask {{.*}} { vector.contract
+# VEC:         vector.transfer_write
+
+# After bufferization the masks survive and the subviews fold into direct
+# indexed transfers off the function arguments.
+# BUF-LABEL: func.func @payload(
+# BUF:         memref.dim
+# BUF:         scf.forall
+# BUF:           vector.transfer_read %{{.*}}[
+# BUF:           scf.for {{.*}} iter_args({{.*}}) -> (vector<{{[0-9]+}}x{{[0-9]+}}xf32>)
+# BUF:             vector.create_mask
+# BUF:             vector.mask {{.*}} { vector.transfer_read %{{.*}}[
+# BUF:             vector.mask {{.*}} { vector.contract
+# BUF:           vector.transfer_write
+# BUF-NOT:     linalg.matmul
+
+# The dynamic K extent travels into the kernel as a `?` in the argument type, so
+# memref.dim still recovers it inside gpu.func. affine.min is lowered to
+# arith.subi/minsi by lower-affine, and the masks are carried through untouched.
+# OUTLINE: gpu.module @payload_kernel
+# OUTLINE:   gpu.func @payload_kernel(%{{.*}}: memref<{{[0-9]+}}x?x{{[a-z0-9]+}}>,
+# OUTLINE-SAME:  kernel
+# OUTLINE:     %[[K:.*]] = memref.dim
+# OUTLINE:     scf.for {{.*}} to %[[K]] step
+# OUTLINE:       arith.minsi
+# OUTLINE:       vector.mask {{.*}} { vector.transfer_read
+# OUTLINE:       vector.mask {{.*}} { vector.contract
+# OUTLINE:     gpu.return
+# OUTLINE-NOT: linalg.matmul
+
 # SCHEDULE: transform.named_sequence @__transform_main
 # SCHEDULE: transform.structured.match ops{["func.func"]} attributes {sym_name = "payload"}
+# SCHEDULE: transform.structured.fuse
 # SCHEDULE: transform.yield
 
 """
@@ -50,7 +117,11 @@ from lighthouse.schedule.xegpu import xegpu_to_binary
 from lighthouse.utils.numpy import mlir_to_numpy_dtype
 
 from dyn_shape_matmul_payload import generate_dyn_shape_matmul_payload
-from dyn_shape_matmul_schedule import IMPLEMENTED_STAGES, dyn_shape_matmul_schedule
+from dyn_shape_matmul_schedule import (
+    IMPLEMENTED_STAGES,
+    STAGES,
+    dyn_shape_matmul_schedule,
+)
 
 
 def matmul_complexity(
@@ -320,15 +391,8 @@ def parse_cli_args(description):
     parser.add_argument(
         "--dump-kernel",
         type=str,
-        choices=[
-            "initial",
-            "tiled",
-            "vectorized",
-            "bufferized",
-            "xegpu-initial",
-            "xegpu-wg",
-            "final",
-        ],
+        # Derived from the schedule so the two cannot drift apart.
+        choices=list(STAGES),
         help="Dump kernel IR at different stages of lowering and exit without "
         "executing the kernel.",
     )
