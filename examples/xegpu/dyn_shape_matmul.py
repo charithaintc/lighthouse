@@ -13,10 +13,13 @@
 # RUN: %PYTHON %s --dump-kernel=vectorized | FileCheck %s --check-prefix=VEC
 # RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=vectorized | FileCheck %s --check-prefix=VEC
 # RUN: %PYTHON %s --dump-kernel=vectorized --k-tile 64 | FileCheck %s --check-prefix=VEC
+# RUN: %PYTHON %s --dump-kernel=vectorized --truncate-c | FileCheck %s --check-prefix=VEC
 # RUN: %PYTHON %s --dump-kernel=bufferized | FileCheck %s --check-prefix=BUF
 # RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=bufferized | FileCheck %s --check-prefix=BUF
 # RUN: %PYTHON %s --dump-kernel=gpu-outlining | FileCheck %s --check-prefix=OUTLINE
 # RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=gpu-outlining | FileCheck %s --check-prefix=OUTLINE
+# RUN: %PYTHON %s --dump-kernel=xegpu-initial | FileCheck %s --check-prefix=XEGPU
+# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=xegpu-initial | FileCheck %s --check-prefix=XEGPU
 # RUN: %PYTHON %s --dump-schedule | FileCheck %s --check-prefix=SCHEDULE
 
 # K must stay dynamic all the way to the payload: A is Mx? and B is ?xN.
@@ -38,10 +41,9 @@
 # TILED:           tensor.parallel_insert_slice
 # TILED:         bufferization.materialize_in_destination
 
-# Masked vectorization: the affine.min feeds a vector.create_mask per operand,
-# the A/B reads become fixed-shape masked transfers, the contract is masked on
-# the reduction dim, and the MxN accumulator is hoisted into the K loop's
-# iter_args as a vector.
+# The dynamic K tile is padded to k_tile with zeros before vectorizing, so masks
+# land only on the A/B loads and the contraction is bare.
+# The MxN accumulator is hoisted into the K loop's iter_args as a vector.
 # VEC-LABEL: func.func @payload(
 # VEC:         vector.transfer_read
 # VEC:         scf.for {{.*}} iter_args({{.*}}) -> (vector<{{[0-9]+}}x{{[0-9]+}}xf32>)
@@ -50,9 +52,26 @@
 # VEC:           vector.mask {{.*}} { vector.transfer_read
 # VEC:           vector.create_mask
 # VEC:           vector.mask {{.*}} { vector.transfer_read
-# VEC:           vector.create_mask
-# VEC:           vector.mask {{.*}} { vector.contract
+# VEC:           vector.contract
 # VEC:         vector.transfer_write
+# VEC-NOT:     vector.mask {{.*}} { vector.contract
+# VEC-NOT:     tensor.pad
+
+# convert-vector-to-xegpu: the contraction reaches xegpu.dpas, and the static MxN
+# accumulator becomes create_nd_tdesc + load_nd/store_nd. The masked A/B loads do
+# NOT convert -- transferPreconditions rejects a transfer with a mask operand --
+# so they stay as vector.transfer_read. Flip those XEGPU-NOT/CHECK pairs when
+# that gap is closed.
+# XEGPU: gpu.module @payload_kernel [#xevm.target<O = 3>]
+# XEGPU:   gpu.func @payload_kernel(%{{.*}}: memref<{{[0-9]+}}x?x{{[a-z0-9]+}}>,
+# XEGPU:     xegpu.create_nd_tdesc
+# XEGPU:     xegpu.load_nd
+# XEGPU:     scf.for {{.*}} iter_args({{.*}}) -> (vector<{{[0-9]+}}x{{[0-9]+}}xf32>)
+# XEGPU:       vector.create_mask
+# XEGPU:       vector.transfer_read %{{.*}}, %{{.*}}, %{{.*}} {in_bounds
+# XEGPU:       xegpu.dpas
+# XEGPU:     xegpu.store_nd
+# XEGPU-NOT: vector.mask
 
 # After bufferization the masks survive and the subviews fold into direct
 # indexed transfers off the function arguments.
@@ -63,9 +82,10 @@
 # BUF:           scf.for {{.*}} iter_args({{.*}}) -> (vector<{{[0-9]+}}x{{[0-9]+}}xf32>)
 # BUF:             vector.create_mask
 # BUF:             vector.mask {{.*}} { vector.transfer_read %{{.*}}[
-# BUF:             vector.mask {{.*}} { vector.contract
+# BUF:             vector.contract
 # BUF:           vector.transfer_write
 # BUF-NOT:     linalg.matmul
+# BUF-NOT:     vector.mask {{.*}} { vector.contract
 
 # The dynamic K extent travels into the kernel as a `?` in the argument type, so
 # memref.dim still recovers it inside gpu.func. affine.min is lowered to
@@ -77,9 +97,10 @@
 # OUTLINE:     scf.for {{.*}} to %[[K]] step
 # OUTLINE:       arith.minsi
 # OUTLINE:       vector.mask {{.*}} { vector.transfer_read
-# OUTLINE:       vector.mask {{.*}} { vector.contract
+# OUTLINE:       vector.contract
 # OUTLINE:     gpu.return
 # OUTLINE-NOT: linalg.matmul
+# OUTLINE-NOT: vector.mask {{.*}} { vector.contract
 
 # SCHEDULE: transform.named_sequence @__transform_main
 # SCHEDULE: transform.structured.match ops{["func.func"]} attributes {sym_name = "payload"}
@@ -272,6 +293,8 @@ class XeGPUDynShapeMatMul:
                 payload_func_name=self.payload_function_name,
                 device=device,
                 stop_at_stage=stop_at_stage,
+                ab_type=self.ab_type,
+                acc_type=self.acc_type,
             )
         )
 
