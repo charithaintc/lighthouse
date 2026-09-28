@@ -306,41 +306,27 @@ class Builder:
         def row_sum(p, acc):
             return arith.AddFOp(p, acc)
 
-        # pn = p / l, the softmax normalization. A bare `divf` and nothing else: the
-        # schedule moves it past the @V contraction below
-        # (`transform_ext.sink_normalization_past_contraction`), turning this
-        # conventional `softmax(s) @ V` order into the flash form that
-        # `fuse_dependent_reduction_ops` folds into one loop.
-        @linalg.generic(
-            [probs, row_sum],
-            [tensor.empty((n_head, n_ctx, n_ctx), f16)],
-            [ew_map, row_map, ew_map],
-            [parallel, parallel, parallel],
-        )
-        def normalized(p, denom, out):
-            return arith.DivFOp(p, denom)
-
-        # @V: (n_head,n_ctx,n_ctx) @ (n_head,n_ctx,d_head) -> (n_head,n_ctx,d_head),
-        # f16 throughout, materialized into the (n_ctx,n_embd) view. Written as a
-        # `linalg.generic` rather than a `linalg.batch_matmul` because
-        # `sink_normalization_past_contraction` works off indexing maps and iterator
-        # types, which the named op does not expose.
+        # @V with the softmax divide in its body. The schedule moves that divide
+        # past the contraction to form the flash chain.
         b, m, n, k = (ir.AffineDimExpr.get(i) for i in range(4))
         pv_maps = [
             affine_map(4, [b, m, k]),
+            affine_map(4, [b, m]),
             affine_map(4, [b, k, n]),
             affine_map(4, [b, m, n]),
         ]
         pv_init = linalg.fill(zero, outs=[out_view])
 
         @linalg.generic(
-            [normalized, Vh],
+            [probs, row_sum, Vh],
             [pv_init],
             pv_maps,
             [parallel, parallel, parallel, reduction],
         )
-        def out(p, v, acc):
-            return arith.AddFOp(acc, arith.MulFOp(p, v).result)
+        def out(p, denom, v, acc):
+            return arith.AddFOp(
+                acc, arith.MulFOp(arith.DivFOp(p, denom).result, v).result
+            )
 
         bufferization.materialize_in_destination(
             None, out, out_view_memref, restrict=True, writable=True

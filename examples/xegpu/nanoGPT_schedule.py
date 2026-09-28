@@ -526,8 +526,14 @@ def _bundle(
     # that `fuse_dependent_reduction_ops` can fold into a single loop. Done before
     # the generic handles are split below, so the counting sees the final order.
     if n_fa:
-        payload_func = match(mod, ops={"func.func"})
-        transform_ext.sink_normalization_past_contraction(payload_func)
+        contractions = transform_ext.filter_contraction_ops(
+            match(mod, ops={"linalg.generic"})
+        )
+        handles = transform.split_handle([anytype] * n_fa, contractions)
+        if n_fa == 1:
+            handles = [handles]
+        for contraction in handles:
+            transform_ext.sink_normalization_past_contraction(contraction)
 
     # ===== TILE each op-class into its own forall =====
     # Key problem: match(linalg.generic) is not scoped -- once an op is tiled into

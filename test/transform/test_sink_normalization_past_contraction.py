@@ -2,10 +2,9 @@
 
 """Tests for `transform_ext.sink_normalization_past_contraction`.
 
-The op rewrites ``contract(A / N, B)`` into ``contract(A, B) / N``, which is legal
-because ``N`` does not vary along the reduction axis. Two input shapes are covered
--- the scale as its own op, and the scale already fused into the contraction's body
-by ``linalg-fuse-elementwise-ops`` -- plus one case that must be rejected.
+The op rewrites ``contract(A / S, B)`` into ``contract(A, B) / S``, taking the scale
+out of the contraction's body. Legal because ``S`` does not vary along the reduction
+axis.
 """
 
 from mlir import ir
@@ -16,61 +15,21 @@ from lighthouse.dialects.transform import transform_ext
 from lighthouse.schedule.builders import schedule_boilerplate
 
 
-_MAPS = """
-#rc  = affine_map<(d0, d1) -> (d0, d1)>
-#r   = affine_map<(d0, d1) -> (d0)>
-#ik  = affine_map<(d0, d1, d2) -> (d0, d2)>
-#kj  = affine_map<(d0, d1, d2) -> (d2, d1)>
-#ij  = affine_map<(d0, d1, d2) -> (d0, d1)>
-#i   = affine_map<(d0, d1, d2) -> (d0)>
-"""
-
-#: `(P / l) @ V`, the divide as its own elementwise op feeding the contraction.
-SEPARATE_SCALE = (
-    _MAPS
-    + """
+#: `(P / l) @ V` with the divide in the contraction's body.
+SIMPLE = """
+#ik = affine_map<(d0, d1, d2) -> (d0, d2)>
+#i  = affine_map<(d0, d1, d2) -> (d0)>
+#kj = affine_map<(d0, d1, d2) -> (d2, d1)>
+#ij = affine_map<(d0, d1, d2) -> (d0, d1)>
 func.func @pv(%p: tensor<64x512xf32>, %l: tensor<64xf32>,
               %v: tensor<512x128xf32>) -> tensor<64x128xf32> {
   %zero = arith.constant 0.000000e+00 : f32
-  %pn_init = tensor.empty() : tensor<64x512xf32>
-  %pn = linalg.generic {indexing_maps = [#rc, #r, #rc],
-                        iterator_types = ["parallel", "parallel"]}
-      ins(%p, %l : tensor<64x512xf32>, tensor<64xf32>)
-      outs(%pn_init : tensor<64x512xf32>) {
-  ^bb0(%a: f32, %b: f32, %o: f32):
-    %d = arith.divf %a, %b : f32
-    linalg.yield %d : f32
-  } -> tensor<64x512xf32>
-  %o_init = tensor.empty() : tensor<64x128xf32>
-  %o_fill = linalg.fill ins(%zero : f32) outs(%o_init : tensor<64x128xf32>) -> tensor<64x128xf32>
-  %o = linalg.generic {indexing_maps = [#ik, #kj, #ij],
-                       iterator_types = ["parallel", "parallel", "reduction"]}
-      ins(%pn, %v : tensor<64x512xf32>, tensor<512x128xf32>)
-      outs(%o_fill : tensor<64x128xf32>) {
-  ^bb0(%a: f32, %b: f32, %acc: f32):
-    %m = arith.mulf %a, %b : f32
-    %s = arith.addf %acc, %m : f32
-    linalg.yield %s : f32
-  } -> tensor<64x128xf32>
-  return %o : tensor<64x128xf32>
-}
-"""
-)
-
-#: The same computation after elementwise fusion has sunk the divide into the
-#: contraction's body, which is the form the attention schedule actually sees.
-FUSED_SCALE = (
-    _MAPS
-    + """
-func.func @pv_fused(%p: tensor<64x512xf32>, %l: tensor<64xf32>,
-                    %v: tensor<512x128xf32>) -> tensor<64x128xf32> {
-  %zero = arith.constant 0.000000e+00 : f32
-  %o_init = tensor.empty() : tensor<64x128xf32>
-  %o_fill = linalg.fill ins(%zero : f32) outs(%o_init : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %init = tensor.empty() : tensor<64x128xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%init : tensor<64x128xf32>) -> tensor<64x128xf32>
   %o = linalg.generic {indexing_maps = [#ik, #i, #kj, #ij],
                        iterator_types = ["parallel", "parallel", "reduction"]}
       ins(%p, %l, %v : tensor<64x512xf32>, tensor<64xf32>, tensor<512x128xf32>)
-      outs(%o_fill : tensor<64x128xf32>) {
+      outs(%fill : tensor<64x128xf32>) {
   ^bb0(%a: f32, %n: f32, %b: f32, %acc: f32):
     %d = arith.divf %a, %n : f32
     %m = arith.mulf %d, %b : f32
@@ -80,22 +39,51 @@ func.func @pv_fused(%p: tensor<64x512xf32>, %l: tensor<64xf32>,
   return %o : tensor<64x128xf32>
 }
 """
-)
 
-#: The divisor varies along the reduction axis, so it does not factor out of the
-#: sum and the op must decline.
-REDUCTION_VARYING_SCALE = (
-    _MAPS
-    + """
+#: The shape the kernel-bench attention payload reaches the schedule as: batched over
+#: two leading dims, reduction innermost of five loops, and a bf16 scale on an f32
+#: accumulator, so the scale has to be widened when the divide moves.
+BATCHED_MIXED = """
+#p4 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d4)>
+#r3 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>
+#v4 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4, d3)>
+#o4 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>
+func.func @pv_batched(%p: tensor<4x4x64x512xbf16>, %l: tensor<4x4x64xbf16>,
+                      %v: tensor<4x4x512x128xbf16>) -> tensor<4x4x64x128xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %init = tensor.empty() : tensor<4x4x64x128xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%init : tensor<4x4x64x128xf32>) -> tensor<4x4x64x128xf32>
+  %o = linalg.generic {indexing_maps = [#p4, #r3, #v4, #o4],
+                       iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]}
+      ins(%p, %l, %v : tensor<4x4x64x512xbf16>, tensor<4x4x64xbf16>, tensor<4x4x512x128xbf16>)
+      outs(%fill : tensor<4x4x64x128xf32>) {
+  ^bb0(%a: bf16, %n: bf16, %b: bf16, %acc: f32):
+    %d = arith.divf %a, %n : bf16
+    %ae = arith.extf %d : bf16 to f32
+    %be = arith.extf %b : bf16 to f32
+    %m = arith.mulf %ae, %be : f32
+    %s = arith.addf %acc, %m : f32
+    linalg.yield %s : f32
+  } -> tensor<4x4x64x128xf32>
+  return %o : tensor<4x4x64x128xf32>
+}
+"""
+
+#: The scale is indexed by the reduction dim, so it does not factor out of the sum.
+REDUCTION_VARYING = """
+#ik = affine_map<(d0, d1, d2) -> (d0, d2)>
+#k  = affine_map<(d0, d1, d2) -> (d2)>
+#kj = affine_map<(d0, d1, d2) -> (d2, d1)>
+#ij = affine_map<(d0, d1, d2) -> (d0, d1)>
 func.func @pv_varying(%p: tensor<64x512xf32>, %n: tensor<512xf32>,
                       %v: tensor<512x128xf32>) -> tensor<64x128xf32> {
   %zero = arith.constant 0.000000e+00 : f32
-  %o_init = tensor.empty() : tensor<64x128xf32>
-  %o_fill = linalg.fill ins(%zero : f32) outs(%o_init : tensor<64x128xf32>) -> tensor<64x128xf32>
-  %o = linalg.generic {indexing_maps = [#ik, affine_map<(d0, d1, d2) -> (d2)>, #kj, #ij],
+  %init = tensor.empty() : tensor<64x128xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%init : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %o = linalg.generic {indexing_maps = [#ik, #k, #kj, #ij],
                        iterator_types = ["parallel", "parallel", "reduction"]}
       ins(%p, %n, %v : tensor<64x512xf32>, tensor<512xf32>, tensor<512x128xf32>)
-      outs(%o_fill : tensor<64x128xf32>) {
+      outs(%fill : tensor<64x128xf32>) {
   ^bb0(%a: f32, %nv: f32, %b: f32, %acc: f32):
     %d = arith.divf %a, %nv : f32
     %m = arith.mulf %d, %b : f32
@@ -105,73 +93,161 @@ func.func @pv_varying(%p: tensor<64x512xf32>, %n: tensor<512xf32>,
   return %o : tensor<64x128xf32>
 }
 """
-)
 
-
-#: The contraction accumulates in f32 while the numerator and the row scale are
-#: bf16, as torch-mlir emits attention. The scale has to be widened to the
-#: accumulator type when the divide moves after the contraction.
-MIXED_PRECISION_SCALE = (
-    _MAPS
-    + """
-func.func @pv_mixed(%p: tensor<64x512xbf16>, %l: tensor<64xbf16>,
-                    %v: tensor<512x128xbf16>) -> tensor<64x128xf32> {
+#: Two divides on input arguments, so which one normalizes is ambiguous.
+TWO_SCALES = """
+#ik = affine_map<(d0, d1, d2) -> (d0, d2)>
+#i  = affine_map<(d0, d1, d2) -> (d0)>
+#kj = affine_map<(d0, d1, d2) -> (d2, d1)>
+#ij = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @pv_two_scales(%p: tensor<64x512xf32>, %l: tensor<64xf32>, %g: tensor<64xf32>,
+                         %v: tensor<512x128xf32>) -> tensor<64x128xf32> {
   %zero = arith.constant 0.000000e+00 : f32
-  %pn_init = tensor.empty() : tensor<64x512xbf16>
-  %pn = linalg.generic {indexing_maps = [#rc, #r, #rc],
-                        iterator_types = ["parallel", "parallel"]}
-      ins(%p, %l : tensor<64x512xbf16>, tensor<64xbf16>)
-      outs(%pn_init : tensor<64x512xbf16>) {
-  ^bb0(%a: bf16, %b: bf16, %o: bf16):
-    %d = arith.divf %a, %b : bf16
-    linalg.yield %d : bf16
-  } -> tensor<64x512xbf16>
-  %o_init = tensor.empty() : tensor<64x128xf32>
-  %o_fill = linalg.fill ins(%zero : f32) outs(%o_init : tensor<64x128xf32>) -> tensor<64x128xf32>
-  %o = linalg.generic {indexing_maps = [#ik, #kj, #ij],
+  %init = tensor.empty() : tensor<64x128xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%init : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %o = linalg.generic {indexing_maps = [#ik, #i, #i, #kj, #ij],
                        iterator_types = ["parallel", "parallel", "reduction"]}
-      ins(%pn, %v : tensor<64x512xbf16>, tensor<512x128xbf16>)
-      outs(%o_fill : tensor<64x128xf32>) {
-  ^bb0(%a: bf16, %b: bf16, %acc: f32):
-    %ae = arith.extf %a : bf16 to f32
-    %be = arith.extf %b : bf16 to f32
-    %m = arith.mulf %ae, %be : f32
+      ins(%p, %l, %g, %v : tensor<64x512xf32>, tensor<64xf32>, tensor<64xf32>, tensor<512x128xf32>)
+      outs(%fill : tensor<64x128xf32>) {
+  ^bb0(%a: f32, %n: f32, %n2: f32, %b: f32, %acc: f32):
+    %d = arith.divf %a, %n : f32
+    %d2 = arith.divf %a, %n2 : f32
+    %e = arith.addf %d, %d2 : f32
+    %m = arith.mulf %e, %b : f32
     %s = arith.addf %acc, %m : f32
     linalg.yield %s : f32
   } -> tensor<64x128xf32>
   return %o : tensor<64x128xf32>
 }
 """
-)
+
+#: The scale feeds a transcendental before the multiply, so it is not what the
+#: contraction sums: ``exp(a / n) != exp(a) / n``, and sinking would change the value.
+SCALE_NOT_MULTIPLIED = """
+#ik = affine_map<(d0, d1, d2) -> (d0, d2)>
+#i  = affine_map<(d0, d1, d2) -> (d0)>
+#kj = affine_map<(d0, d1, d2) -> (d2, d1)>
+#ij = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @pv_not_multiplied(%p: tensor<64x512xf32>, %l: tensor<64xf32>,
+                             %v: tensor<512x128xf32>) -> tensor<64x128xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %init = tensor.empty() : tensor<64x128xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%init : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %o = linalg.generic {indexing_maps = [#ik, #i, #kj, #ij],
+                       iterator_types = ["parallel", "parallel", "reduction"]}
+      ins(%p, %l, %v : tensor<64x512xf32>, tensor<64xf32>, tensor<512x128xf32>)
+      outs(%fill : tensor<64x128xf32>) {
+  ^bb0(%a: f32, %n: f32, %b: f32, %acc: f32):
+    %d = arith.divf %a, %n : f32
+    %e = math.exp %d : f32
+    %m = arith.mulf %e, %b : f32
+    %s = arith.addf %acc, %m : f32
+    linalg.yield %s : f32
+  } -> tensor<64x128xf32>
+  return %o : tensor<64x128xf32>
+}
+"""
+
+#: The scale's map is a composite expression holding the reduction dim, so it cannot
+#: be re-expressed over the output space.
+COMPOSITE_SCALE_MAP = """
+#ik  = affine_map<(d0, d1, d2) -> (d0, d2)>
+#sum = affine_map<(d0, d1, d2) -> (d0 + d2)>
+#kj  = affine_map<(d0, d1, d2) -> (d2, d1)>
+#ij  = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @pv_composite(%p: tensor<64x512xf32>, %n: tensor<576xf32>,
+                        %v: tensor<512x128xf32>) -> tensor<64x128xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %init = tensor.empty() : tensor<64x128xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%init : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %o = linalg.generic {indexing_maps = [#ik, #sum, #kj, #ij],
+                       iterator_types = ["parallel", "parallel", "reduction"]}
+      ins(%p, %n, %v : tensor<64x512xf32>, tensor<576xf32>, tensor<512x128xf32>)
+      outs(%fill : tensor<64x128xf32>) {
+  ^bb0(%a: f32, %nv: f32, %b: f32, %acc: f32):
+    %d = arith.divf %a, %nv : f32
+    %m = arith.mulf %d, %b : f32
+    %s = arith.addf %acc, %m : f32
+    linalg.yield %s : f32
+  } -> tensor<64x128xf32>
+  return %o : tensor<64x128xf32>
+}
+"""
+
+#: A named contraction has a fixed body, so it never carries a scale.
+NAMED_MATMUL = """
+func.func @pv_matmul(%p: tensor<64x512xf32>, %v: tensor<512x128xf32>) -> tensor<64x128xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %init = tensor.empty() : tensor<64x128xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%init : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %o = linalg.matmul ins(%p, %v : tensor<64x512xf32>, tensor<512x128xf32>)
+      outs(%fill : tensor<64x128xf32>) -> tensor<64x128xf32>
+  return %o : tensor<64x128xf32>
+}
+"""
 
 
-def sink_schedule() -> ir.Module:
+def _match(root, *names):
+    """Handle to the payload ops named `names`, in program order."""
+    return transform.structured.MatchOp(
+        transform.AnyOpType.get(), root, ops=list(names)
+    ).results[0]
+
+
+def reduction_generic(root):
+    """The contraction when it is the payload's only reduction `linalg.generic`."""
+    return transform_ext.filter_reduction_ops(_match(root, "linalg.generic"))
+
+
+def named(name):
+    """The contraction when it is the named op `name`."""
+
+    def matcher(root):
+        return _match(root, name)
+
+    return matcher
+
+
+def sink_schedule(match_contraction) -> ir.Module:
+    """Schedule applying the op to the contraction `match_contraction` picks out."""
     with schedule_boilerplate() as (sched, seq):
-        func = transform.structured.MatchOp(
-            transform.AnyOpType.get(), seq.bodyTarget, ops=["func.func"]
-        ).results[0]
-        transform_ext.sink_normalization_past_contraction(func)
+        transform_ext.sink_normalization_past_contraction(
+            match_contraction(seq.bodyTarget)
+        )
         transform.yield_([])
     return sched
 
 
-def apply(payload_str: str) -> ir.Module:
+def apply(payload_str: str, match_contraction=reduction_generic) -> ir.Module:
     payload = ir.Module.parse(payload_str)
     # Bound to a local: the schedule module must outlive `apply`.
-    schedule = sink_schedule()
+    schedule = sink_schedule(match_contraction)
     schedule.body.operations[0].apply(payload.operation)
     assert payload.operation.verify()
     return payload
 
 
-def test_separate_scale() -> None:
-    """A standalone divide moves to after the contraction."""
+def expect_rejected(payload_str: str, match_contraction=reduction_generic) -> None:
+    """Apply and print the diagnostic, which the op is expected to emit.
+
+    The interpreter turns the silenceable failure into a `ValueError` carrying it.
+    """
+    try:
+        apply(payload_str, match_contraction)
+    except ValueError as error:
+        print(error)
+        return
+    raise AssertionError("expected the op to reject this contraction")
+
+
+def test_simple() -> None:
+    """The divide moves to after the contraction, which loses the scale operand."""
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
-        print(apply(SEPARATE_SCALE))
+        print(apply(SIMPLE))
 
 
-# The contraction now reads the unscaled numerator directly, and only multiplies.
+# The rebuilt contraction has two inputs and only multiplies.
 # CHECK-LABEL: func.func @pv
 # CHECK:         linalg.generic
 # CHECK-SAME:      iterator_types = ["parallel", "parallel", "reduction"]
@@ -188,69 +264,94 @@ def test_separate_scale() -> None:
 # CHECK:         return %[[N]]
 
 
-def test_fused_scale() -> None:
-    """A divide already inside the contraction's body is lifted back out."""
+def test_batched_mixed() -> None:
+    """A batched contraction keeps its parallel dims; a bf16 scale is widened."""
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
-        print(apply(FUSED_SCALE))
+        print(apply(BATCHED_MIXED))
 
 
-# The scale operand is dropped from the contraction, leaving two inputs.
-# CHECK-LABEL: func.func @pv_fused
+# CHECK-LABEL: func.func @pv_batched
 # CHECK:         linalg.generic
-# CHECK-SAME:      iterator_types = ["parallel", "parallel", "reduction"]
+# CHECK-SAME:      iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
 # CHECK-SAME:      ins(%arg0, %arg2
-# CHECK:           arith.mulf
-# CHECK:           arith.addf
-# CHECK-NOT:       arith.divf
-# CHECK:           linalg.yield
-#
-# CHECK:         %[[N:.+]] = linalg.generic
-# CHECK-SAME:      iterator_types = ["parallel", "parallel"]
-# CHECK:           arith.divf
-# CHECK:         return %[[N]]
-
-
-def test_mixed_precision_scale() -> None:
-    """A bf16 scale is widened to the f32 accumulator it now divides."""
-    with ir.Context(), ir.Location.unknown():
-        lh_dialects.register_and_load()
-        print(apply(MIXED_PRECISION_SCALE))
-
-
-# CHECK-LABEL: func.func @pv_mixed
-# CHECK:         linalg.generic
-# CHECK-SAME:      iterator_types = ["parallel", "parallel", "reduction"]
 # CHECK-NOT:       arith.divf
 # CHECK:           linalg.yield
 #
 # The moved divide runs in the accumulator's type, so the bf16 scale is extended.
 # CHECK:         %[[N:.+]] = linalg.generic
-# CHECK-SAME:      iterator_types = ["parallel", "parallel"]
+# CHECK-SAME:      iterator_types = ["parallel", "parallel", "parallel", "parallel"]
 # CHECK:         ^bb0(%[[ACC:.+]]: f32, %[[S:.+]]: bf16, %{{.+}}: f32):
 # CHECK:           %[[W:.+]] = arith.extf %[[S]] : bf16 to f32
 # CHECK:           arith.divf %[[ACC]], %[[W]] : f32
 # CHECK:         return %[[N]]
 
 
-def test_reduction_varying_scale_is_rejected() -> None:
-    """A divisor indexed by the reduction dim does not factor out."""
+def test_reduction_varying_is_rejected() -> None:
+    """A scale indexed by the reduction dim does not factor out."""
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
-        print(apply(REDUCTION_VARYING_SCALE))
+        expect_rejected(REDUCTION_VARYING)
 
 
-# The divide stays inside the contraction.
-# CHECK-LABEL: func.func @pv_varying
-# CHECK:         linalg.generic
-# CHECK-SAME:      iterator_types = ["parallel", "parallel", "reduction"]
-# CHECK:           arith.divf
-# CHECK:           arith.mulf
-# CHECK:           arith.addf
+# CHECK-LABEL: rejected: reduction-varying scale
+# CHECK: the scale varies along the contraction's reduction dim d2
+
+
+def test_two_scales_is_rejected() -> None:
+    """With two candidate scales, which one normalizes is ambiguous."""
+    with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+        expect_rejected(TWO_SCALES)
+
+
+# CHECK-LABEL: rejected: two scales
+# CHECK: has 2 arith.divf/arith.mulf ops on two input arguments
+
+
+def test_scale_not_multiplied_is_rejected() -> None:
+    """A scale that is not what the contraction multiplies does not factor out."""
+    with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+        expect_rejected(SCALE_NOT_MULTIPLIED)
+
+
+# CHECK-LABEL: rejected: scale not multiplied
+# CHECK: not consumed by the contraction's multiply-accumulate
+
+
+def test_composite_scale_map_is_rejected() -> None:
+    """A scale map that is not a plain dim projection cannot be re-expressed."""
+    with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+        expect_rejected(COMPOSITE_SCALE_MAP)
+
+
+# CHECK-LABEL: rejected: composite scale map
+# CHECK: cannot re-express the scale's map
+
+
+def test_named_contraction_is_rejected() -> None:
+    """A named op has a fixed body, so there is no scale to find."""
+    with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+        expect_rejected(NAMED_MATMUL, named("linalg.matmul"))
+
+
+# CHECK-LABEL: rejected: named contraction
+# CHECK: expected a linalg.generic, got 'linalg.matmul'
 
 
 if __name__ == "__main__":
-    test_separate_scale()
-    test_fused_scale()
-    test_mixed_precision_scale()
-    test_reduction_varying_scale_is_rejected()
+    test_simple()
+    test_batched_mixed()
+    print("rejected: reduction-varying scale")
+    test_reduction_varying_is_rejected()
+    print("rejected: two scales")
+    test_two_scales_is_rejected()
+    print("rejected: scale not multiplied")
+    test_scale_not_multiplied_is_rejected()
+    print("rejected: composite scale map")
+    test_composite_scale_map_is_rejected()
+    print("rejected: named contraction")
+    test_named_contraction_is_rejected()

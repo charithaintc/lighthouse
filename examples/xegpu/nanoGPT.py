@@ -1,4 +1,5 @@
 # RUN: %PYTHON %s --dump xegpu-wg --gpt-layers 1 | FileCheck %s
+# RUN: %PYTHON %s --dump xegpu-wg --gpt-layers 2 | FileCheck %s
 # CHECK: module attributes {gpu.container_module} {
 
 """nano-GPT / GPT-2-style forward pass on the Intel GPU (XeGPU), with fused

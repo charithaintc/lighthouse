@@ -30,6 +30,7 @@ from .ops.move_offsets_to_subview import move_offsets_to_subview
 from .ops.clear_tile_and_fuse_annotations import clear_tile_and_fuse_annotations
 from .ops.get_fusion_roots import get_fusion_roots
 from .ops.propagate_tile_sizes import propagate_tile_sizes
+from .ops.replace_with_fused_attention import replace_with_fused_attention
 from .utils.dependent_reduction_legality import REDUCTION_LOOP_ATTR_NAME
 from .ops.sfc_remap_forall import sfc_remap_forall
 from .ops.sink_extract_slice_into_loop import sink_extract_slice_into_loop
@@ -61,6 +62,7 @@ __all__ = [
     "propagate_tile_sizes",
     "register_and_load",
     "replace",
+    "replace_with_fused_attention",
     "reverse_handles",
     "sfc_remap_forall",
     "sink_extract_slice_into_loop",
