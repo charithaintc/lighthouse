@@ -1,7 +1,7 @@
 """Transform schedule for XeGPU matmul with a runtime-sized K dimension.
 
-Implemented stages tile M/N and K, pad K before vectorization, bufferize,
-outline a GPU kernel, and lower the contraction to XeGPU.
+The stages tile M/N and K, pad K before vectorization, bufferize, outline a
+GPU kernel, lower the contraction to XeGPU, and annotate workgroup layouts.
 """
 
 from mlir import ir
@@ -29,6 +29,7 @@ from lighthouse.schedule.xegpu.lowering_common import (
     get_payload_func,
     outline_gpu_function,
 )
+from lighthouse.schedule.xegpu.mlp_schedule import xegpu_wg_annotation_for_mlp_layer
 from lighthouse.schedule.xegpu.xegpu_specs import XeGPUSpecs
 
 # Lowering stages in pipeline order.
@@ -50,6 +51,8 @@ IMPLEMENTED_STAGES = (
     "bufferized",
     "gpu-outlining",
     "xegpu-initial",
+    "xegpu-wg",
+    "final",
 )
 
 REQUIRED_PARAMS = ("wg_m", "wg_n", "sg_m", "sg_n", "k_tile")
@@ -250,7 +253,11 @@ def bundle_dyn_shape_matmul_schedule(
     if stop_at_stage == "xegpu-initial":
         raise PipelineInterrupt()
 
-    raise NotImplementedError(
-        f"stop_at_stage={stop_at_stage!r} is not implemented yet; "
-        f"dyn_shape_matmul_schedule currently supports {IMPLEMENTED_STAGES}."
-    )
+    gpu_mod = match(mod, ops={"gpu.module"})
+    gpu_func = match(gpu_mod, ops={"gpu.func"})
+    xegpu_wg_annotation_for_mlp_layer(gpu_func, gpu_specs=gpu_specs, **layer_params)
+
+    if stop_at_stage == "xegpu-wg":
+        raise PipelineInterrupt()
+
+    return mod

@@ -1,10 +1,12 @@
 # RUN: %PYTHON %s --dump-kernel=xegpu-initial | FileCheck %s
 # RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=xegpu-initial | FileCheck %s
+# RUN: %PYTHON %s --dump-kernel=xegpu-wg | FileCheck %s
+# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=xegpu-wg | FileCheck %s
 # CHECK: gpu.module @payload_kernel
 
 """XeGPU matmul example with static M/N and runtime-sized K.
 
-Use `--dump-kernel` to inspect stages through `xegpu-initial`.
+Use `--dump-kernel` to inspect lowering stages through `final`.
 """
 
 import argparse
@@ -95,6 +97,12 @@ class XeGPUDynShapeMatMul:
             )
         self.ab_dtype = mlir_to_numpy_dtype(self.ab_type)
         self.c_dtype = mlir_to_numpy_dtype(self.c_type)
+        row_pitch_bytes = self.K * np.dtype(self.ab_dtype).itemsize
+        if row_pitch_bytes % 64:
+            raise ValueError(
+                f"XeGPU block loads require K to give A a 64-byte-aligned row "
+                f"pitch; K={self.K} gives {row_pitch_bytes} bytes"
+            )
         self.a_shape = (self.M, self.K)
         self.b_shape = (self.K, self.N)
         self.c_shape = (self.M, self.N)
@@ -112,7 +120,7 @@ class XeGPUDynShapeMatMul:
                 # Integers avoid rounding differences during correctness checks.
                 a = np.random.randint(-3, 4, shape)
             else:
-                a = np.random.rand(*shape) - 0.5
+                a = np.random.rand(*shape)
             return a.astype(dtype)
 
         np.random.seed(2)
@@ -234,7 +242,8 @@ def parse_cli_args(description):
         nargs=3,
         default=[4096, 4096, 4096],
         help="M,N,K matrix sizes (A=MxK, B=KxN, C=MxN). K is the runtime extent "
-        "of the dynamic reduction dimension.",
+        "of the dynamic reduction dimension. K times the A/B element size "
+        "must be a multiple of 64 bytes for XeGPU block loads.",
     )
     parser.add_argument(
         "--ab-type",
@@ -359,14 +368,6 @@ Use --dump-kernel to inspect implemented lowering stages.
             accumulate_c=not args.no_accumulate_c,
             truncate_c=args.truncate_c,
         )
-
-        # Execution requires the not-yet-implemented final schedule stage.
-        if not (args.dump_kernel or args.dump_schedule):
-            raise SystemExit(
-                "Executing the kernel needs the 'final' schedule stage, which is not "
-                f"implemented yet (implemented: {IMPLEMENTED_STAGES}). "
-                "Use --dump-kernel or --dump-schedule for now."
-            )
 
         if args.check_result and not args.init_int:
             warnings.warn(
