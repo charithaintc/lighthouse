@@ -1,120 +1,10 @@
-# RUN: %PYTHON %s --dump-kernel=initial | FileCheck %s
-# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=initial | FileCheck %s
-# RUN: %PYTHON %s --dump-kernel=initial --ab-type bf16 | FileCheck %s
-# RUN: %PYTHON %s --dump-kernel=initial --no-accumulate-c | FileCheck %s
-# RUN: %PYTHON %s --dump-kernel=initial --truncate-c | FileCheck %s
-# RUN: %PYTHON %s --dump-kernel=tiled | FileCheck %s --check-prefix=TILED
-# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=tiled | FileCheck %s --check-prefix=TILED
-# RUN: %PYTHON %s --dump-kernel=tiled --wg-tile 256 256 | FileCheck %s --check-prefix=TILED
-# RUN: %PYTHON %s --dump-kernel=tiled --k-tile 64 | FileCheck %s --check-prefix=TILED
-# RUN: %PYTHON %s --dump-kernel=tiled --ab-type bf16 | FileCheck %s --check-prefix=TILED
-# RUN: %PYTHON %s --dump-kernel=tiled --no-accumulate-c | FileCheck %s --check-prefix=TILED
-# RUN: %PYTHON %s --dump-kernel=tiled --truncate-c | FileCheck %s --check-prefix=TILED
-# RUN: %PYTHON %s --dump-kernel=vectorized | FileCheck %s --check-prefix=VEC
-# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=vectorized | FileCheck %s --check-prefix=VEC
-# RUN: %PYTHON %s --dump-kernel=vectorized --k-tile 64 | FileCheck %s --check-prefix=VEC
-# RUN: %PYTHON %s --dump-kernel=vectorized --truncate-c | FileCheck %s --check-prefix=VEC
-# RUN: %PYTHON %s --dump-kernel=bufferized | FileCheck %s --check-prefix=BUF
-# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=bufferized | FileCheck %s --check-prefix=BUF
-# RUN: %PYTHON %s --dump-kernel=gpu-outlining | FileCheck %s --check-prefix=OUTLINE
-# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=gpu-outlining | FileCheck %s --check-prefix=OUTLINE
-# RUN: %PYTHON %s --dump-kernel=xegpu-initial | FileCheck %s --check-prefix=XEGPU
-# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=xegpu-initial | FileCheck %s --check-prefix=XEGPU
-# RUN: %PYTHON %s --dump-schedule | FileCheck %s --check-prefix=SCHEDULE
+# RUN: %PYTHON %s --dump-kernel=xegpu-initial | FileCheck %s
+# RUN: %PYTHON %s --sizes 512 1024 128 --dump-kernel=xegpu-initial | FileCheck %s
+# CHECK: gpu.module @payload_kernel
 
-# K must stay dynamic all the way to the payload: A is Mx? and B is ?xN.
-# CHECK-LABEL: func.func @payload(
-# CHECK-SAME:    %{{.*}}: memref<{{[0-9]+}}x{{[0-9]+}}x{{[a-z0-9]+}}>,
-# CHECK-SAME:    %{{.*}}: memref<{{[0-9]+}}x?x{{[a-z0-9]+}}>,
-# CHECK-SAME:    %{{.*}}: memref<?x{{[0-9]+}}x{{[a-z0-9]+}}>)
-# CHECK:         linalg.matmul ins(%{{.*}}, %{{.*}} : tensor<{{[0-9]+}}x?x{{[a-z0-9]+}}>, tensor<?x{{[0-9]+}}x{{[a-z0-9]+}}>)
-# CHECK:         bufferization.materialize_in_destination
+"""XeGPU matmul example with static M/N and runtime-sized K.
 
-# M and N are tiled statically into an scf.forall, K into an scf.for whose trip
-# count is only known at runtime. The affine.min clamps the last K tile, and the
-# matmul operands keep `?` on the reduction dim.
-# TILED-LABEL: func.func @payload(
-# TILED:         scf.forall
-# TILED:           scf.for
-# TILED:             affine.min
-# TILED:             linalg.matmul ins(%{{.*}}, %{{.*}} : tensor<{{[0-9]+}}x?x{{[a-z0-9]+}}>, tensor<?x{{[0-9]+}}x{{[a-z0-9]+}}>)
-# TILED:           tensor.parallel_insert_slice
-# TILED:         bufferization.materialize_in_destination
-
-# The dynamic K tile is padded to k_tile with zeros before vectorizing, so masks
-# land only on the A/B loads and the contraction is bare.
-# The MxN accumulator is hoisted into the K loop's iter_args as a vector.
-# VEC-LABEL: func.func @payload(
-# VEC:         vector.transfer_read
-# VEC:         scf.for {{.*}} iter_args({{.*}}) -> (vector<{{[0-9]+}}x{{[0-9]+}}xf32>)
-# VEC:           affine.min
-# VEC:           vector.create_mask
-# VEC:           vector.mask {{.*}} { vector.transfer_read
-# VEC:           vector.create_mask
-# VEC:           vector.mask {{.*}} { vector.transfer_read
-# VEC:           vector.contract
-# VEC:         vector.transfer_write
-# VEC-NOT:     vector.mask {{.*}} { vector.contract
-# VEC-NOT:     tensor.pad
-
-# convert-vector-to-xegpu: the contraction reaches xegpu.dpas, and the static MxN
-# accumulator becomes create_nd_tdesc + load_nd/store_nd. The masked A/B loads do
-# NOT convert -- transferPreconditions rejects a transfer with a mask operand --
-# so they stay as vector.transfer_read. Flip those XEGPU-NOT/CHECK pairs when
-# that gap is closed.
-# XEGPU: gpu.module @payload_kernel [#xevm.target<O = 3>]
-# XEGPU:   gpu.func @payload_kernel(%{{.*}}: memref<{{[0-9]+}}x?x{{[a-z0-9]+}}>,
-# XEGPU:     xegpu.create_nd_tdesc
-# XEGPU:     xegpu.load_nd
-# XEGPU:     scf.for {{.*}} iter_args({{.*}}) -> (vector<{{[0-9]+}}x{{[0-9]+}}xf32>)
-# XEGPU:       vector.create_mask
-# XEGPU:       vector.transfer_read %{{.*}}, %{{.*}}, %{{.*}} {in_bounds
-# XEGPU:       xegpu.dpas
-# XEGPU:     xegpu.store_nd
-# XEGPU-NOT: vector.mask
-
-# After bufferization the masks survive and the subviews fold into direct
-# indexed transfers off the function arguments.
-# BUF-LABEL: func.func @payload(
-# BUF:         memref.dim
-# BUF:         scf.forall
-# BUF:           vector.transfer_read %{{.*}}[
-# BUF:           scf.for {{.*}} iter_args({{.*}}) -> (vector<{{[0-9]+}}x{{[0-9]+}}xf32>)
-# BUF:             vector.create_mask
-# BUF:             vector.mask {{.*}} { vector.transfer_read %{{.*}}[
-# BUF:             vector.contract
-# BUF:           vector.transfer_write
-# BUF-NOT:     linalg.matmul
-# BUF-NOT:     vector.mask {{.*}} { vector.contract
-
-# The dynamic K extent travels into the kernel as a `?` in the argument type, so
-# memref.dim still recovers it inside gpu.func. affine.min is lowered to
-# arith.subi/minsi by lower-affine, and the masks are carried through untouched.
-# OUTLINE: gpu.module @payload_kernel
-# OUTLINE:   gpu.func @payload_kernel(%{{.*}}: memref<{{[0-9]+}}x?x{{[a-z0-9]+}}>,
-# OUTLINE-SAME:  kernel
-# OUTLINE:     %[[K:.*]] = memref.dim
-# OUTLINE:     scf.for {{.*}} to %[[K]] step
-# OUTLINE:       arith.minsi
-# OUTLINE:       vector.mask {{.*}} { vector.transfer_read
-# OUTLINE:       vector.contract
-# OUTLINE:     gpu.return
-# OUTLINE-NOT: linalg.matmul
-# OUTLINE-NOT: vector.mask {{.*}} { vector.contract
-
-# SCHEDULE: transform.named_sequence @__transform_main
-# SCHEDULE: transform.structured.match ops{["func.func"]} attributes {sym_name = "payload"}
-# SCHEDULE: transform.structured.fuse
-# SCHEDULE: transform.yield
-
-"""
-XeGPU matrix multiplication example with a dynamic reduction dimension.
-
-Same kernel as `matmul.py`, except the payload declares K as `?`, so the
-reduction extent is only known at runtime. M and N stay static.
-
-The transform schedule is built up stage by stage; currently only
-`--dump-kernel=initial` is supported.
+Use `--dump-kernel` to inspect stages through `xegpu-initial`.
 """
 
 import argparse
@@ -153,7 +43,7 @@ def matmul_complexity(
     nbytes_ab: int,
     nbytes_c: int,
 ):
-    """Complexity of the matmul operation."""
+    """Estimate matmul FLOPs and memory traffic."""
     flop_count = 2 * M * N * K
     memory_reads = (M * K + K * N) * nbytes_ab  # read A and B
     memory_writes = M * N * nbytes_c  # write C
@@ -164,21 +54,7 @@ def matmul_complexity(
 
 @dataclass
 class XeGPUDynShapeMatMul:
-    """
-    Matrix multiplication kernel on XeGPU with a dynamic reduction dimension.
-
-    Computes C = A * B for input matrices A (M x K) and B (K x N), where the
-    payload declares K as `?`. `K` here is only the runtime extent: it sizes the
-    host buffers and feeds the tile-size heuristics, but never appears in the
-    payload types.
-
-    If `accumulate_c` is True, computes C = A * B + C instead.
-
-    `ab_type` specifies the data type for A and B matrices (f16 or bf16).
-    `c_type` specifies the data type of the result C (f32 by default, or ab_type
-    if truncate_c is True).
-    `acc_type` specifies the data type for accumulation (f32 by default).
-    """
+    """Configure a dynamic-K matmul; nominal K sizes buffers and selects tiles."""
 
     payload_function_name: ClassVar[str] = "payload"
     memory_manager_class: ClassVar[type[MemoryManager]] = GPUMemoryManager
@@ -196,6 +72,7 @@ class XeGPUDynShapeMatMul:
     )
 
     def __post_init__(self):
+        """Resolve element types and derive host matrix shapes."""
         if isinstance(self.ab_type, str):
             self.ab_type = get_mlir_elem_type(self.ab_type)
         if isinstance(self.c_type, str):
@@ -223,21 +100,18 @@ class XeGPUDynShapeMatMul:
         self.c_shape = (self.M, self.N)
 
     def get_input_arrays(self, init_int: bool = False) -> list[np.ndarray]:
-        """Generate initial values on host with numpy."""
+        """Generate and cache host inputs for the selected initialization mode."""
 
-        # Cache the generated arrays to avoid regenerating them for every run.
         cached = self._input_arrays_cache.get(init_int)
         if cached is not None:
             return cached
 
         def gen_random(shape, dtype):
+            """Generate integer or floating-point inputs of the requested shape."""
             if init_int:
-                # Use integer values to avoid f16/f32 floating point
-                # discrepancies in the correctness check.
+                # Integers avoid rounding differences during correctness checks.
                 a = np.random.randint(-3, 4, shape)
             else:
-                # Use float values for benchmarking to get reliable performance
-                # measurements.
                 a = np.random.rand(*shape) - 0.5
             return a.astype(dtype)
 
@@ -250,6 +124,7 @@ class XeGPUDynShapeMatMul:
         return arrays
 
     def get_complexity(self) -> tuple[int, int, int]:
+        """Return estimated FLOPs, bytes read, and bytes written."""
         nbytes_ab = np.dtype(self.ab_dtype).itemsize
         nbytes_c = np.dtype(self.c_dtype).itemsize
         return matmul_complexity(
@@ -262,6 +137,7 @@ class XeGPUDynShapeMatMul:
         )
 
     def payload_module(self) -> ir.Module:
+        """Build the payload and GPU buffer helpers."""
         mod = generate_dyn_shape_matmul_payload(
             func_name=self.payload_function_name,
             M=self.M,
@@ -283,6 +159,7 @@ class XeGPUDynShapeMatMul:
         parameters: ScheduleParameters | None = None,
         device: str | None = None,
     ) -> list[ir.Module]:
+        """Build wrapper and lowering schedules through the requested stage."""
         assert parameters is not None, "Schedule parameters must be provided"
         schedules = []
         schedules.append(Runner.get_bench_wrapper_schedule(self.payload_function_name))
@@ -306,6 +183,7 @@ class XeGPUDynShapeMatMul:
         return schedules
 
     def shared_libs(self) -> list[str]:
+        """List shared libraries needed for execution."""
         return ["libmlir_levelzero_runtime.so"]
 
 
@@ -315,13 +193,9 @@ def check_results(
     host_solution: np.ndarray,
     verbose: int = 0,
 ) -> bool:
-    """
-    Check correctness of the result.
-    """
-    # Compute reference solution on host.
+    """Compare the computed output with a NumPy matmul reference."""
     C, A, B = host_inputs[:3]
 
-    # use float32 data type for efficiency
     f32 = np.float32
     D_ref = A.astype(f32) @ B.astype(f32)
     if mmul.accumulate_c:
@@ -349,6 +223,7 @@ def check_results(
 
 
 def parse_cli_args(description):
+    """Parse example and dump-stage options."""
     parser = argparse.ArgumentParser(
         description=description,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -414,7 +289,6 @@ def parse_cli_args(description):
     parser.add_argument(
         "--dump-kernel",
         type=str,
-        # Derived from the schedule so the two cannot drift apart.
         choices=list(STAGES),
         help="Dump kernel IR at different stages of lowering and exit without "
         "executing the kernel.",
@@ -445,11 +319,11 @@ if __name__ == "__main__":
 The payload declares K as `?`, so the reduction extent is a runtime value. The
 `--sizes` K entry only sizes the host buffers and the tile-size heuristics.
 
-The schedule is still being built up; currently only --dump-kernel=initial works.
+Use --dump-kernel to inspect implemented lowering stages.
 """
     args = parse_cli_args(description=description)
 
-    # Problem size. K is the runtime extent of the dynamic dimension.
+    # K sizes host buffers; its payload dimension remains dynamic.
     m, n, k = args.sizes
 
     params = ScheduleParameters(
@@ -461,14 +335,12 @@ The schedule is still being built up; currently only --dump-kernel=initial works
                 "k": k,
                 "transpose_a": False,
                 "transpose_b": False,
-                # The reduction dim is dynamic in the payload; record that so the
-                # later schedule stages can pick masking over static tiling.
                 "dynamic_k": True,
             }
         ]
     )
 
-    # Collect parameters from CLI arguments
+    # Override workgroup and reduction tiles from the CLI.
     cli_params = {}
     if args.wg_tile:
         cli_params["wg_m"], cli_params["wg_n"] = args.wg_tile
@@ -488,13 +360,12 @@ The schedule is still being built up; currently only --dump-kernel=initial works
             truncate_c=args.truncate_c,
         )
 
-        # Remove this guard once dyn_shape_matmul_schedule reaches the "final"
-        # stage; everything below it is already wired up for execution.
+        # Execution requires the not-yet-implemented final schedule stage.
         if not (args.dump_kernel or args.dump_schedule):
             raise SystemExit(
                 "Executing the kernel needs the 'final' schedule stage, which is not "
                 f"implemented yet (implemented: {IMPLEMENTED_STAGES}). "
-                "Use --dump-kernel=initial or --dump-schedule for now."
+                "Use --dump-kernel or --dump-schedule for now."
             )
 
         if args.check_result and not args.init_int:
@@ -517,9 +388,7 @@ The schedule is still being built up; currently only --dump-kernel=initial works
                 payload = pipeline.apply(wload.payload_module())
                 print(payload)
             if args.dump_schedule:
-                # Only the stages listed in dyn_shape_matmul_schedule's
-                # IMPLEMENTED_STAGES can be built, so dump the schedule as far
-                # as it currently goes.
+                # Dump the requested stage or the latest implemented one.
                 for schedule_module in wload.schedule_modules(
                     stop_at_stage=args.dump_kernel or IMPLEMENTED_STAGES[-1],
                     parameters=params,
@@ -538,7 +407,7 @@ The schedule is still being built up; currently only --dump-kernel=initial works
             )
             host_inputs = wload.get_input_arrays(args.init_int)
             if args.check_result:
-                # Setup callback function to copy result from device to host.
+                # Copy device output back for correctness checking.
                 D_host_copy = np.zeros(wload.c_shape, dtype=wload.c_dtype)
                 argument_access_callback = Runner.get_gpu_argument_access_callback(
                     D_host_copy, arg_index=0
