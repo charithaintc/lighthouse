@@ -189,14 +189,23 @@ def generate_gpu_attention_payload(
                 lambda s, acc: arith.maximumf(s, acc),
             )
 
-            # P = exp(s - m), kept in f32 and read directly by both consumers: a
-            # cast in between would hide the chain from the fusion.
-            probs = _generic(
+            # Keep the subtract and exponential separate here. The schedule
+            # explicitly fuses them into one term before reduction fusion.
+            score_delta = _generic(
                 [scaled_qkt, row_max],
                 tensor.empty(qkt_shape_3d, compute_type),
                 [elementwise_map, row_map, elementwise_map],
                 ["parallel", "parallel", "parallel"],
-                lambda s, m, out: math_dialect.exp(arith.subf(s, m)),
+                lambda s, m, out: arith.subf(s, m),
+            )
+            # P = exp(s - m), kept in f32 and read directly by both consumers: a
+            # cast in between would hide the chain from the fusion.
+            probs = _generic(
+                [score_delta],
+                tensor.empty(qkt_shape_3d, compute_type),
+                [elementwise_map, elementwise_map],
+                ["parallel", "parallel", "parallel"],
+                lambda delta, out: math_dialect.exp(delta),
             )
 
             # l = sum_k P, all in f32.

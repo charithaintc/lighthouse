@@ -21,7 +21,6 @@ from .ops.fuse_elementwise_op import fuse_elementwise_op
 from .ops.filter_by_name import filter_by_name
 from .ops.filter_reduction_ops import filter_reduction_ops
 from .ops.fuse_dependent_reduction_ops import fuse_dependent_reduction_ops
-from .ops.fuse_same_rank_elementwise_chains import fuse_same_rank_elementwise_chains
 from .ops.sink_normalization_past_contraction import (
     sink_normalization_past_contraction,
 )
@@ -51,7 +50,6 @@ __all__ = [
     "filter_reduction_ops",
     "fuse_dependent_reduction_ops",
     "fuse_elementwise_op",
-    "fuse_same_rank_elementwise_chains",
     "get_fusion_roots",
     "get_leading_unit_tile_sizes",
     "get_named_attribute",

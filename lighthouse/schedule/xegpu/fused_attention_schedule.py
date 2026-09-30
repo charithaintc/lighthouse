@@ -325,12 +325,17 @@ def bundle_xegpu_fused_attention_schedule(
     lh_transform.cleanup(func)
 
     # Bring the chain into the `R1 -> E -> R2` shape the reduction fusion expects.
-    #
-    # First collapse a multi-op per-element term into one op: torch-mlir emits
-    # `exp(x - m)` as a separate `sub` and `exp`, and the fusion needs the whole
-    # term in a single op. This runs *before* the pass below so the term is formed
-    # by the narrow rewrite, which cannot fuse across a reduction.
-    func = transform_ext.fuse_same_rank_elementwise_chains(func)
+    # The row sum's input is exp(s - m). Follow that input to the exp op, then
+    # follow the exp's input to the subtract. Before WG tiling, the reductions
+    # are Q@K^T, row max, row sum, P@V in that order. Fuse only the term pair
+    # before the general elementwise pass below can fuse across a reduction.
+    reductions = transform_ext.filter_reduction_ops(
+        structured.structured_match(anytype, func, ops=["linalg.generic"])
+    )
+    _, _, row_sum, _ = transform.split_handle([anytype] * 4, reductions)
+    exp_op = transform.get_producer_of_operand(anytype, row_sum, operand_number=0)
+    sub_op = transform.get_producer_of_operand(anytype, exp_op, operand_number=0)
+    transform_ext.fuse_elementwise_op(sub_op, exp_op)
 
     # Fuse elementwise ops, also removes unused linalg op results (if any). This
     # is also what folds the `collapse_shape`/`expand_shape` pairs around a
