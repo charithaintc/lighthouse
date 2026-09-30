@@ -282,6 +282,42 @@ def _derive_flash_attention(anytype, func, layer_params):
     transform.apply_cse(func)
 
 
+def _annotate_fastmath_flags(func: ir.Value[transform.AnyOpType]) -> None:
+    """Mark online rescale quotients for LLVM's MathToXeVM simplification.
+
+    Preserve any flags already chosen by the payload. `afn` on the exps
+    selects native math; `reassoc,arcp` on each quotient permits exp(a-b).
+    """
+    anytype = transform.AnyOpType.get()
+    no_fastmath = ir.Attribute.parse("#arith.fastmath<none>")
+    fast = transform.param_constant(
+        transform.AnyParamType.get(), ir.Attribute.parse("#arith.fastmath<fast>")
+    )
+    for op_name in ("math.exp", "arith.subf"):
+        unmarked = structured.structured_match(
+            anytype, func, ops=[op_name], op_attrs={"fastmath": no_fastmath}
+        )
+        transform.annotate(unmarked, "fastmath", param=fast)
+
+    quotient_flags = transform.param_constant(
+        transform.AnyParamType.get(),
+        ir.Attribute.parse("#arith.fastmath<reassoc,arcp>"),
+    )
+    reduction_loop = structured.structured_match(
+        anytype,
+        func,
+        ops=["scf.for"],
+        op_attrs={transform_ext.REDUCTION_LOOP_ATTR_NAME: ir.UnitAttr.get()},
+    )
+    correction_divs = structured.structured_match(
+        anytype,
+        reduction_loop,
+        ops=["arith.divf"],
+        op_attrs={"fastmath": no_fastmath},
+    )
+    transform.annotate(correction_divs, "fastmath", param=quotient_flags)
+
+
 def bundle_xegpu_fused_attention_schedule(
     mod: ir.Value[transform.AnyOpType],
     params: ScheduleParameters,
@@ -397,13 +433,7 @@ def bundle_xegpu_fused_attention_schedule(
     reduction_loop = match(func, ops={"scf.for"})
     lh_transform.loop_hoisting(reduction_loop)
 
-    # Turn on fast math and take the rewrite it licenses: the online rescale factor
-    # arrives as `exp(-m_new) / exp(-m_old)` and becomes the single
-    # `exp(m_old - m_new)` a hand-written flash-attention kernel uses, dropping a
-    # transcendental and a divide per iteration. Run after vectorization -- before
-    # it the two exponentials and the divide live in three separate linalg.generics,
-    # so there is no single op to match.
-    transform_ext.enable_fastmath_optimizations(func)
+    _annotate_fastmath_flags(func)
     transform.apply_cse(func)
     canonicalize(func)
 
