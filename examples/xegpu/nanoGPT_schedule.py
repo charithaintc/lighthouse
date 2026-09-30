@@ -21,8 +21,8 @@ build one combined schedule that handles all op classes. The strategy:
                        DPAS tile sizes come from `mm_params`)
         - layernorm-> `_tile_one_layernorm` (tile rows, fuse the 2 reductions +
                        2 zero-fills into the loop)
-        - fused attn-> `_tile_one_fused_attention_region` (tile @V batch_matmul into
-                       a forall, fuse QK^T/scale/softmax/@V in; flash rewrite later)
+        - fused attn-> `_tile_one_fused_attention_region` (tile the chain's leaf
+                       into a forall and fuse the rest in; flash loop folded after)
         - elementwise -> a single `structured_tile_using_forall` over rows
   (b) Shared tail (same for every kernel): vectorize -> bufferize (tensors ->
       memrefs) -> convert the forall grids to `gpu.launch` -> outline each into
@@ -36,7 +36,7 @@ so steps (a) and (c) can treat each one correctly.
 
 from mlir import ir
 from mlir.dialects import transform
-from mlir.dialects.transform import structured, xegpu
+from mlir.dialects.transform import structured, tensor, xegpu
 from mlir.dialects.transform import bufferization as transform_bufferization
 from mlir.dialects.transform.vector import (
     apply_patterns_vector_cast_away_vector_leading_one_dim,
@@ -144,14 +144,14 @@ def _tile_one_layernorm(
     canonicalize(ln_forall)
 
 
-def _tile_one_fused_attention_region(anytype, pv_bmm, softmax_op, fa_params):
-    """Tile + fuse one attention region (QK^T -> scale -> softmax -> @V) into a
-    SINGLE scf.forall, so it vectorizes/bufferizes into one kernel body that
-    `replace_with_fused_attention` later rewrites into the flash loop.
+def _tile_one_fused_attention_region(anytype, divide_op, fa_params):
+    """Tile + fuse one attention region (QK^T -> scale -> softmax -> @V -> divide)
+    into a SINGLE scf.forall, so it vectorizes/bufferizes into one kernel body that
+    `_fuse_attention_in_region` then folds into the flash loop.
 
-    Operates on PRE-SPLIT, per-region
-    handles (pv_bmm, softmax_op) so it is region-local and works at any
-    multiplicity. All further producers are pulled in via get_producer_of_operand
+    Operates on a PRE-SPLIT, per-region handle (the region's deferred normalizing
+    divide, which is its leaf op) so it is region-local and works at any
+    multiplicity. All producers are pulled in via get_producer_of_operand
     (SSA-walk = inherently scoped to this region)."""
     prod = transform.get_producer_of_operand
 
@@ -161,39 +161,31 @@ def _tile_one_fused_attention_region(anytype, pv_bmm, softmax_op, fa_params):
         )[1]
 
     wg_rows = fa_params["wg_rows"]
-    # 1. Tile the @V batch_matmul in (batch=1, M=wg_rows) -> forall grid.
-    tiled_pv, forall = structured.structured_tile_using_forall(
+    # 1. Tile the region's leaf -- the `o / l` divide -- in (batch=1, M=wg_rows).
+    #    It is all-parallel over (head, row, d_head), so three tile sizes.
+    tiled_div, forall = structured.structured_tile_using_forall(
         anytype,
         anytype,
-        pv_bmm,
+        divide_op,
         num_threads=[],
         tile_sizes=[],
-        static_tile_sizes=(1, wg_rows, 0, 0),
+        static_tile_sizes=(1, wg_rows, 0),
     )
     func = transform.get_parent_op(
         anytype, forall, op_name="func.func", deduplicate=True
     )
-    # 2. Fuse the @V output init fill (producer of forall operand 0).
-    forall = fuse(prod(anytype, forall, operand_number=0), forall)
-    transform.apply_cse(func)
-    canonicalize(func)
-    # 3. Decompose this region's softmax. linalg.softmax -> 4 generics + 2 fills:
-    #    max = reduce_max(scaled)         [+ -inf fill]
-    #    num = exp(scaled - max)
-    #    den = reduce_sum(num)            [+ 0 fill]
-    #    div = num / den                  (feeds @V)
-    structured.structured_decompose_interface(anytype, softmax_op)
     transform.apply_cse(func)
     canonicalize(func)
     # Grab the whole producer chain UP FRONT via SSA walk (region-local; no count
     # matching). Fusing op X invalidates only X's handle, so collect all, then fuse
-    # each once in consumer->producer topological order.
-    # tiled_pv operand 0 is the aw extract_slice inside the forall; hop through it
-    # to the func-scope softmax `div` that it slices.
-    aw_slice = prod(anytype, tiled_pv, operand_number=0)
-    div = prod(anytype, aw_slice, operand_number=0)  # num / den (softmax out)
-    num = prod(anytype, div, operand_number=0)  # exp generic
-    den = prod(anytype, div, operand_number=1)  # sum-reduce generic
+    # each once in consumer->producer topological order. The divide's two operands
+    # are extract_slices inside the forall, so hop through each to its producer.
+    o_slice = prod(anytype, tiled_div, operand_number=0)
+    pv = prod(anytype, o_slice, operand_number=0)  # @V contraction (unnormalized)
+    l_slice = prod(anytype, tiled_div, operand_number=1)
+    den = prod(anytype, l_slice, operand_number=0)  # row-sum generic
+    num = prod(anytype, pv, operand_number=0)  # exp generic, feeds @V and the sum
+    pv_fill = prod(anytype, pv, operand_number=2)  # 0 fill (@V acc)
     den_fill = prod(anytype, den, operand_number=1)  # 0 fill (sum acc)
     mx = prod(anytype, num, operand_number=1)  # max-reduce generic
     mx_fill = prod(anytype, mx, operand_number=1)  # -inf fill (max acc)
@@ -204,13 +196,15 @@ def _tile_one_fused_attention_region(anytype, pv_bmm, softmax_op, fa_params):
     qkt = prod(anytype, scaled, operand_number=0)  # QK^T batch_matmul
     kt = prod(anytype, qkt, operand_number=1)  # K^T transpose
     qkt_fill = prod(anytype, qkt, operand_number=2)  # 0 fill (qkt acc)
+    # `num` is fused after both its consumers (@V and the row sum) are inside.
     for p in (
-        div,
+        pv,
         den,
         num,
         mx,
         scaled,
         qkt,
+        pv_fill,
         den_fill,
         mx_fill,
         scale_fill,
@@ -224,31 +218,144 @@ def _tile_one_fused_attention_region(anytype, pv_bmm, softmax_op, fa_params):
 
 
 def _fuse_attention_in_region(anytype, forall, fa_params):
-    """Rewrite one attention region's tensor-level batch_matmul pair (QK^T, @V)
-    into the flash loop via the transform op. Scoped to `forall` so counts are
-    exact at any multiplicity. Runs right after the region was tiled, i.e. still
-    on tensors, so the shared vectorize tail lowers the emitted loop."""
+    """Fold one attention region's chain into the flash loop.
+
+    `fuse_dependent_reduction_ops` does the work: it moves the elementwise term and
+    one consumer reduction into an already-tiled producer reduction loop and inserts
+    the online correction that rescales that reduction's running accumulator
+    whenever the running max changes. Inside `forall` the chain reads:
+
+        %s   = elementwise<mul>(batch_matmul(q, k^T), fill(scale))  the scaled scores
+        %m   = max_j %s                                        the producer reduction
+        %p   = exp(%s - %m)                                    the elementwise term
+        %o   = contract(%p, v)                                 consumer reduction
+        %l   = sum_j %p                                        consumer reduction
+        %out = %o / %l                                         the deferred divide
+
+    Every match is scoped to `forall` so counts are exact at any multiplicity. Runs
+    right after the region was tiled, i.e. still on tensors, so the shared vectorize
+    tail lowers the emitted loop.
+
+    NB: non-causal only -- there is no `causal` parameter yet.
+    """
     prod = transform.get_producer_of_operand
-    bmms = match_and_split(forall, ops={"linalg.batch_matmul"}, nhandles=2)
-    qk_bmm, pv_bmm = bmms[0], bmms[1]
-    q = prod(anytype, qk_bmm, operand_number=0)
-    # K reaches the QK^T matmul through the linalg.transpose that forms K^T.
-    k = prod(anytype, prod(anytype, qk_bmm, operand_number=1), operand_number=0)
-    v = prod(anytype, pv_bmm, operand_number=1)
-    # The scale is the fill value of the linalg.elementwise mul rhs operand.
-    mul_op = match_and_split(forall, ops={"linalg.elementwise"}, nhandles=1)[0]
-    scale = prod(anytype, prod(anytype, mul_op, operand_number=1), operand_number=0)
-    # NB: the merged fused-attention op is non-causal only -- there is
-    # no `causal` parameter yet, so the model runs as non-causal attention.
-    transform_ext.replace_with_fused_attention(
-        q=q,
-        k=k,
-        v=v,
-        p=prod(anytype, pv_bmm, operand_number=0),
-        scale=scale,
-        replaced=pv_bmm,
-        tile_size=fa_params["inner_loop_tile_size"],
+    tile_size = fa_params["inner_loop_tile_size"]
+
+    # The region's reduction generics, in program order: the row max, the row sum and
+    # the @V contraction. Q@K^T is a `linalg.batch_matmul`, so it is not in this pool.
+    reductions = transform_ext.filter_reduction_ops(
+        match(forall, ops={"linalg.generic"})
     )
+    max_op, sum_op, pv_op = transform.split_handle([anytype] * 3, reductions)
+    qk_bmm = match_and_split(forall, ops={"linalg.batch_matmul"}, nhandles=1)[0]
+
+    # The elementwise term `p` is the row sum's input; the scaled scores feed the row
+    # max, and K^T is Q@K^T's rhs. The latter two are sunk into the reduction loop
+    # further down. Derived now rather than matched later: the fusion emits its own
+    # `linalg.elementwise` correction ops inside the loop, so a name-based match for
+    # the scale multiply would no longer be unique.
+    p_op = prod(anytype, sum_op, operand_number=0)
+    scale_mul_op = prod(anytype, max_op, operand_number=0)
+    transpose_op = prod(anytype, qk_bmm, operand_number=1)
+
+    # Tile the row max along the key/value axis. This is the producer reduction loop
+    # the rest of the chain gets folded into; the marker attribute is what the
+    # fusion op recognizes it by.
+    _, reduction_loop = structured.structured_tile_using_for(
+        anytype,
+        [anytype],
+        max_op,
+        dynamic_sizes=[],
+        interchange=[],
+        static_sizes=[0, 0, tile_size],
+        scalable_sizes=[False, False, False],
+    )
+    transform.annotate(reduction_loop, transform_ext.REDUCTION_LOOP_ATTR_NAME)
+
+    # First chain: max -> p -> row sum. `p` also feeds the contraction, so the op
+    # fuses a clone of it and leaves the original in place for the second chain.
+    # Fusing replaces the loop, but the replacement inherits the marker attribute,
+    # so it is ready to serve as the producer reduction of the second chain.
+    reduction_loop = transform_ext.fuse_dependent_reduction_ops(
+        p_op, sum_op, reduction_loop
+    )
+
+    # Second chain: max -> p -> @V, into that same loop. The first fusion consumed
+    # the handle to `p`; the original is still the contraction's operand.
+    p_op = prod(anytype, pv_op, operand_number=0)
+    reduction_loop = transform_ext.fuse_dependent_reduction_ops(
+        p_op, pv_op, reduction_loop
+    )
+    transform.apply_cse(forall)
+
+    # Sink the score computation into the reduction loop as well, so only one
+    # [wg_rows, tile_size] score tile -- rather than the full [wg_rows, n_ctx]
+    # matrix -- is ever live.
+    # Consumer before producer, and the in-loop copies of the first two are kept:
+    # their accumulator fills are sunk next.
+    in_loop = {}
+    for key, producer_op in [
+        ("mul", scale_mul_op),
+        ("qk", qk_bmm),
+        ("transpose", transpose_op),
+    ]:
+        in_loop[key], reduction_loop = structured.structured_fuse_into_containing_op(
+            anytype,
+            anytype,
+            producer_op=producer_op,
+            containing_op=reduction_loop,
+        )
+
+    # The Q @ K^T zero accumulator and the scale tensor are still filled at full
+    # [wg_rows, n_ctx] extent outside the loop, even though the ops now inside it
+    # only ever read a [wg_rows, tile_size] slice. Sink those two fills as well so
+    # neither tensor is materialized whole. Reach them through the in-loop consumer
+    # they initialize -- one hop for the slice the fusion left behind, one more for
+    # the fill itself. The remaining fills initialize the loop's running
+    # accumulators and must stay outside.
+    for consumer_op, operand_number in [(in_loop["mul"], 1), (in_loop["qk"], 2)]:
+        fill_slice = prod(anytype, consumer_op, operand_number=operand_number)
+        fill_op = prod(anytype, fill_slice, operand_number=0)
+        _, reduction_loop = structured.structured_fuse_into_containing_op(
+            anytype,
+            anytype,
+            producer_op=fill_op,
+            containing_op=reduction_loop,
+        )
+
+    transform.apply_cse(forall)
+    canonicalize(forall)
+
+    # Strip the head dim, which the region tiling cut down to 1. Everything
+    # downstream -- the XeGPU layouts and the blocking/distribution passes -- is
+    # built for rank-2 tiles, and the vector-level `cast_away_leading_one_dim`
+    # patterns cannot finish the job: they have no pattern for multi_reduction,
+    # broadcast or transpose, so the softmax row reductions and the correction's
+    # broadcasts would keep a unit dim and drag shape_casts (and rank-3 XeGPU
+    # layouts) along with them. `fold_unit_extent_dims` only rewrites
+    # linalg.generic, hence the generalize; and it leaves two-step slice chains
+    # behind, which plain canonicalization does not compose, hence the tensor
+    # patterns.
+    named_ops = match(
+        forall,
+        ops={
+            "linalg.batch_matmul",
+            "linalg.transpose",
+            "linalg.fill",
+            "linalg.elementwise",
+        },
+    )
+    structured.structured_generalize(anytype, named_ops)
+    with ir.InsertionPoint(transform.apply_patterns(forall).patterns):
+        structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
+        transform.apply_patterns_canonicalization()
+    transform.apply_cse(forall)
+    with ir.InsertionPoint(transform.apply_patterns(forall).patterns):
+        tensor.apply_patterns_tensor_merge_consecutive_insert_extract_slice()
+        tensor.apply_patterns_tensor_drop_redundant_insert_slice_rank_expansion()
+        tensor.apply_patterns_tensor_fold_tensor_subset_ops()
+        transform.apply_patterns_canonicalization()
+    transform.apply_cse(forall)
 
 
 def xegpu_fa_annotation(gf, fa_params):
@@ -413,6 +520,21 @@ def _bundle(
     if stop_at_stage == "initial":
         raise PipelineInterrupt()
 
+    # The attention payload is built in the conventional `softmax(s) @ V` order, with
+    # the normalizing divide before the contraction. Move it past the contraction
+    # first, so each region becomes the flash chain -- max, exp, @V, sum, divide --
+    # that `fuse_dependent_reduction_ops` can fold into a single loop. Done before
+    # the generic handles are split below, so the counting sees the final order.
+    if n_fa:
+        contractions = transform_ext.filter_contraction_ops(
+            match(mod, ops={"linalg.generic"})
+        )
+        handles = transform.split_handle([anytype] * n_fa, contractions)
+        if n_fa == 1:
+            handles = [handles]
+        for contraction in handles:
+            transform_ext.sink_normalization_past_contraction(contraction)
+
     # ===== TILE each op-class into its own forall =====
     # Key problem: match(linalg.generic) is not scoped -- once an op is tiled into
     # a forall, its generic is still matched (it's just nested), so we can't
@@ -425,16 +547,18 @@ def _bundle(
     # Generic build order: each layernorm contributes [mean, var, normalize] (3),
     # in block build order; each elementwise contributes 1. We reconstruct the
     # per-op handle slices from `kinds`.
-    # 'fa' softmax generics do NOT exist yet (fa is tiled last, softmax still
-    # un-decomposed), so they are not in this pool. The fa core's linalg.transpose
-    # /linalg.elementwise/batch_matmul are not linalg.generic, so also excluded. (The head
-    # reshape is a pure memref VIEW -- no generic, no kernel; see Builder.heads_view.)
-    ngen_total = 3 * n_ln + n_ew
+    # Each 'fa' region contributes 5 bare generics -- row max, exp term, row sum, the
+    # @V contraction and the normalizing divide -- so they ARE in this pool. The
+    # divide is last because `sink_normalization_past_contraction` above moved it
+    # past the contraction. The fa core's linalg.transpose / linalg.elementwise /
+    # batch_matmul are not linalg.generic, so those stay excluded. (The head reshape
+    # is a pure memref VIEW -- no generic, no kernel; see Builder.heads_view.)
+    ngen_total = 3 * n_ln + n_ew + 5 * n_fa
     gen_handles = transform.split_handle(
         (anytype,) * ngen_total, match(mod, ops={"linalg.generic"})
     )
     # Walk kinds to assign generic handles to ops.
-    ln_slices, ew_handles = [], []
+    ln_slices, ew_handles, fa_slices = [], [], []
     gi = 0
     for k in kinds:
         if k == "ln":
@@ -445,7 +569,11 @@ def _bundle(
         elif k == "ew":
             ew_handles.append(gen_handles[gi])
             gi += 1
-        # mm / sm / fa contribute no bare linalg.generic here
+        elif k == "fa":
+            # (row_max, probs, row_sum, pv_contraction, divide)
+            fa_slices.append(tuple(gen_handles[gi : gi + 5]))
+            gi += 5
+        # mm contributes no bare linalg.generic here
 
     # 1) Tile layernorms FIRST, using preserved (mean,var,normalize) handles.
     #    Doing this BEFORE EW/matmul tiling keeps the bare linalg.fill pool exactly
@@ -480,22 +608,18 @@ def _bundle(
     for mm in mms:
         _tile_one_matmul(mm, mm_params)
 
-    # 5) Fused-attention regions. Done last so the generic pre-split above ran while
-    #    each fa softmax was still one linalg.softmax (its decomposition generics
-    #    don't exist yet, so they can't inflate ngen_total). Pre-split the 2*n_fa
-    #    batch_matmuls (build order [QK^T, @V] per region) + n_fa softmaxes by count,
-    #    then tile+fuse each region into one forall (decompose happens in-region).
-    if n_fa:
-        fa_bmms = match_and_split(mod, ops={"linalg.batch_matmul"}, nhandles=2 * n_fa)
-        fa_softmaxes = match_and_split(mod, ops={"linalg.softmax"}, nhandles=n_fa)
-        for r in range(n_fa):
-            _, fa_forall = _tile_one_fused_attention_region(
-                anytype, fa_bmms[2 * r + 1], fa_softmaxes[r], fa_params
-            )
-            # Rewrite the region into the flash online-softmax loop while it is
-            # still on tensors, so the shared vectorize tail lowers it like any
-            # other tiled region.
-            _fuse_attention_in_region(anytype, fa_forall, fa_params)
+    # 5) Fused-attention regions. Done last so every other kernel is already tiled
+    #    when the reduction fusion runs. Each region is driven from its pre-split
+    #    leaf handle -- the deferred normalizing divide -- and tiled into one forall;
+    #    the flash loop is then folded out of the chain inside it.
+    for divide_op in fa_slices:
+        _, fa_forall = _tile_one_fused_attention_region(
+            anytype, divide_op[4], fa_params
+        )
+        # Fold the region into the flash online-softmax loop while it is still on
+        # tensors, so the shared vectorize tail lowers it like any other tiled
+        # region.
+        _fuse_attention_in_region(anytype, fa_forall, fa_params)
 
     func = match(mod, ops={"func.func"})
     lh_transform.cleanup(func)
@@ -515,6 +639,12 @@ def _bundle(
     with lh_transform.foreach(match(mod, ops={"scf.for"})) as reduction_loop:
         lh_transform.loop_hoisting(reduction_loop)
         transform.yield_()
+    # Each reduction fusion left the elementwise term's full-extent result as a
+    # loop accumulator that nothing reads (every tile but the last is scaled by a
+    # stale running max). Only now, with vectorization having replaced the in-loop
+    # destination slice with transfer ops, does liveness see them as unused; left in
+    # place they bufferize into real stores of a stale tensor.
+    func = apply_registered_pass(func, "remove-dead-values")
     lh_transform.cleanup(func)
     # Drop any leading unit dims left over from the (1, wg_rows, 0, 0) tiling of
     # the attention regions so the QK^T/@V vector.contracts stay 2D.

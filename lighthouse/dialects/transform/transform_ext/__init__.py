@@ -14,25 +14,28 @@ from .ops.get_tiling_sizes import get_tiling_sizes
 from .ops.trace_producers import trace_producers
 from .ops.reverse_handles import reverse_handles
 from .ops.update_address_space import update_address_space
-from .ops.replace_with_fused_attention import replace_with_fused_attention
 from .ops.filter_num_loops import filter_num_loops
 from .ops.filter_elementwise import filter_elementwise
 from .ops.fuse_elementwise_op import fuse_elementwise_op
 from .ops.filter_by_name import filter_by_name
 from .ops.filter_reduction_ops import filter_reduction_ops
+from .ops.fuse_dependent_reduction_ops import fuse_dependent_reduction_ops
+from .ops.sink_normalization_past_contraction import (
+    sink_normalization_past_contraction,
+)
 from .ops.filter_contraction_ops import filter_contraction_ops
 from .ops.get_leading_unit_tile_sizes import get_leading_unit_tile_sizes
 from .ops.move_offsets_to_subview import move_offsets_to_subview
 from .ops.clear_tile_and_fuse_annotations import clear_tile_and_fuse_annotations
 from .ops.get_fusion_roots import get_fusion_roots
 from .ops.propagate_tile_sizes import propagate_tile_sizes
+from .ops.replace_with_fused_attention import replace_with_fused_attention
+from .utils.dependent_reduction_legality import REDUCTION_LOOP_ATTR_NAME
 from .ops.sfc_remap_forall import sfc_remap_forall
 from .ops.sink_extract_slice_into_loop import sink_extract_slice_into_loop
-from .ops.sink_normalization_past_contraction import (
-    sink_normalization_past_contraction,
-)
 
 __all__ = [
+    "REDUCTION_LOOP_ATTR_NAME",
     "TransformExtensionDialect",
     "assign_tile_sizes",
     "clear_tile_and_fuse_annotations",
@@ -43,6 +46,7 @@ __all__ = [
     "filter_elementwise",
     "filter_num_loops",
     "filter_reduction_ops",
+    "fuse_dependent_reduction_ops",
     "fuse_elementwise_op",
     "get_fusion_roots",
     "get_leading_unit_tile_sizes",
