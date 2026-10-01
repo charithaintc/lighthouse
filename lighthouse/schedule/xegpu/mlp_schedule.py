@@ -212,6 +212,7 @@ def xegpu_wg_annotation_for_mlp_layer(
     prefetch_b_nb: int,
     transpose_a: bool,
     transpose_b: bool,
+    dynamic_k: bool = False,
     **_catch_all,
 ):
     """
@@ -256,12 +257,16 @@ def xegpu_wg_annotation_for_mlp_layer(
     load_op_b = xegpu.get_load_op(transform.get_operand(anyvalue, dpas_op, [1]))
 
     def add_prefetch(load_op, prefetch_nb, **layout):
-        desc_op = xegpu.insert_prefetch(
+        if prefetch_nb == 0:
+            return
+        desc_ops = xegpu.insert_prefetch(
             load_op,
             nb_prefetch=prefetch_nb,
         )
-        pf_ops = transform.get_consumers_of_result(anytype, desc_op, 0)
-        xegpu.set_anchor_layout(pf_ops, **layout)
+        with lh_transform.foreach(desc_ops) as desc_op:
+            pf_ops = transform.get_consumers_of_result(anytype, desc_op, 0)
+            xegpu.set_anchor_layout(pf_ops, **layout)
+            transform.yield_()
 
     def annotate_ab_load(
         dpas_op, index, load_op, layout_load, layout_dpas, layout_prefetch, prefetch_nb
@@ -373,8 +378,9 @@ def xegpu_wg_annotation_for_mlp_layer(
     transform.apply_cse(gpu_func)
     canonicalize(gpu_func)
 
-    # hoist desc ops out of reduction loop
-    transform.apply_licm(k_loop)
+    # Dynamic-K descriptors depend on subviews created inside the reduction loop.
+    if not dynamic_k:
+        transform.apply_licm(k_loop)
 
     canonicalize(gpu_func)
     transform.apply_cse(gpu_func)
