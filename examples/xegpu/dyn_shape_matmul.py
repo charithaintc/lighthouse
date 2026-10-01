@@ -274,6 +274,18 @@ def parse_cli_args(description):
         help="Inner reduction dimension tile size K.",
     )
     parser.add_argument(
+        "--prefetch-a-nb",
+        type=int,
+        default=1,
+        help="Number of prefetch steps for the A matrix (0 disables prefetch).",
+    )
+    parser.add_argument(
+        "--prefetch-b-nb",
+        type=int,
+        default=1,
+        help="Number of prefetch steps for the B matrix (0 disables prefetch).",
+    )
+    parser.add_argument(
         "--init-int",
         action="store_true",
         help="Initialize arrays with integers in [-3, 3] to make result checking more reliable.",
@@ -355,6 +367,8 @@ Use --dump-kernel to inspect implemented lowering stages.
         cli_params["wg_m"], cli_params["wg_n"] = args.wg_tile
     if args.k_tile:
         cli_params["k_tile"] = args.k_tile
+    cli_params["prefetch_a_nb"] = args.prefetch_a_nb
+    cli_params["prefetch_b_nb"] = args.prefetch_b_nb
     params[0].update(cli_params)
 
     with ir.Context(), ir.Location.unknown():
