@@ -9,7 +9,7 @@
 \usepackage{booktabs}
 \usepackage{qrcode}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, fit, backgrounds}
+\usetikzlibrary{arrows.meta, positioning, fit, backgrounds, calc}
 
 % ---------------------------------------------------------------- code style
 \definecolor{cmt}{HTML}{6E7B8B}
@@ -131,59 +131,13 @@
 \subtitle{MLIR Developer Meetup - Oct 2026}
 \date{}  % empty: no date on the title slide
 % \date{October 2026 }
-\author{Charitha Saumya \\ Intel MLIR Team, Intel Labs}
+\author{Charitha Saumya \\ Intel MLIR Team}
 
 \begin{document}
 
 \maketitle
 
 % =============================================================== Motivation
-\begin{frame}[fragile]{Tile, Fuse Producers/Consumers, and Repeat}
-  \lstset{basicstyle=\ttfamily\fontsize{7.5}{9}\selectfont}
-  \begin{columns}[c, onlytextwidth]
-    \begin{column}{0.385\textwidth}
-\begin{lstlisting}
-// prologue: A + c
-|p%a = linalg.add ins(%A, %cst) outs(%e0)|
-
-// GEMM
-%c = linalg.matmul ins(%a, %B) outs(%C)
-
-// epilogue: exp
-|e%d = linalg.exp ins(%c) outs(%D)|
-\end{lstlisting}
-    \end{column}
-    \begin{column}{0.145\textwidth}
-      \centering
-      {\scriptsize\mbox{Tile the GEMM}\\ \mbox{Fuse producers}\\ \mbox{Fuse consumers}\par}
-      \vspace{1mm}
-      \tikz\draw[-{Latex[length=2.5mm]}, line width=1.2pt, inteltitle]
-        (0,0) -- (0.9\linewidth,0);
-    \end{column}
-    \begin{column}{0.47\textwidth}
-\begin{lstlisting}
-%r = scf.forall (%i, %j) = (0, 0) to (M, N)
-       step (tM, tN) shared_outs(%o = %D) {
-  %At = tensor.extract_slice %A[%i, 0] [tM, K]
-  |p%at = linalg.add ins(%At, %cst) outs(%e0t)|
-  %Bt = tensor.extract_slice %B[0, %j] [K, tN]
-  %Ct = tensor.extract_slice %C[%i, %j] [tM, tN]
-  %ct = linalg.matmul ins(%at, %Bt) outs(%Ct)
-  %Ot = tensor.extract_slice %o[%i, %j] [tM, tN]
-  |e%dt = linalg.exp ins(%ct) outs(%Ot)|
-  scf.forall.in_parallel {
-    tensor.parallel_insert_slice %dt into
-        %o[%i, %j] [tM, tN]
-  }
-}
-\end{lstlisting}
-    \end{column}
-  \end{columns}
-
-  \takeawayspace{Great support for tiling along parallel/reduction dims and
-    fusion along parallel dims}
-\end{frame}
-
 \begin{frame}[fragile]{Tile, Fuse Producers/Consumers, and Repeat}
   \lstset{basicstyle=\ttfamily\fontsize{7.5}{9}\selectfont}
   \begin{columns}[c, onlytextwidth]
@@ -573,47 +527,70 @@ linalg.yield %e
     The op can be applied repeatedly to fuse chains of dependent reductions}
 \end{frame}
 
-\begin{frame}{Main Stages of the Transformation}
+\begin{frame}[fragile]{Main Stages of the Transformation}
+  \centering
+  \begin{tikzpicture}[
+      st/.style={draw, rounded corners=3pt, fill=white, align=center,
+                 inner xsep=5pt, inner ysep=4pt, font=\footnotesize},
+      arr/.style={-{Latex[length=2mm]}, thick},
+    ]
+    \node[st, fill=black!4] (s1) {Tile \code{R1}};
+    \node[st, right=10mm of s1] (s2) {Fuse and re-tile \code{E} and \code{R2}};
+    \node[st, right=6mm of s2] (s3) {Online correction};
+    \node[font=\scriptsize\bfseries, text=pro!70!black, anchor=north]
+      (lbl) at ([yshift=-1.5mm] $(s2.south)!0.5!(s3.south)$) {Proposed transformation};
+    \draw[arr] (s1) -- (s2);
+    \draw[arr] (s2) -- (s3);
+    \begin{scope}[on background layer]
+      \node[fill=pro!12, rounded corners=4pt, inner sep=2mm,
+            fit=(s2)(s3)(lbl)] {};
+    \end{scope}
+  \end{tikzpicture}
+
+  \vspace{4mm}
+  \raggedright
   \begin{columns}[c, onlytextwidth]
-    \begin{column}{0.38\textwidth}
-      \centering
-      \begin{tikzpicture}[
-          st/.style={draw, rounded corners=3pt, fill=white, text width=32mm,
-                     align=center, inner sep=4pt, minimum height=10mm,
-                     font=\small},
-          arr/.style={-{Latex[length=2mm]}, thick},
-        ]
-        \node[st, fill=black!4] (s1) {Tile \code{R1}};
-        \node[st, below=10mm of s1] (s2) {Fuse and re-tile\\ \code{E} and \code{R2}};
-        \node[st, below=6mm of s2] (s3) {Online correction};
-        \node[below=2mm of s3, font=\scriptsize\bfseries, text=pro!70!black]
-          (lbl) {Proposed transformation};
-        \draw[arr] (s1) -- (s2);
-        \draw[arr] (s2) -- (s3);
-        \begin{scope}[on background layer]
-          \node[fill=pro!12, rounded corners=4pt, inner sep=2.5mm,
-                fit=(s2)(s3)(lbl)] {};
-        \end{scope}
-      \end{tikzpicture}
-    \end{column}
-    \begin{column}{0.58\textwidth}
+    \begin{column}{0.40\textwidth}
+      \footnotesize
       \begin{itemize}
-        \setlength{\itemsep}{3mm}
+        \setlength{\itemsep}{2mm}
         \item \code{E} is fused first (\code{scf::tileAndFuseConsumer}), then
           immediately re-tiled to match \code{R1}'s tile
         \item \code{R2} is fused against the slice that \code{E} yields
         \item Implemented as an \code{OpRewritePattern} on \code{R2}
       \end{itemize}
+      \vspace{12mm}  % lift the points above the code column's center
+    \end{column}
+    \begin{column}{0.56\textwidth}
+      \lstset{basicstyle=\ttfamily\fontsize{7.5}{9}\selectfont}
+      {\scriptsize\textbf{Input:} softmax, max already tiled}
+\begin{lstlisting}
+|pfor j in tiles(N):|              // R1
+|p  m = max(m, max(x[j]))|
+p = exp(x - m)                  // E
+|es = sum(p)|                      // R2
+\end{lstlisting}
+      \vspace{1mm}
+      {\scriptsize\textbf{After fusion:} one loop}
+\begin{lstlisting}
+for j in tiles(N):
+|p  m_new = max(m, max(x[j]))|     // R1
+  p     = exp(x[j] - m_new)     // E, re-tiled
+|c  s     = s * exp(m - m_new)|    // online correction
+|e  s     = s + sum(p)|            // R2, re-tiled
+  m     = m_new
+\end{lstlisting}
     \end{column}
   \end{columns}
 \end{frame}
 
 % =============================================================== Example
 \begin{frame}{Example: Standard to Fused Attention}
-  Score matrix \code{x = Q @ K\textsuperscript{T}}, values \code{V}; all
-  reductions over the key axis \code{j}. Normalization is deferred
-  (flash-attention-v2):
-  \vspace{1mm}
+  \begin{itemize}\small
+    \item \code{x} is the score matrix: \code{x = Q @ K\textsuperscript{T}}
+    \item All reductions are over the inner \code{j} axis
+    \item Normalization is deferred (flash-attention style)
+  \end{itemize}
   \[
   \begin{aligned}
     R1 \;(\max):&\quad m[i]    = \max_j x[i,j] \\
@@ -623,25 +600,20 @@ linalg.yield %e
     \text{div}:&\quad o[i,d]  = o'[i,d] / s[i]
   \end{aligned}
   \]
-  \vspace{1mm}
-  \begin{itemize}\small
-    \item One term \code{E} feeds \alert{two} consumer reductions over the same
-      axis $\Rightarrow$ the op is applied \alert{twice}.
-    \item Shapes in the listings: \code{x} is \code{[64, 512]}, \code{V} is
-      \code{[512, 128]}, reduction tile is \code{32}.
-  \end{itemize}
+  \takeaway{A single \code{E} feeds two consumer reductions $\Rightarrow$ requires
+    \alert{2} applications of reduction fusion}
 \end{frame}
 
-\begin{frame}[fragile]{Step 1: Input IR (\textit{R1} Already Tiled + Annotated)}
+\begin{frame}[fragile]{Step 1: Input IR (\textit{R1} Already Tiled)}
 \begin{lstlisting}
-%m = scf.for %iv = 0 to 512 step 32                    // R1: row max, tiled + annotated
+%m = scf.for %iv = 0 to 512 step 32                    // R1: row max, already tiled
        iter_args(%acc_m = %ninf_64) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]     // score tile
   %mold = tensor.extract_slice %acc_m[0] [64]
   %mt   = linalg.generic ins(%xt) outs(%mold)          // max(x_tile, acc_m)
   %im   = tensor.insert_slice %mt into %acc_m[0] [64]
   scf.yield %im
-} {__reduction_loop__}
+}
 %p = linalg.generic ins(%x, %m) outs(%empty_64x512)    // E: exp(x - m), full [64, 512]
 %s = linalg.generic ins(%p) outs(%zero_64)             // R2a: row sum, sum_j p
 %o = linalg.generic ins(%p, %V) outs(%zero_64x128)     // R2b: P @ V, sum_j p * V
@@ -791,22 +763,25 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op  // fused loop i
 \end{frame}
 
 % =============================================================== Evaluation
-\begin{frame}{Evaluation: Attention}
-  Standard attention generated from Linalg-level ops, lowered to the \alert{XeGPU}
-  backend and run end-to-end on GPU hardware.
+\begin{frame}{Evaluation}
+  \textbf{Hardware}
   \begin{itemize}
-    \item \textbf{Hardware}: Intel Battlemage (BMG) GPU.
+    \item Intel Battlemage (BMG) GPU
+  \end{itemize}
+  \vspace{3mm}
+  \textbf{Attention kernel}
+  \begin{itemize}
+    \item \textbf{Input IR}: standard attention kernel written in Linalg,
+      lowered for end-to-end execution using the upstream \alert{XeGPU} pipeline
     \item \textbf{Sizes}: \code{Z = 2} (batch), \code{H = 8} heads, head dim
-      \code{= 64}, \code{f16}; \code{n\_ctx} $\in \{1024, 4096, 8192, 16384\}$.
+      \code{= 64}, \code{f16}; \code{n\_ctx} $\in \{1024, 4096, 8192, 16384\}$
     \item \textbf{Baseline (unfused)}: same kernel tiled/fused with existing
       upstream transforms only --- no fusion on the reduction dim, score matrix
-      recomputed for each reduction.
-    \item \textbf{This RFC}: schedule from this proposal, fusing the max, sum and
-      \code{attn * V} reductions into a single loop.
+      recomputed for each reduction
   \end{itemize}
 \end{frame}
 
-\begin{frame}{Results: Attention (BMG)}
+\begin{frame}{Results: Attention}
   \centering
   \begin{tabular}{rrr}
     \toprule
@@ -820,15 +795,16 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op  // fused loop i
   \end{tabular}
 
   \vspace{5mm}
-  \small Fusing the dependent reductions into a single online loop gives a
-  \alert{2.2x--2.7x} speedup across the sweep.
+  \takeaway{Reduction fusion gives \alert{2.2x--2.7x} speedup over the unfused
+    baseline}
 \end{frame}
 
 \begin{frame}{Results: Softmax and L1/L2 Normalization (BMG)}
-  One application of the op each; the epilogue recomputes its term from the
-  \emph{final} max, so \alert{three passes over the input become two}. The three
-  differ only in \code{E}, and so in the correction --- no code specific to
-  \code{exp}:
+  \begin{itemize}\small
+    \item All three are a max reduction $\rightarrow$ \code{E} $\rightarrow$ sum
+      reduction chain, with a different \code{E} in each kernel
+    \item Baseline (unfused): 3 loops vs.\ 2 loops with fusion
+  \end{itemize}
 
   \vspace{1mm}
   \centering
@@ -855,12 +831,8 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op  // fused loop i
     \bottomrule
   \end{tabular}
 
-  \vspace{1mm}
-  \raggedright \scriptsize
-  \code{f32}, parallel dim 4096; wg 64 / sg 8 rows, sg size 16;
-  \code{fastmath<fast>}, best tile per variant (128 / 64). Normalization uses the
-  overflow-safe max-scaled form (BLAS \code{nrm2}) --- hence the max. All three
-  land within 0.01x at every size: same loop, only \code{E} differs.
+  \takeaway{The transformation automatically derives the correction factor for
+    each \code{E}}
 \end{frame}
 
 % =============================================================== Wrap-up
