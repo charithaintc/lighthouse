@@ -34,10 +34,10 @@
             transform.structured.fuse_into_containing_op,fuse_consumer,scf.for,scf.yield,linalg.generic,linalg.elementwise,tensor.extract_slice,
             tensor.insert_slice,iter_args,ins,outs,step,to,transform.structured.match,
             transform.split_handle,transform.annotate,transform.get_producer_of_operand,
-            transform.structured.fuse_dependant_reduction_ops,
+            transform.structured.fuse_dependent_reduction_ops,
             transform.structured.tile_using_for,for,if,def},
   showstringspaces=false,
-  columns=fullflexible,
+  columns=fixed, basewidth=0.525em,  % one cmtt char per column: aligned comments
   keepspaces=true,
   breaklines=false,
   backgroundcolor=\color{bg},
@@ -517,7 +517,7 @@ linalg.yield %e          // {MUL}
       \small
       \textbf{Example:} $E(x, r_1) = \exp(x - r_1)$\\[1mm]
       \lstset{basicstyle=\ttfamily\fontsize{7.5}{9}\selectfont}
-      \begin{minipage}[t]{0.44\linewidth}
+      \begin{minipage}[t]{0.45\linewidth}
 \begin{lstlisting}
 // E
 
@@ -526,7 +526,7 @@ linalg.yield %e          // {MUL}
 linalg.yield %e
 \end{lstlisting}
       \end{minipage}\hfill
-      \begin{minipage}[t]{0.53\linewidth}
+      \begin{minipage}[t]{0.54\linewidth}
 \begin{lstlisting}
 // E': %x := 0.0
 |c%c0 = arith.constant 0.0|
@@ -549,7 +549,7 @@ linalg.yield %e
 \end{frame}
 
 % =============================================================== Proposed op
-\begin{frame}[fragile]{Proposed op: \code{structured.fuse\_dependant\_reduction\_ops}}
+\begin{frame}[fragile]{Proposal: \textit{structured.fuse\_dependent\_reduction\_ops}}
   Three operand handles, one result:
   \begin{enumerate}\small
     \item \textbf{\code{R1}} --- already tiled producer reduction
@@ -560,63 +560,56 @@ linalg.yield %e
     \item \textbf{\code{R2}} --- still-untiled consumer reduction over the same
       axis, reducing \code{E}'s result.
   \end{enumerate}
-  \vspace{1mm}
 \begin{lstlisting}
 %loop = ..... -> !transform.any_op   // R1: the already tiled reduction loop
 %e    = ..... -> !transform.any_op   // E : the elementwise term
 %r2   = ..... -> !transform.any_op   // R2: the consumer reduction
 
-%fused = transform.structured.fuse_dependant_reduction_ops %e, %r2 into %loop
+%fused = transform.structured.fuse_dependent_reduction_ops %e, %r2 into %loop
     : (!transform.any_op, !transform.any_op, !transform.any_op)
     -> !transform.any_op
 \end{lstlisting}
-  \vspace{1mm}
-  \small Returns the loop, now also carrying \code{E} and \code{R2}, fused and
-  online $\Rightarrow$ \alert{apply repeatedly} for chains of dependent reductions.
+  \takeaway{Returns the fused loop, now carrying \code{E} and \code{R2}\\
+    The op can be applied repeatedly to fuse chains of dependent reductions}
 \end{frame}
 
-\begin{frame}{Main stages of the transformation}
-  \centering
-  \resizebox{\textwidth}{!}{%
-  \begin{tikzpicture}[
-      font=\scriptsize,
-      st/.style={draw, rounded corners=3pt, fill=black!4, text width=21mm,
-                 align=center, inner sep=4pt, minimum height=11mm},
-      arr/.style={-{Latex[length=1.8mm]}, thick},
-      note/.style={font=\scriptsize\itshape, align=center},
-    ]
-    \node[st, fill=blue!8] (s0) {\textbf{tiled \code{R1}}\\loop};
-    \node[st, right=5mm of s0] (s1) {fuse \code{E}};
-    \node[st, right=5mm of s1] (s2) {re-tile \code{E}};
-    \node[st, right=5mm of s2] (s3) {fuse \code{R2}};
-    \node[st, right=5mm of s3] (s4) {re-tile \code{R2}};
-    \node[st, right=5mm of s4, fill=green!10] (s5) {\textbf{online correction}};
-
-    \foreach \a/\b in {s0/s1, s1/s2, s2/s3, s3/s4, s4/s5}
-      \draw[arr] (\a) -- (\b);
-
-    \node[note, below=3mm of s1, text width=24mm, text=blue!50!black]
-      {valid, but recomputes the full extent};
-    \node[note, below=8mm of s3, text width=30mm, text=red!60!black]
-      {numerically invalid: accumulator is stale};
-    \node[note, below=3mm of s5, text width=26mm, text=green!40!black]
-      {valid \emph{and} online};
-  \end{tikzpicture}}
-
-  \vspace{4mm}
-  \begin{itemize}\small
-    \item One op at a time, \code{E} first: \emph{fuse} (\code{scf::tileAndFuseConsumer}),
-      then immediately \emph{re-tile} to \code{R1}'s tile.
-    \item \code{E} first, so \code{R2} is fused against the slice \code{E} yields.
-    \item Implemented as an \code{OpRewritePattern} on \code{R2}; a control function
-      confines fusion to the handles named by the transform op.
-  \end{itemize}
+\begin{frame}{Main Stages of the Transformation}
+  \begin{columns}[c, onlytextwidth]
+    \begin{column}{0.38\textwidth}
+      \centering
+      \begin{tikzpicture}[
+          st/.style={draw, rounded corners=3pt, fill=white, text width=32mm,
+                     align=center, inner sep=4pt, minimum height=10mm,
+                     font=\small},
+          arr/.style={-{Latex[length=2mm]}, thick},
+        ]
+        \node[st, fill=black!4] (s1) {Tile \code{R1}};
+        \node[st, below=10mm of s1] (s2) {Fuse and re-tile\\ \code{E} and \code{R2}};
+        \node[st, below=6mm of s2] (s3) {Online correction};
+        \node[below=2mm of s3, font=\scriptsize\bfseries, text=pro!70!black]
+          (lbl) {Proposed transformation};
+        \draw[arr] (s1) -- (s2);
+        \draw[arr] (s2) -- (s3);
+        \begin{scope}[on background layer]
+          \node[fill=pro!12, rounded corners=4pt, inner sep=2.5mm,
+                fit=(s2)(s3)(lbl)] {};
+        \end{scope}
+      \end{tikzpicture}
+    \end{column}
+    \begin{column}{0.58\textwidth}
+      \begin{itemize}
+        \setlength{\itemsep}{3mm}
+        \item \code{E} is fused first (\code{scf::tileAndFuseConsumer}), then
+          immediately re-tiled to match \code{R1}'s tile
+        \item \code{R2} is fused against the slice that \code{E} yields
+        \item Implemented as an \code{OpRewritePattern} on \code{R2}
+      \end{itemize}
+    \end{column}
+  \end{columns}
 \end{frame}
 
 % =============================================================== Example
-\section{Example: standard attention $\rightarrow$ fused attention}
-
-\begin{frame}{The attention chain}
+\begin{frame}{Example: Standard to Fused Attention}
   Score matrix \code{x = Q @ K\textsuperscript{T}}, values \code{V}; all
   reductions over the key axis \code{j}. Normalization is deferred
   (flash-attention-v2):
@@ -639,79 +632,67 @@ linalg.yield %e
   \end{itemize}
 \end{frame}
 
-\begin{frame}[fragile]{Step 1: input IR (\code{R1} already tiled + annotated)}
+\begin{frame}[fragile]{Step 1: Input IR (\textit{R1} Already Tiled + Annotated)}
 \begin{lstlisting}
-// R1: the row max, tiled along the reduction axis and annotated.
-%m = scf.for %iv = 0 to 512 step 32 iter_args(%acc_m = %ninf_64) {
+%m = scf.for %iv = 0 to 512 step 32                    // R1: row max, tiled + annotated
+       iter_args(%acc_m = %ninf_64) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]     // score tile
   %mold = tensor.extract_slice %acc_m[0] [64]
   %mt   = linalg.generic ins(%xt) outs(%mold)          // max(x_tile, acc_m)
   %im   = tensor.insert_slice %mt into %acc_m[0] [64]
   scf.yield %im
 } {__reduction_loop__}
-// E: the term, at the full [64, 512] extent, read by BOTH reductions below.
-%p = linalg.generic ins(%x, %m) outs(%empty_64x512)    // exp(x - m)
-// R2a: the row sum of E.
-%s = linalg.generic ins(%p) outs(%zero_64)             // sum_j p
-// R2b: the P @ V contraction over E, reducing the same axis.
-%o = linalg.generic ins(%p, %V) outs(%zero_64x128)     // sum_j p * V
-// The deferred normalization, downstream of both reductions.
-%out = linalg.generic ins(%o, %s) outs(%empty_64x128)  // o / s
+%p = linalg.generic ins(%x, %m) outs(%empty_64x512)    // E: exp(x - m), full [64, 512]
+%s = linalg.generic ins(%p) outs(%zero_64)             // R2a: row sum, sum_j p
+%o = linalg.generic ins(%p, %V) outs(%zero_64x128)     // R2b: P @ V, sum_j p * V
+%out = linalg.generic ins(%o, %s) outs(%empty_64x128)  // normalize: o / s
 \end{lstlisting}
 \end{frame}
 
-\begin{frame}[fragile]{Step 1: the transform schedule (one chain per application)}
+\begin{frame}[fragile]{Step 1: The Transform Schedule (One Chain per Application)}
 \begin{lstlisting}
 %gen = transform.structured.match ops{["linalg.generic"]} in %arg0 .....
-// #1 = max (R1), #2 = E, #3 = row sum (R2a), #4 = contraction (R2b),
-// #5 = the normalizing divide.
-%r1, %e, %r2a, %r2b, %div = transform.split_handle %gen .....
+%r1, %e, %r2a, %r2b, %div = transform.split_handle %gen .....    // R1, E, R2a (sum), R2b (P @ V), div
 %loop = transform.structured.match ops{["scf.for"]} in %arg0 .....
 
-// Chain 1: fuse E and the row sum into the tiled max loop.
-%fa = transform.structured.fuse_dependant_reduction_ops %e, %r2a into %loop .....
-// The fused loop is the producer reduction of the second chain.
-transform.annotate %fa "__reduction_loop__" : !transform.any_op
+%fa = transform.structured.fuse_dependent_reduction_ops          // chain 1: E + row sum
+        %e, %r2a into %loop .....
+transform.annotate %fa "__reduction_loop__" : !transform.any_op  // fused loop is the next R1
 
-// The first fusion consumed the handle to E; the original E is still the
-// contraction's operand, so re-derive it from there.
-%e2 = transform.get_producer_of_operand %r2b[0] .....
-// Chain 2: fuse E and the P @ V contraction into the same loop.
-%fb = transform.structured.fuse_dependant_reduction_ops %e2, %r2b into %fa .....
+%e2 = transform.get_producer_of_operand %r2b[0] .....            // re-derive E (handle consumed)
+%fb = transform.structured.fuse_dependent_reduction_ops          // chain 2: E + P @ V
+        %e2, %r2b into %fa .....
 \end{lstlisting}
 \end{frame}
 
-\begin{frame}[fragile]{Step 2: \code{E} fused --- still at full extent}
+\begin{frame}[fragile]{Step 2: \textit{E} Fused --- Still at Full Extent}
 \begin{lstlisting}
-// A second iter_arg (%acc_p) now carries E's full-extent result.
-%r:2 = scf.for %iv = 0 to 512 step 32 iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512) {
+%r:2 = scf.for %iv = 0 to 512 step 32                  // new iter_arg %acc_p: E's full result
+         iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]
   %mold = tensor.extract_slice %acc_m[0] [64]
   %mt   = linalg.generic ins(%xt) outs(%mold)          // max(x_tile, acc_m)
-  // The fused clone of E: reads all 512 columns, writes the whole extent.
-  %xf   = tensor.extract_slice %x[0, 0] [64, 512]
-  %pdst = tensor.extract_slice %acc_p[0, 0] [64, 512]
+  %xf   = tensor.extract_slice %x[0, 0] [64, 512]      // fused E clone reads all 512 cols ...
+  %pdst = tensor.extract_slice %acc_p[0, 0] [64, 512]  // ... and writes the full extent
   %pt   = linalg.generic ins(%xf, %mt) outs(%pdst)     // exp(x - m_new), FULL row
   %im   = tensor.insert_slice %mt into %acc_m[0] [64]
   %ip   = tensor.insert_slice %pt into %acc_p[0, 0] [64, 512]
   scf.yield %im, %ip
-}
-// ... still outside the loop: the row sum (now reading %r#1), the original E,
-// the P @ V contraction and the normalizing divide.
+}                                                      // outside: row sum, original E, P @ V, div
 \end{lstlisting}
   \small \code{E} also feeds the contraction $\Rightarrow$ a \emph{clone} is fused;
   the original stays outside for the second application.
 \end{frame}
 
-\begin{frame}[fragile]{Step 3: \code{E} re-tiled to the reduction tile}
+\begin{frame}[fragile]{Step 3: \textit{E} Re-Tiled to the Reduction Tile}
 \begin{lstlisting}
-%r:2 = scf.for %iv = 0 to 512 step 32 iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512) {
+%r:2 = scf.for %iv = 0 to 512 step 32
+         iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]
   %mold = tensor.extract_slice %acc_m[0] [64]
-  %mt   = linalg.generic ins(%xt) outs(%mold)          // max(x_tile, acc_m)
-  // E, cut to the tile: reads the [64, 32] tile of x, writes a [64, 32] tile.
-  %pdst = tensor.extract_slice %acc_p[0, %iv] [64, 32]
-  %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)     // exp(x_tile - m_new)
+  %mt   = linalg.generic ins(%xt) outs(%mold)           // max(x_tile, acc_m)
+  %pdst = tensor.extract_slice %acc_p[0, %iv] [64, 32]  // E cut to the [64, 32] tile
+  %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)      // exp(x_tile - m_new)
   %im   = tensor.insert_slice %mt into %acc_m[0] [64]
   %ip   = tensor.insert_slice %pt into %acc_p[0, %iv] [64, 32]
   scf.yield %im, %ip
@@ -726,18 +707,17 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op
   \end{itemize}
 \end{frame}
 
-\begin{frame}[fragile]{Step 4: the row sum fused (and re-tiled)}
+\begin{frame}[fragile]{Step 4: The Row Sum Fused (and Re-Tiled)}
 \begin{lstlisting}
 %r:3 = scf.for %iv = 0 to 512 step 32
          iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512, %acc_s = %zero_64) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]
   %mold = tensor.extract_slice %acc_m[0] [64]
-  %mt   = linalg.generic ins(%xt) outs(%mold)          // max(x_tile, acc_m)
+  %mt   = linalg.generic ins(%xt) outs(%mold)       // max(x_tile, acc_m)
   %pdst = tensor.extract_slice %acc_p[0, %iv] [64, 32]
-  %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)     // exp(x_tile - m_new)
-  // The fused row sum, reducing this tile into the (stale) running sum.
-  %sold = tensor.extract_slice %acc_s[0] [64]
-  %st   = linalg.generic ins(%pt) outs(%sold)          // acc_s + sum_j p_tile
+  %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)  // exp(x_tile - m_new)
+  %sold = tensor.extract_slice %acc_s[0] [64]       // fused row sum: stale running sum
+  %st   = linalg.generic ins(%pt) outs(%sold)       // acc_s + sum_j p_tile
   ... yields: %mt, %pt, %st
 }
 \end{lstlisting}
@@ -746,21 +726,18 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op
   contraction it is what cuts \code{V} from \code{[512, 128]} to \code{[32, 128]}.
 \end{frame}
 
-\begin{frame}[fragile]{Step 5: online correction --- chain 1 complete}
+\begin{frame}[fragile]{Step 5: Online Correction --- Chain 1 Complete}
 \begin{lstlisting}
 %r:3 = scf.for %iv = 0 to 512 step 32
          iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512, %acc_s = %zero_64) {
-  %mt   = linalg.generic ins(%xt) outs(%mold)          // max(x_tile, acc_m)
-  %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)     // exp(x_tile - m_new)
+  %mt   = linalg.generic ins(%xt) outs(%mold)         // max(x_tile, acc_m)
+  %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)    // exp(x_tile - m_new)
   %sold = tensor.extract_slice %acc_s[0] [64]
-  // The correction term: E isolated on the max (x := 0), evaluated at the new
-  // max and at the previous running max.
-  %tnew = linalg.generic ins(%mt) outs(%empty_64)      // exp(0 - m_new)
-  %told = linalg.generic ins(%mold) outs(%empty_64)    // exp(0 - m_old)
-  %f    = linalg.elementwise <div> ins(%tnew, %told)   // exp(m_old - m_new)
-  // The rescaled running sum becomes the fused sum's DPS init.
-  %sc   = linalg.elementwise <mul> ins(%sold, %f)      // acc_s * factor
-  %st   = linalg.generic ins(%pt) outs(%sc)            // sc + sum_j p_tile
+  %tnew = linalg.generic ins(%mt) outs(%empty_64)     // correction, E at new max: exp(0 - m_new)
+  %told = linalg.generic ins(%mold) outs(%empty_64)   // E at old max: exp(0 - m_old)
+  %f    = linalg.elementwise <div> ins(%tnew, %told)  // exp(m_old - m_new)
+  %sc   = linalg.elementwise <mul> ins(%sold, %f)     // acc_s * factor: rescaled init
+  %st   = linalg.generic ins(%pt) outs(%sc)           // sc + sum_j p_tile
   ... yields: %mt, %pt, %st
 }
 \end{lstlisting}
@@ -768,40 +745,37 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op
   producer of the next chain.
 \end{frame}
 
-\begin{frame}[fragile]{Step 6: second application --- fused loop (1/2)}
+\begin{frame}[fragile]{Step 6: Second Application --- Fused Loop (1/2)}
 \begin{lstlisting}
 %r:5 = scf.for %iv = 0 to 512 step 32
          iter_args(%acc_m = %ninf_64, %acc_p1 = %empty_64x512, %acc_s = %zero_64,
                    %acc_p2 = %empty_64x512, %acc_o = %zero_64x128) {
-  %xt   = tensor.extract_slice %x[0, %iv] [64, 32]
-  %mold = tensor.extract_slice %acc_m[0] [64]
-  %mt   = linalg.generic ins(%xt) outs(%mold)           // max(x_tile, acc_m)
-  // One E per fused chain: the clone for the row sum, the original for P @ V.
+  %xt    = tensor.extract_slice %x[0, %iv] [64, 32]
+  %mold  = tensor.extract_slice %acc_m[0] [64]
+  %mt    = linalg.generic ins(%xt) outs(%mold)         // max(x_tile, acc_m)
   %p1dst = tensor.extract_slice %acc_p1[0, %iv] [64, 32]
-  %p1    = linalg.generic ins(%xt, %mt) outs(%p1dst)    // exp(x_tile - m_new)
+  %p1    = linalg.generic ins(%xt, %mt) outs(%p1dst)   // E for chain 1 (clone)
   %p2dst = tensor.extract_slice %acc_p2[0, %iv] [64, 32]
-  %p2    = linalg.generic ins(%xt, %mt) outs(%p2dst)    // exp(x_tile - m_new)
+  %p2    = linalg.generic ins(%xt, %mt) outs(%p2dst)   // E for chain 2 (original)
 
-  // Chain 1: correction over the row sum's [64] accumulator shape.
-  %sold = tensor.extract_slice %acc_s[0] [64]
-  %tnew = linalg.generic ins(%mt) outs(%empty_64)       // exp(0 - m_new)
-  %told = linalg.generic ins(%mold) outs(%empty_64)     // exp(0 - m_old)
-  %f1   = linalg.elementwise <div> ins(%tnew, %told)    // exp(m_old - m_new)
-  %sc   = linalg.elementwise <mul> ins(%sold, %f1)      // acc_s * factor
-  %st   = linalg.generic ins(%p1) outs(%sc)             // sc + sum_j p1
+  %sold  = tensor.extract_slice %acc_s[0] [64]         // chain 1 correction, [64]
+  %tnew  = linalg.generic ins(%mt) outs(%empty_64)     // exp(0 - m_new)
+  %told  = linalg.generic ins(%mold) outs(%empty_64)   // exp(0 - m_old)
+  %f1    = linalg.elementwise <div> ins(%tnew, %told)  // exp(m_old - m_new)
+  %sc    = linalg.elementwise <mul> ins(%sold, %f1)    // acc_s * factor
+  %st    = linalg.generic ins(%p1) outs(%sc)           // sc + sum_j p1
 \end{lstlisting}
 \end{frame}
 
-\begin{frame}[fragile]{Step 6: second application --- fused loop (2/2)}
+\begin{frame}[fragile]{Step 6: Second Application --- Fused Loop (2/2)}
 \begin{lstlisting}
-  // Chain 2: the same term, correction over the [64, 128] accumulator shape.
-  %vt    = tensor.extract_slice %V[%iv, 0] [32, 128]     // value tile
-  %oold  = tensor.extract_slice %acc_o[0, 0] [64, 128]
-  %tnew2 = linalg.generic ins(%mt) outs(%empty_64x128)   // exp(0 - m_new), broadcast
-  %told2 = linalg.generic ins(%mold) outs(%empty_64x128) // exp(0 - m_old), broadcast
-  %f2    = linalg.elementwise <div> ins(%tnew2, %told2)  // exp(m_old - m_new)
-  %oc    = linalg.elementwise <mul> ins(%oold, %f2)      // acc_o * factor
-  %ot    = linalg.generic ins(%p2, %vt) outs(%oc)        // oc + sum_j p2 * V_tile
+  %vt    = tensor.extract_slice %V[%iv, 0] [32, 128]       // value tile
+  %oold  = tensor.extract_slice %acc_o[0, 0] [64, 128]     // chain 2 correction, [64, 128]
+  %tnew2 = linalg.generic ins(%mt) outs(%empty_64x128)     // exp(0 - m_new), broadcast
+  %told2 = linalg.generic ins(%mold) outs(%empty_64x128)   // exp(0 - m_old), broadcast
+  %f2    = linalg.elementwise <div> ins(%tnew2, %told2)    // exp(m_old - m_new)
+  %oc    = linalg.elementwise <mul> ins(%oold, %f2)        // acc_o * factor
+  %ot    = linalg.generic ins(%p2, %vt) outs(%oc)          // oc + sum_j p2 * V_tile
 
   %im  = tensor.insert_slice %mt into %acc_m[0] [64]
   %ip1 = tensor.insert_slice %p1 into %acc_p1[0, %iv] [64, 32]
@@ -810,17 +784,14 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op
   %io  = tensor.insert_slice %ot into %acc_o[0, 0] [64, 128]
   scf.yield %im, %ip1, %is, %ip2, %io
 }
-// Only the normalizing divide is left outside.
-%out = linalg.generic ins(%r#4, %r#2) outs(%empty_64x128)  // o / s
+%out = linalg.generic ins(%r#4, %r#2) outs(%empty_64x128)  // only the divide is left: o / s
 \end{lstlisting}
   \small One online loop, five accumulators: running max, one \code{E} tile buffer
   per chain, running sum, running \code{P @ V}.
 \end{frame}
 
 % =============================================================== Evaluation
-\section{Evaluation}
-
-\begin{frame}{Experimental setup: attention}
+\begin{frame}{Evaluation: Attention}
   Standard attention generated from Linalg-level ops, lowered to the \alert{XeGPU}
   backend and run end-to-end on GPU hardware.
   \begin{itemize}
@@ -835,7 +806,7 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op
   \end{itemize}
 \end{frame}
 
-\begin{frame}{Results: attention (BMG)}
+\begin{frame}{Results: Attention (BMG)}
   \centering
   \begin{tabular}{rrr}
     \toprule
@@ -853,7 +824,7 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op
   \alert{2.2x--2.7x} speedup across the sweep.
 \end{frame}
 
-\begin{frame}{Results: softmax and L1/L2 normalization (BMG)}
+\begin{frame}{Results: Softmax and L1/L2 Normalization (BMG)}
   One application of the op each; the epilogue recomputes its term from the
   \emph{final} max, so \alert{three passes over the input become two}. The three
   differ only in \code{E}, and so in the correction --- no code specific to
