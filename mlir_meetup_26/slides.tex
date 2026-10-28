@@ -636,6 +636,8 @@ for j in tiles(N):
 %o = linalg.generic ins(%p, %V) outs(%zero_64x64)      // (*\textcolor{labelred}{\cbold{R2b: P @ V}}*), sum_j p * V
 %out = linalg.generic ins(%o, %s) outs(%empty_64x64)   // normalize: o / s
 \end{lstlisting}
+  \takeaway{Attention input shapes: \code{Q @ K\textsuperscript{T}} (64$\times$512),
+    \code{K}, \code{V} (512$\times$64)}
 \end{frame}
 
 \begin{frame}[fragile]{The Transform Schedule}
