@@ -127,6 +127,18 @@
 % A dataflow fact of the separability analysis (IND, ADD, MUL).
 \newcommand{\dfact}[1]{\textcolor{inteltitle}{\textsf{\{#1\}}}}
 
+\definecolor{labelred}{HTML}{C00000}  % highlighted labels in listings
+% Highlight listing rows: \hlmark{name} at the start of a row (via escapeinside),
+% then \hlrows{first}{last} in an overlay tikzpicture after the listing. The
+% band spans the listing width; multiply keeps the code readable on top.
+\newcommand{\hlmark}[1]{\tikz[remember picture, overlay]\coordinate (#1);}
+\newcommand{\hlrows}[2]{%
+  \fill[red!12, blend mode=multiply]
+    ([xshift=-2pt, yshift=5.8pt] #1) rectangle ([xshift=\textwidth-2pt, yshift=-2.2pt] #2);}
+
+% Bold typewriter (CM has none; Latin Modern matches it) for labels in listings.
+\newcommand{\cbold}[1]{{\fontencoding{T1}\fontfamily{lmtt}\fontseries{b}\selectfont\frenchspacing #1}}
+
 \title{An Approach for Tiling  and Fusing \\Dependent Reductions in Linalg}
 \subtitle{MLIR Developer Meetup - Oct 2026}
 \date{}  % empty: no date on the title slide
@@ -604,9 +616,9 @@ for j in tiles(N):
     \alert{2} applications of reduction fusion}
 \end{frame}
 
-\begin{frame}[fragile]{Step 1: Input IR (\textit{R1} Already Tiled)}
-\begin{lstlisting}
-%m = scf.for %iv = 0 to 512 step 32                    // R1: row max, already tiled
+\begin{frame}[fragile]{Input IR}
+\begin{lstlisting}[escapeinside={(*}{*)}]
+%m = scf.for %iv = 0 to 512 step 32                    // (*\textcolor{labelred}{\cbold{R1: row max}}*), already tiled
        iter_args(%acc_m = %ninf_64) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]     // score tile
   %mold = tensor.extract_slice %acc_m[0] [64]
@@ -614,73 +626,71 @@ for j in tiles(N):
   %im   = tensor.insert_slice %mt into %acc_m[0] [64]
   scf.yield %im
 }
-%p = linalg.generic ins(%x, %m) outs(%empty_64x512)    // E: exp(x - m), full [64, 512]
-%s = linalg.generic ins(%p) outs(%zero_64)             // R2a: row sum, sum_j p
-%o = linalg.generic ins(%p, %V) outs(%zero_64x128)     // R2b: P @ V, sum_j p * V
+%p = linalg.generic ins(%x, %m) outs(%empty_64x512)    // (*\textcolor{labelred}{\cbold{E: exp(x - m)}}*), full [64, 512]
+%s = linalg.generic ins(%p) outs(%zero_64)             // (*\textcolor{labelred}{\cbold{R2a: row sum}}*), sum_j p
+%o = linalg.generic ins(%p, %V) outs(%zero_64x128)     // (*\textcolor{labelred}{\cbold{R2b: P @ V}}*), sum_j p * V
 %out = linalg.generic ins(%o, %s) outs(%empty_64x128)  // normalize: o / s
 \end{lstlisting}
 \end{frame}
 
-\begin{frame}[fragile]{Step 1: The Transform Schedule (One Chain per Application)}
-\begin{lstlisting}
+\begin{frame}[fragile]{The Transform Schedule}
+\begin{lstlisting}[escapeinside={(*}{*)}]
 %gen = transform.structured.match ops{["linalg.generic"]} in %arg0 .....
 %r1, %e, %r2a, %r2b, %div = transform.split_handle %gen .....    // R1, E, R2a (sum), R2b (P @ V), div
 %loop = transform.structured.match ops{["scf.for"]} in %arg0 .....
 
-%fa = transform.structured.fuse_dependent_reduction_ops          // chain 1: E + row sum
+%fa = transform.structured.fuse_dependent_reduction_ops          // (*\textcolor{labelred}{\cbold{Fuse chain 1: max -> E -> row sum}}*)
         %e, %r2a into %loop .....
-transform.annotate %fa "__reduction_loop__" : !transform.any_op  // fused loop is the next R1
 
 %e2 = transform.get_producer_of_operand %r2b[0] .....            // re-derive E (handle consumed)
-%fb = transform.structured.fuse_dependent_reduction_ops          // chain 2: E + P @ V
-        %e2, %r2b into %fa .....
+%fb = transform.structured.fuse_dependent_reduction_ops          // (*\textcolor{labelred}{\cbold{Capture fused loop \%fa and fuse}}*)
+        %e2, %r2b into %fa .....                                 // (*\textcolor{labelred}{\cbold{chain 2: max + sum -> E -> P @ V}}*)
 \end{lstlisting}
 \end{frame}
 
-\begin{frame}[fragile]{Step 2: \textit{E} Fused --- Still at Full Extent}
-\begin{lstlisting}
+\begin{frame}[fragile]{Step 1: \textit{E} Fused --- Still at Full Extent}
+\begin{lstlisting}[escapeinside={(*}{*)}]
 %r:2 = scf.for %iv = 0 to 512 step 32                  // new iter_arg %acc_p: E's full result
          iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]
   %mold = tensor.extract_slice %acc_m[0] [64]
   %mt   = linalg.generic ins(%xt) outs(%mold)          // max(x_tile, acc_m)
-  %xf   = tensor.extract_slice %x[0, 0] [64, 512]      // fused E clone reads all 512 cols ...
-  %pdst = tensor.extract_slice %acc_p[0, 0] [64, 512]  // ... and writes the full extent
-  %pt   = linalg.generic ins(%xf, %mt) outs(%pdst)     // exp(x - m_new), FULL row
+(*\hlmark{hlxf}*)  %xf   = tensor.extract_slice %x[0, 0] [64, 512]      // (*\textcolor{labelred}{\cbold{Fused E clone reads all the cols along the}}*)
+  %pdst = tensor.extract_slice %acc_p[0, 0] [64, 512]  // (*\textcolor{labelred}{\cbold{reduction dim (512 cols) and writes}}*)
+(*\hlmark{hlpt}*)  %pt   = linalg.generic ins(%xf, %mt) outs(%pdst)     // (*\textcolor{labelred}{\cbold{exp(x - m\_new) along the FULL row}}*)
   %im   = tensor.insert_slice %mt into %acc_m[0] [64]
-  %ip   = tensor.insert_slice %pt into %acc_p[0, 0] [64, 512]
+(*\hlmark{hlip}*)  %ip   = tensor.insert_slice %pt into %acc_p[0, 0] [64, 512]
   scf.yield %im, %ip
 }                                                      // outside: row sum, original E, P @ V, div
 \end{lstlisting}
-  \small \code{E} also feeds the contraction $\Rightarrow$ a \emph{clone} is fused;
-  the original stays outside for the second application.
+  \begin{tikzpicture}[remember picture, overlay]
+    \hlrows{hlxf}{hlpt}
+    \hlrows{hlip}{hlip}
+  \end{tikzpicture}
 \end{frame}
 
-\begin{frame}[fragile]{Step 3: \textit{E} Re-Tiled to the Reduction Tile}
-\begin{lstlisting}
-%r:2 = scf.for %iv = 0 to 512 step 32
+\begin{frame}[fragile]{Step 2: \textit{E} Re-Tiled to the Reduction Tile}
+\begin{lstlisting}[escapeinside={(*}{*)}]
+%r:2 = scf.for %iv = 0 to 512 step 32                   // (*\textcolor{labelred}{\cbold{Reduction tile size = 32}}*)
          iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]
   %mold = tensor.extract_slice %acc_m[0] [64]
   %mt   = linalg.generic ins(%xt) outs(%mold)           // max(x_tile, acc_m)
-  %pdst = tensor.extract_slice %acc_p[0, %iv] [64, 32]  // E cut to the [64, 32] tile
-  %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)      // exp(x_tile - m_new)
+(*\hlmark{rtpdst}*)  %pdst = tensor.extract_slice %acc_p[0, %iv] [64, 32]  // (*\textcolor{labelred}{\cbold{E cut to the [64, 32] tile}}*)
+(*\hlmark{rtpt}*)  %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)      // (*\textcolor{labelred}{\cbold{exp(x\_tile - m\_new)}}*)
   %im   = tensor.insert_slice %mt into %acc_m[0] [64]
-  %ip   = tensor.insert_slice %pt into %acc_p[0, %iv] [64, 32]
+(*\hlmark{rtip}*)  %ip   = tensor.insert_slice %pt into %acc_p[0, %iv] [64, 32]
   scf.yield %im, %ip
 }
 \end{lstlisting}
-  \begin{itemize}\small
-    \item \code{E} is all-parallel, so its \emph{destination} shrinks too: result
-      type becomes \code{[64, 32]} and the yielding \code{insert\_slice} is
-      re-sliced to match.
-    \item \alert{Numerically invalid from here}: earlier tiles of the carried
-      \code{p} were computed against older maxes.
-  \end{itemize}
+  \begin{tikzpicture}[remember picture, overlay]
+    \hlrows{rtpdst}{rtpt}
+    \hlrows{rtip}{rtip}
+  \end{tikzpicture}
 \end{frame}
 
-\begin{frame}[fragile]{Step 4: The Row Sum Fused (and Re-Tiled)}
-\begin{lstlisting}
+\begin{frame}[fragile]{Step 3: The Row Sum Fused (and Re-Tiled)}
+\begin{lstlisting}[escapeinside={(*}{*)}]
 %r:3 = scf.for %iv = 0 to 512 step 32
          iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512, %acc_s = %zero_64) {
   %xt   = tensor.extract_slice %x[0, %iv] [64, 32]
@@ -688,59 +698,46 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op  // fused loop i
   %mt   = linalg.generic ins(%xt) outs(%mold)       // max(x_tile, acc_m)
   %pdst = tensor.extract_slice %acc_p[0, %iv] [64, 32]
   %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)  // exp(x_tile - m_new)
-  %sold = tensor.extract_slice %acc_s[0] [64]       // fused row sum: stale running sum
-  %st   = linalg.generic ins(%pt) outs(%sold)       // acc_s + sum_j p_tile
+(*\hlmark{rssold}*)  %sold = tensor.extract_slice %acc_s[0] [64]       // (*\textcolor{labelred}{\cbold{Row sum fused against the  E tile}}*)
+(*\hlmark{rsst}*)  %st   = linalg.generic ins(%pt) outs(%sold)       // (*\textcolor{labelred}{\cbold{(acc\_s + sum\_j p\_tile)}}*)
   ... yields: %mt, %pt, %st
 }
 \end{lstlisting}
-  \small Re-tiling only rewrites input slices carrying the reduction axis. For the
-  row sum this is a no-op (its only input is \code{E}'s tile); for the \code{P @ V}
-  contraction it is what cuts \code{V} from \code{[512, 128]} to \code{[32, 128]}.
+  \begin{tikzpicture}[remember picture, overlay]
+    \hlrows{rssold}{rsst}
+  \end{tikzpicture}
+  \takeaway{Sum's only input was \code{E}, which is already re-tiled. So
+    re-tiling is a no-op in this case}
 \end{frame}
 
-\begin{frame}[fragile]{Step 5: Online Correction --- Chain 1 Complete}
-\begin{lstlisting}
+\begin{frame}[fragile]{Step 4: Online Correction --- Chain 1 Complete}
+\begin{lstlisting}[escapeinside={(*}{*)}]
 %r:3 = scf.for %iv = 0 to 512 step 32
          iter_args(%acc_m = %ninf_64, %acc_p = %empty_64x512, %acc_s = %zero_64) {
   %mt   = linalg.generic ins(%xt) outs(%mold)         // max(x_tile, acc_m)
   %pt   = linalg.generic ins(%xt, %mt) outs(%pdst)    // exp(x_tile - m_new)
   %sold = tensor.extract_slice %acc_s[0] [64]
-  %tnew = linalg.generic ins(%mt) outs(%empty_64)     // correction, E at new max: exp(0 - m_new)
-  %told = linalg.generic ins(%mold) outs(%empty_64)   // E at old max: exp(0 - m_old)
-  %f    = linalg.elementwise <div> ins(%tnew, %told)  // exp(m_old - m_new)
-  %sc   = linalg.elementwise <mul> ins(%sold, %f)     // acc_s * factor: rescaled init
+(*\hlmark{octnew}*)  %tnew = linalg.generic ins(%mt) outs(%empty_64)     // (*\textcolor{labelred}{\cbold{Online correction: E'(m\_new) = exp(0.0 - m\_new)}}*)
+  %told = linalg.generic ins(%mold) outs(%empty_64)   // (*\textcolor{labelred}{\cbold{E'(m\_old) = exp(0.0 - m\_old)}}*)
+  %f    = linalg.elementwise <div> ins(%tnew, %told)  // (*\textcolor{labelred}{\cbold{correction factor = E'(m\_new)/E'(m\_old)}}*)
+(*\hlmark{ocsc}*)  %sc   = linalg.elementwise <mul> ins(%sold, %f)     // (*\textcolor{labelred}{\cbold{acc\_s\_rescaled = acc\_s \char42{} factor}}*)
   %st   = linalg.generic ins(%pt) outs(%sc)           // sc + sum_j p_tile
   ... yields: %mt, %pt, %st
 }
 \end{lstlisting}
-  \small The loop is again a tiled reduction loop $\Rightarrow$ it can be the
-  producer of the next chain.
+  \begin{tikzpicture}[remember picture, overlay]
+    \hlrows{octnew}{ocsc}
+  \end{tikzpicture}
+  \takeaway{Loop is again a tiled reduction loop (now returning two reductions)
+    $\Rightarrow$ it can be the producer of the next chain}
 \end{frame}
 
-\begin{frame}[fragile]{Step 6: Second Application --- Fused Loop (1/2)}
+\begin{frame}[fragile]{Step 5: Second Application --- Fused Loop}
 \begin{lstlisting}
 %r:5 = scf.for %iv = 0 to 512 step 32
          iter_args(%acc_m = %ninf_64, %acc_p1 = %empty_64x512, %acc_s = %zero_64,
                    %acc_p2 = %empty_64x512, %acc_o = %zero_64x128) {
-  %xt    = tensor.extract_slice %x[0, %iv] [64, 32]
-  %mold  = tensor.extract_slice %acc_m[0] [64]
-  %mt    = linalg.generic ins(%xt) outs(%mold)         // max(x_tile, acc_m)
-  %p1dst = tensor.extract_slice %acc_p1[0, %iv] [64, 32]
-  %p1    = linalg.generic ins(%xt, %mt) outs(%p1dst)   // E for chain 1 (clone)
-  %p2dst = tensor.extract_slice %acc_p2[0, %iv] [64, 32]
-  %p2    = linalg.generic ins(%xt, %mt) outs(%p2dst)   // E for chain 2 (original)
-
-  %sold  = tensor.extract_slice %acc_s[0] [64]         // chain 1 correction, [64]
-  %tnew  = linalg.generic ins(%mt) outs(%empty_64)     // exp(0 - m_new)
-  %told  = linalg.generic ins(%mold) outs(%empty_64)   // exp(0 - m_old)
-  %f1    = linalg.elementwise <div> ins(%tnew, %told)  // exp(m_old - m_new)
-  %sc    = linalg.elementwise <mul> ins(%sold, %f1)    // acc_s * factor
-  %st    = linalg.generic ins(%p1) outs(%sc)           // sc + sum_j p1
-\end{lstlisting}
-\end{frame}
-
-\begin{frame}[fragile]{Step 6: Second Application --- Fused Loop (2/2)}
-\begin{lstlisting}
+  // %mt (max), %st (sum) fused in previous step
   %vt    = tensor.extract_slice %V[%iv, 0] [32, 128]       // value tile
   %oold  = tensor.extract_slice %acc_o[0, 0] [64, 128]     // chain 2 correction, [64, 128]
   %tnew2 = linalg.generic ins(%mt) outs(%empty_64x128)     // exp(0 - m_new), broadcast
@@ -748,13 +745,8 @@ transform.annotate %fa "__reduction_loop__" : !transform.any_op  // fused loop i
   %f2    = linalg.elementwise <div> ins(%tnew2, %told2)    // exp(m_old - m_new)
   %oc    = linalg.elementwise <mul> ins(%oold, %f2)        // acc_o * factor
   %ot    = linalg.generic ins(%p2, %vt) outs(%oc)          // oc + sum_j p2 * V_tile
-
-  %im  = tensor.insert_slice %mt into %acc_m[0] [64]
-  %ip1 = tensor.insert_slice %p1 into %acc_p1[0, %iv] [64, 32]
-  %is  = tensor.insert_slice %st into %acc_s[0] [64]
-  %ip2 = tensor.insert_slice %p2 into %acc_p2[0, %iv] [64, 32]
-  %io  = tensor.insert_slice %ot into %acc_o[0, 0] [64, 128]
-  scf.yield %im, %ip1, %is, %ip2, %io
+  // insert tensors into the running accumulators
+  ... yields: %mt, %p1, %st, %p2, %ot
 }
 %out = linalg.generic ins(%r#4, %r#2) outs(%empty_64x128)  // only the divide is left: o / s
 \end{lstlisting}
