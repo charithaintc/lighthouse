@@ -132,6 +132,11 @@
 % then \hlrows{first}{last} in an overlay tikzpicture after the listing. The
 % band spans the listing width; multiply keeps the code readable on top.
 \newcommand{\hlmark}[1]{\tikz[remember picture, overlay]\coordinate (#1);}
+% Paint highlight bands without taking up vertical space (an overlay tikzpicture
+% on its own would start an empty paragraph line).
+\newcommand{\hlpaint}[1]{\par\nointerlineskip
+  \vbox to 0pt{\noindent\begin{tikzpicture}[remember picture, overlay]#1\end{tikzpicture}\vss}%
+  \nointerlineskip}
 \newcommand{\hlrows}[2]{%
   \fill[red!12, blend mode=multiply]
     ([xshift=-2pt, yshift=5.8pt] #1) rectangle ([xshift=\textwidth-2pt, yshift=-2.2pt] #2);}
@@ -628,8 +633,8 @@ for j in tiles(N):
 }
 %p = linalg.generic ins(%x, %m) outs(%empty_64x512)    // (*\textcolor{labelred}{\cbold{E: exp(x - m)}}*), full [64, 512]
 %s = linalg.generic ins(%p) outs(%zero_64)             // (*\textcolor{labelred}{\cbold{R2a: row sum}}*), sum_j p
-%o = linalg.generic ins(%p, %V) outs(%zero_64x128)     // (*\textcolor{labelred}{\cbold{R2b: P @ V}}*), sum_j p * V
-%out = linalg.generic ins(%o, %s) outs(%empty_64x128)  // normalize: o / s
+%o = linalg.generic ins(%p, %V) outs(%zero_64x64)      // (*\textcolor{labelred}{\cbold{R2b: P @ V}}*), sum_j p * V
+%out = linalg.generic ins(%o, %s) outs(%empty_64x64)   // normalize: o / s
 \end{lstlisting}
 \end{frame}
 
@@ -663,10 +668,7 @@ for j in tiles(N):
   scf.yield %im, %ip
 }                                                      // outside: row sum, original E, P @ V, div
 \end{lstlisting}
-  \begin{tikzpicture}[remember picture, overlay]
-    \hlrows{hlxf}{hlpt}
-    \hlrows{hlip}{hlip}
-  \end{tikzpicture}
+  \hlpaint{\hlrows{hlxf}{hlpt}\hlrows{hlip}{hlip}}
 \end{frame}
 
 \begin{frame}[fragile]{Step 2: \textit{E} Re-Tiled to the Reduction Tile}
@@ -683,10 +685,7 @@ for j in tiles(N):
   scf.yield %im, %ip
 }
 \end{lstlisting}
-  \begin{tikzpicture}[remember picture, overlay]
-    \hlrows{rtpdst}{rtpt}
-    \hlrows{rtip}{rtip}
-  \end{tikzpicture}
+  \hlpaint{\hlrows{rtpdst}{rtpt}\hlrows{rtip}{rtip}}
 \end{frame}
 
 \begin{frame}[fragile]{Step 3: The Row Sum Fused (and Re-Tiled)}
@@ -703,9 +702,7 @@ for j in tiles(N):
   ... yields: %mt, %pt, %st
 }
 \end{lstlisting}
-  \begin{tikzpicture}[remember picture, overlay]
-    \hlrows{rssold}{rsst}
-  \end{tikzpicture}
+  \hlpaint{\hlrows{rssold}{rsst}}
   \takeaway{Sum's only input was \code{E}, which is already re-tiled. So
     re-tiling is a no-op in this case}
 \end{frame}
@@ -725,33 +722,33 @@ for j in tiles(N):
   ... yields: %mt, %pt, %st
 }
 \end{lstlisting}
-  \begin{tikzpicture}[remember picture, overlay]
-    \hlrows{octnew}{ocsc}
-  \end{tikzpicture}
+  \hlpaint{\hlrows{octnew}{ocsc}}
   \takeaway{Loop is again a tiled reduction loop (now returning two reductions)
     $\Rightarrow$ it can be the producer of the next chain}
 \end{frame}
 
-\begin{frame}[fragile]{Step 5: Second Application --- Fused Loop}
-\begin{lstlisting}
+\begin{frame}[fragile]{Step 5: P @ V Fusion}
+\begin{lstlisting}[escapeinside={(*}{*)}]
 %r:5 = scf.for %iv = 0 to 512 step 32
          iter_args(%acc_m = %ninf_64, %acc_p1 = %empty_64x512, %acc_s = %zero_64,
-                   %acc_p2 = %empty_64x512, %acc_o = %zero_64x128) {
+                   %acc_p2 = %empty_64x512, %acc_o = %zero_64x64) {
   // %mt (max), %st (sum) fused in previous step
-  %vt    = tensor.extract_slice %V[%iv, 0] [32, 128]       // value tile
-  %oold  = tensor.extract_slice %acc_o[0, 0] [64, 128]     // chain 2 correction, [64, 128]
-  %tnew2 = linalg.generic ins(%mt) outs(%empty_64x128)     // exp(0 - m_new), broadcast
-  %told2 = linalg.generic ins(%mold) outs(%empty_64x128)   // exp(0 - m_old), broadcast
-  %f2    = linalg.elementwise <div> ins(%tnew2, %told2)    // exp(m_old - m_new)
-  %oc    = linalg.elementwise <mul> ins(%oold, %f2)        // acc_o * factor
+(*\hlmark{pvvt}*)  %vt    = tensor.extract_slice %V[%iv, 0] [32, 64]        // (*\textcolor{labelred}{\cbold{V slice is re-tiled}}*)
+  %oold  = tensor.extract_slice %acc_o[0, 0] [64, 64]      // (*\textcolor{labelred}{\cbold{Online correction for P @ V acc}}*)
+(*\hlmark{pvtnew}*)  %tnew2 = linalg.generic ins(%mt) outs(%empty_64x64)      // (*\textcolor{labelred}{\cbold{E'(m\_new) = exp(0.0 - m\_new)}}*)
+  %told2 = linalg.generic ins(%mold) outs(%empty_64x64)    // (*\textcolor{labelred}{\cbold{E'(m\_old) = exp(0.0 - m\_old)}}*)
+  %f2    = linalg.elementwise <div> ins(%tnew2, %told2)    // (*\textcolor{labelred}{\cbold{correction factor = E'(m\_new)/E'(m\_old)}}*)
+(*\hlmark{pvoc}*)  %oc    = linalg.elementwise <mul> ins(%oold, %f2)        // (*\textcolor{labelred}{\cbold{acc\_o\_rescaled = acc\_o \char42{} factor}}*)
   %ot    = linalg.generic ins(%p2, %vt) outs(%oc)          // oc + sum_j p2 * V_tile
-  // insert tensors into the running accumulators
+  // insert result tensors into the running accumulators
   ... yields: %mt, %p1, %st, %p2, %ot
 }
-%out = linalg.generic ins(%r#4, %r#2) outs(%empty_64x128)  // only the divide is left: o / s
+%out = linalg.generic ins(%r#4, %r#2) outs(%empty_64x64)   // only the divide is left: o / s
 \end{lstlisting}
-  \small One online loop, five accumulators: running max, one \code{E} tile buffer
-  per chain, running sum, running \code{P @ V}.
+  \hlpaint{\hlrows{pvvt}{pvvt}\hlrows{pvtnew}{pvoc}}
+  \takeaway{\code{V} must be re-tiled (unlike before) because it's an extra input
+    for R2\\
+    Result is a fused online loop with max, sum and \code{P @ V} accumulators}
 \end{frame}
 
 % =============================================================== Evaluation
