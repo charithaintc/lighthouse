@@ -114,11 +114,13 @@
 
 % Takeaway box at the bottom of a slide, spanning the text width. \takeawayspace
 % reserves the same space invisibly, so code stays put across slide transitions.
-\newcommand{\takeawaybox}[1]{%
-  \colorbox{inteltitle!12}{%
+\newcommand{\takeawaybox}[2][inteltitle!12]{%
+  \colorbox{#1}{%
     \parbox{\dimexpr\textwidth-2\fboxsep\relax}{\centering\vspace{1mm}
-      #1\vspace{1mm}}}}
+      #2\vspace{1mm}}}}
 \newcommand{\takeaway}[1]{\par\vspace{2mm}\noindent\takeawaybox{#1}\par\vspace{2.5mm}}
+% An open question, on light red; meant to follow a \takeaway box directly.
+\newcommand{\question}[1]{\par\noindent\takeawaybox[red!12]{\bfseries #1}\par\vspace{2.5mm}}
 \newcommand{\takeawayspace}[1]{\par\vspace{2mm}\noindent\phantom{\takeawaybox{#1}}\par\vspace{2.5mm}}
 
 % R1-dependent factor g(m) = e^{-m} of a softmax term, highlighted.
@@ -326,7 +328,10 @@ for each tile x_t of x:
   \end{columns}
 
   \takeaway{One pass over \texttt{x}: rescale the running sum whenever the max
-    changes}
+    changes\\
+    Existing approaches: high-level ops, complex pattern matching}
+  \question{No transform primitive that composes with the existing tile/fuse
+    infra?}
 \end{frame}
 
 \begin{frame}{When/Why does this work?}
@@ -523,13 +528,10 @@ linalg.yield %e
 \begin{frame}[fragile]{Proposal: \textit{structured.fuse\_dependent\_reduction\_ops}}
   Three operand handles, one result:
   \begin{enumerate}\small
-    \item \textbf{\code{R1}} --- already tiled producer reduction
-      (\code{scf.for} from \code{tile\_using\_for} with \code{FullReduction},
-      accumulator carried as \code{iter\_arg}; may carry several results).
-    \item \textbf{\code{E}} --- all-parallel elementwise op consuming an \code{R1}
-      result as a broadcast input.
-    \item \textbf{\code{R2}} --- still-untiled consumer reduction over the same
-      axis, reducing \code{E}'s result.
+    \item \textbf{\code{R1}} --- already tiled producer reduction (tiled using
+      the \code{FullReduction} strategy, i.e.\ \code{tile\_using\_for}). Can carry multiple such reductions.
+    \item \textbf{\code{E}} --- all-parallel elementwise op.
+    \item \textbf{\code{R2}} --- still-untiled consumer reduction.
   \end{enumerate}
 \begin{lstlisting}
 %loop = ..... -> !transform.any_op   // R1: the already tiled reduction loop
@@ -570,13 +572,14 @@ linalg.yield %e
     \begin{column}{0.40\textwidth}
       \footnotesize
       \begin{itemize}
-        \setlength{\itemsep}{2mm}
+        \setlength{\itemsep}{1.5mm}
         \item \code{E} is fused first (\code{scf::tileAndFuseConsumer}), then
           immediately re-tiled to match \code{R1}'s tile
         \item \code{R2} is fused against the slice that \code{E} yields
+        \item Emit online correction for the \code{R2} accumulator
         \item Implemented as an \code{OpRewritePattern} on \code{R2}
       \end{itemize}
-      \vspace{12mm}  % lift the points above the code column's center
+      \vspace{4mm}  % lift the points above the code column's center
     \end{column}
     \begin{column}{0.56\textwidth}
       \lstset{basicstyle=\ttfamily\fontsize{7.5}{9}\selectfont}
